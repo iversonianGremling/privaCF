@@ -2,7 +2,7 @@
 
 ## A Privacy-Preserving Decentralized Recommendation Protocol
 
-### Design Document v0.2.9
+### Design Document v0.3.0
 
 > **Status:** Research specification. Full spec lives in [SPEC.md](./SPEC.md). This README is a behavioral orientation only.
 

@@ -2,7 +2,7 @@
 
 ## A Privacy-Preserving Decentralized Recommendation Protocol
 
-### Design Document v0.2.9
+### Design Document v0.3.0
 
 > **Status:** Research specification. §10.1 lists open questions. §10.2 lists resolved prerequisites.
 
@@ -220,7 +220,7 @@ PrivaCF is organized into five layers plus a dual-chain structure that underpins
 │  Watchdog signals · Recursive oversight          │
 ├─────────────────────────────────────────────────┤
 │  LAYER 2 · Network                               │
-│  Veilid · Dandelion++ · PSI peer selection       │
+│  Loopix/Sphinx · Dandelion++ · PSI peer sel.     │
 │  Relay submission · Niche item delay             │
 ├─────────────────────────────────────────────────┤
 │  LAYER 1 · Identity & Privacy                    │
@@ -853,11 +853,15 @@ All future identities from same sk permanently excluded.
 
 ### 5.1 Transport
 
-**Veilid** provides IP-level privacy via 3-hop private routing and native NAT traversal. Mandatory for all production deployments.
+**Loopix/Sphinx mixnet** (Piotrowska et al., CCS 2017) provides the transport layer. Every unicast message — PSI handshakes, audit responses, verdict commits, gossip vector pushes — is sent as a Sphinx-onion-encrypted packet through a sequence of mix nodes, each of which applies a Poisson-distributed per-hop delay before forwarding. No mix node learns more than the next hop. Sender anonymity, receiver anonymity, and relationship anonymity are formally analyzed under the Loopix model. Mandatory for all production deployments.
 
-Known issue (Veilid GitLab #395): under specific conditions, an adversary controlling nodes at both ends of a safety route can perform a route correlation attack. This provides meaningful but imperfect protection against commercial adversaries. Tor or I2P remain the recommendation for Config C (high-security).
+Implementation target: **Katzenpost** (open-source Loopix implementation). Each client node connects outbound to a provider (a publicly reachable mix node that buffers inbound messages), which sidesteps NAT traversal for home nodes — no inbound connection is required.
 
-**Dandelion++** (Fanti et al., SIGMETRICS 2018) provides message-level source obfuscation. Stem phase: random linear relay (p ≈ 0.9 to continue). Fluff phase: epidemic broadcast. Mandatory on Veilid and clearnet.
+**Loop and drop cover traffic:** Every node emits traffic at a constant Poisson rate regardless of real activity — loop covers (messages to self via the mix) and drop covers (discarded at destination). This is Loopix's native anonymity mechanism and directly subsumes PrivaCF's hand-rolled cover traffic. Cover traffic calibration (§5.8) sets the base Poisson rate; the formal anonymity guarantee holds under this constant-rate assumption.
+
+**Single-Use Reply Blocks (SURBs):** All request-response exchanges (PSI handshakes, audit requests) include a pre-built SURB so the responder can reply anonymously without knowing the requester's mix path.
+
+**Dandelion++** (Fanti et al., SIGMETRICS 2018) is retained for the epidemic broadcast (fluff) phase of gossip propagation, where Loopix's point-to-point model does not apply. Stem phase: random linear relay (p ≈ 0.9 to continue). Fluff phase: epidemic broadcast.
 
 **Retry on failure:** Timeout-only. After k_retry failures, fall back to direct broadcast.
 
@@ -865,7 +869,9 @@ Known issue (Veilid GitLab #395): under specific conditions, an adversary contro
 
 ### 5.2 Uniform Message Frames
 
-Every message is padded to a fixed maximum frame size and encrypted via Noise Protocol sessions before transmission. An observer on the wire sees fixed-size encrypted blobs and cannot distinguish message types or read contents. A gossip vector push, a Class 3 audit response, a `verdict_commit`, and a cover traffic dummy are indistinguishable on the wire. Frame size estimated 4–8 KB.
+Sphinx packets are fixed-size by construction — payload length is padded to a fixed maximum at the sender before onion encryption. An observer on the wire sees fixed-size encrypted blobs and cannot distinguish message types or read contents. A gossip vector push, a Class 3 audit response, a `verdict_commit`, and a Loopix loop or drop cover are indistinguishable on the wire. Frame size estimated 4–8 KB (OQ-30).
+
+Noise Protocol sessions are retained only for any direct connections used in development and clearnet testing; they are redundant for mix-routed production traffic where Sphinx provides per-hop encryption.
 
 ### 5.3 Node Discovery and Cluster Re-Discovery
 
@@ -940,22 +946,22 @@ This attenuation is one of the primary defenses against remote Sybil influence: 
 
 ### 5.8 Communication Rhythm
 
-| Signal                                 | Trigger                                                 | Rate limit                                                      | Routing                       |
-| -------------------------------------- | ------------------------------------------------------- | --------------------------------------------------------------- | ----------------------------- |
-| Gossip vector push                     | T_send = epoch_start + offset + Uniform(0, 0.3 × epoch) | 1 per epoch (hard)                                              | Dandelion++ stem              |
-| Item announcement (mainstream)         | Positive interaction + random delay                     | ~20/epoch                                                       | Dandelion++ stem              |
-| Item announcement (niche)              | Positive interaction + VRF-derived epoch delay          | Per item                                                        | Dandelion++ stem              |
-| Receipt                                | Epoch end (batched)                                     | 1 batch per epoch                                               | Dandelion++ stem              |
-| Rewind signal                          | q_v(T) drop correlated with recent gossip cohort        | 1 per epoch per node; max 1 Class 3 trigger per N_rewind epochs | Dandelion++ stem              |
-| On-chain transaction (M_v, C_p, score) | Every n_commit epochs via relay                         | 1 per n_commit epochs                                           | Via relay node                |
-| commit_T + ZK proof                    | Every epoch via relay                                   | 1 per epoch                                                     | Via relay node                |
-| verdict_commit                         | Commit phase of suspension                              | 1 per committee member per verdict                              | Dandelion++ stem              |
-| verdict_reveal                         | Reveal phase of suspension                              | 1 per committee member per verdict                              | Dandelion++ stem              |
-| null_v_decryption                      | After threshold reveals available                       | Permissionless                                                  | Direct to chain               |
-| watchdog_signal                        | Anomalous verdict_commit rate                           | 1 per epoch per node                                            | Dandelion++ stem              |
-| Auditor handoff                        | Epoch end                                               | 1 per epoch                                                     | Dandelion++ stem to committee |
-| ZK continuity proof                    | Epoch transition (voluntary)                            | 1 per epoch                                                     | Committee chain only          |
-| Cover traffic                          | Constant                                                | Calibrated to mask T_send                                       | Dandelion++ stem              |
+| Signal                                 | Trigger                                                 | Rate limit                                                      | Routing                             |
+| -------------------------------------- | ------------------------------------------------------- | --------------------------------------------------------------- | ----------------------------------- |
+| Gossip vector push                     | T_send = epoch_start + offset + Uniform(0, 0.3 × epoch) | 1 per epoch (hard)                                              | Loopix mix path                     |
+| Item announcement (mainstream)         | Positive interaction + random delay                     | ~20/epoch                                                       | Dandelion++ stem → fluff broadcast  |
+| Item announcement (niche)              | Positive interaction + VRF-derived epoch delay          | Per item                                                        | Dandelion++ stem → fluff broadcast  |
+| Receipt                                | Epoch end (batched)                                     | 1 batch per epoch                                               | Loopix mix path                     |
+| Rewind signal                          | q_v(T) drop correlated with recent gossip cohort        | 1 per epoch per node; max 1 Class 3 trigger per N_rewind epochs | Dandelion++ stem → fluff broadcast  |
+| On-chain transaction (M_v, C_p, score) | Every n_commit epochs via relay                         | 1 per n_commit epochs                                           | Via relay node                      |
+| commit_T + ZK proof                    | Every epoch via relay                                   | 1 per epoch                                                     | Via relay node                      |
+| verdict_commit                         | Commit phase of suspension                              | 1 per committee member per verdict                              | Loopix mix path                     |
+| verdict_reveal                         | Reveal phase of suspension                              | 1 per committee member per verdict                              | Loopix mix path                     |
+| null_v_decryption                      | After threshold reveals available                       | Permissionless                                                  | Direct to chain                     |
+| watchdog_signal                        | Anomalous verdict_commit rate                           | 1 per epoch per node                                            | Dandelion++ stem → fluff broadcast  |
+| Auditor handoff                        | Epoch end                                               | 1 per epoch                                                     | Loopix mix path to committee        |
+| ZK continuity proof                    | Epoch transition (voluntary)                            | 1 per epoch                                                     | Committee chain only                |
+| Loop/drop cover traffic                | Constant (Poisson)                                      | Base Poisson rate λ — calibrated per OQ-58                      | Loopix native (loop and drop covers)|
 
 ---
 
@@ -1400,7 +1406,7 @@ Each B-level and H-level row in the table corresponds to at least one Phase 5 ex
 
 - **Within-cluster preference privacy.** Interest cluster peers accumulate observations over time. Accepted tradeoff.
 - **Long-term differential privacy.** T epochs of ε-DP gives Tε total loss. Not claimed.
-- **Nation-state adversaries.** Veilid is ~2 years old. Use Tor or I2P.
+- **Nation-state adversaries.** Loopix provides formal sender/receiver/relationship anonymity under the Poisson traffic model, but mix node compromise and global traffic analysis remain out of scope.
 - **Semantic poisoning.** No cryptographic guarantee. Primary unresolved attack.
 - **Self-reported Merkle leaves.** PARTICIPATION and RATE_LIMIT remain self-reported, covered by handoff ZK proof but not peer-attested.
 - **Dark node rotators — admission window only.** The dark node gap is closed for nodes that have published at least one `epoch_transaction`. The residual gap is nodes that go dark during the admission window before any `commit_T` is published. Bounded by zero reputation, full admission cost, and behavioral fingerprinting.
@@ -1409,7 +1415,8 @@ Each B-level and H-level row in the table corresponds to at least one Phase 5 ex
 - **ForwardCommit instantiation maturity.** BLS-based ForwardCommit resolved as Boneh-Franklin IBE over BLS12-381; reduces to DBDH in the random oracle model (OQ-2 — closed).
 - **Behavioral fingerprint as persistent identifier.** Derived from public on-chain data and available to any observer. Degraded but not eliminated by per-n-epoch commits, relay submission, and transaction timing jitter.
 - **commit_T as per-epoch presence signal.** Published every epoch, exempt from n_commit batching. Opaque without verdict signature but confirms node liveness every epoch.
-- **Approximate interest cluster graph reconstruction.** Veilid routing substantially degrades this but does not eliminate it.
+- **Approximate interest cluster graph reconstruction.** Loopix relationship anonymity substantially degrades this but does not eliminate it — PSI traffic patterns over many epochs may still leak cluster topology to a patient adversary observing mix nodes.
+- **Poisson cover traffic bandwidth.** Every node emits traffic at a constant Poisson rate regardless of real activity. This is non-trivial on metered or mobile connections (OQ-58).
 - **Committee chain trust.** Compromise of a full committee threshold reveals continuity proofs, raw scores, and fine-grained behavioral data.
 - **Score verification trustlessness.** Ordinary nodes cannot recompute raw scores from public chain data alone. Verification is committee-attested. Accepted cost of the dual-chain model.
 - **p_v targeted inflation.** An adversary can inflate preference weights for target items within the bounds of Statements 1 and 3.
@@ -1446,9 +1453,9 @@ Each B-level and H-level row in the table corresponds to at least one Phase 5 ex
 
 ### 9.1 Minimal Viable PrivaCF
 
-**Core hypothesis:** Decentralized CF with rotating pseudonymous identities, Dandelion++ routing, Veilid transport, Jaccard PSI peer selection, Merkle-committed behavioral history with peer attestations, multi-auditor encrypted handoff, a dual-chain architecture for public state, nullifier-based suspension persistence, forward-secure commitment for dark node closure, commit-reveal verdict observability, and light Sybil resistance can surface content that a popularity baseline misses, without a trusted server.
+**Core hypothesis:** Decentralized CF with rotating pseudonymous identities, Loopix/Sphinx mixnet transport, Dandelion++ broadcast routing, Jaccard PSI peer selection, Merkle-committed behavioral history with peer attestations, multi-auditor encrypted handoff, a dual-chain architecture for public state, nullifier-based suspension persistence, forward-secure commitment for dark node closure, commit-reveal verdict observability, and light Sybil resistance can surface content that a popularity baseline misses, without a trusted server.
 
-**Stack:** Python or Rust · NumPy/ndarray · hnswlib · EMP-toolkit (Pinkas PSI) · tendermint-rs (BFT consensus) · blst (BLS signatures) · Poseidon crate (arkworks-rs) · Simulated network for Experiments 1–3 · Veilid + Dandelion++ for Experiment 4.
+**Stack:** Python or Rust · NumPy/ndarray · hnswlib · EMP-toolkit (Pinkas PSI) · tendermint-rs (BFT consensus) · blst (BLS signatures) · Poseidon crate (arkworks-rs) · Simulated network for Experiments 1–3 · Katzenpost (Loopix/Sphinx) + Dandelion++ for Experiment 4.
 
 **Datasets:**
 
@@ -1473,7 +1480,7 @@ _E4 — PSI peer selection and identity rotation._ Gate: PSI improves precision@
 
 **Phase 1 — Identity, Network, and Blockchain Core**
 
-Poseidon PRF epoch IDs and permutation; null_v local derivation; staggered epoch offsets; variable chopping with VRF-jittered n_v(T); niche item announcement delay; identity VDF chain with interaction checkpoints; Pedersen commitment; Merkle tree with peer-attested leaves; HNSW snapshot storage for rewind; Shamir distribution to auditor committee; Noise Protocol sessions; Dandelion++ with timeout retry; Veilid transport; uniform frame padding; communication rhythm; entry protocol; Class 2 passive audit; cover traffic; first-observation report collection and committee chain submission; ADMITTING health tier.
+Poseidon PRF epoch IDs and permutation; null_v local derivation; staggered epoch offsets; variable chopping with VRF-jittered n_v(T); niche item announcement delay; identity VDF chain with interaction checkpoints; Pedersen commitment; Merkle tree with peer-attested leaves; HNSW snapshot storage for rewind; Shamir distribution to auditor committee; Katzenpost (Loopix/Sphinx) transport with provider-based NAT traversal; SURB-based request-response; Dandelion++ for broadcast fluff phase with timeout retry; Sphinx fixed-size packet padding; Noise Protocol sessions for clearnet/dev only; Loopix loop and drop cover traffic at base Poisson rate; communication rhythm; entry protocol; Class 2 passive audit; first-observation report collection and committee chain submission; ADMITTING health tier.
 
 ForwardCommit construction and per-epoch commit_T publication; Statement 5 extended circuit (four checks + SMT path) in Plonky3; DECRYPTION_SMT initialization; verdict_commit and verdict_reveal transaction types; null_v_decryption transaction type and permissionless aggregation; watchdog_signal transaction type; DKG protocol for per-epoch committee threshold BLS key.
 
@@ -1483,7 +1490,7 @@ Committee chain: threshold-held encrypted ledger; committee handoff protocol bet
 
 Relay nodes: VRF selection; submission batching; reputation model integration.
 
-_Exit: N nodes cycling through staggered epochs over Veilid with public state on public chain and sensitive state on committee chain. Block finality verified. Double-signing detection verified. Light client sync verified. Class 2 audit flow end-to-end verified. Relay submission verified. Statement 5 proof generation and verification end-to-end verified. commit_T published and verified each epoch. Commit-reveal verdict flow end-to-end verified including permissionless aggregation. DECRYPTION_SMT insertion verified. Watchdog signal broadcast verified. Dark node extraction verified — node goes offline after publish, committee decrypts from commit_T._
+_Exit: N nodes cycling through staggered epochs over the Loopix/Sphinx mixnet with public state on public chain and sensitive state on committee chain. Block finality verified. Double-signing detection verified. Light client sync verified. Class 2 audit flow end-to-end verified. Relay submission verified. Statement 5 proof generation and verification end-to-end verified. commit_T published and verified each epoch. Commit-reveal verdict flow end-to-end verified including permissionless aggregation. DECRYPTION_SMT insertion verified. Watchdog signal broadcast verified. Dark node extraction verified — node goes offline after publish, committee decrypts from commit_T._
 
 **Phase 2 — Reputation and Sybil Resistance**
 
@@ -1622,6 +1629,7 @@ Full signed preference model; asymmetric PSI cache decay; two-tier peer selectio
 | OQ-55 | Can the SecLDP trust model from the unified DP-DL MF framework (Cyffers et al., arXiv:2510.17480, 2025) be adapted to derive formal GDP bounds on PrivaCF's gossip exchange, parameterized by n_v(T), the Laplace noise scale, and the permutation key?       | Privacy          | theoretical              | 2    | 3      | open                |
 | OQ-56 | Does PrivaCF's item-based CF on accumulated gossip vectors achieve comparable recommendation quality to gossip-based matrix factorization (Hegedűs et al., ECML PKDD 2019) under matched sparsity conditions on MovieLens and RateYourMusic?                    | CF               | empirical                | 3    | 2      | open                |
 | OQ-57 | Can sustained reputation laundering — proactive identity rotation across many cycles — amortize admission cost in a way that defeats the rate-limiting effect of the VDF chain, and does behavioral fingerprinting hold against a launderer who deliberately varies patterns across cycles? | Sybil resistance | theoretical \| empirical | 2    | 3      | open                |
+| OQ-58 | What base Poisson rate λ for Loopix loop and drop cover traffic provides sufficient anonymity against a mix-node-observing adversary without imposing unacceptable bandwidth overhead on metered or mobile deployments, and what is the correct λ per config (A–E)? | Network | empirical | 3 | 2 | open |
 
 **Notes on selected questions**
 
@@ -2103,7 +2111,7 @@ All messages transmitted inside uniform fixed-size encrypted frames via Noise Pr
 | `q_v(T)`            | Local acceptance rate                                                                   |
 | HNSW snapshots      | Periodic snapshots retained for rewind recovery                                         |
 | PSI cache           | Per-peer Jaccard similarity scores and ZK continuity weights                            |
-| IP address          | Hidden from all other nodes by Veilid transport                                         |
+| IP address          | Hidden from all other nodes by Loopix/Sphinx mixnet transport                           |
 
 **On the public blockchain:**
 
@@ -2198,7 +2206,7 @@ SETUP (one-time)
   Begin admission window (n epochs)
       Each epoch: compute and publish identity VDF proof on-chain
       At VRF-determined checkpoint epochs:
-          PSI handshake with random existing node (Veilid-routed)
+          PSI handshake with random existing node (Loopix mix-routed, SURB reply)
           Gossip vector exchange + collect receipt
       First-observation reports submitted to committee chain only
       Public chain records admission decision only on completion
@@ -2218,7 +2226,7 @@ EACH EPOCH (offset_v stagger)
   ├── Construct commit_T = BF-IBE.Encrypt(null_v, "SUSPEND epoch_id_T", threshold_BLS_pk_T; r_commit_T)
   ├── Generate Statement 5 ZK proof (4 checks + SMT path)
   ├── Optional ZK continuity proof (committee chain only)
-  ├── Refresh bridge peer (DHT + Veilid)
+  ├── Refresh bridge peer (DHT + Loopix provider)
   ├── Update PSI cache (λ_proof or λ_noproof)
   └── Store HNSW snapshot if snapshot interval reached
 
@@ -2298,8 +2306,8 @@ TIER 1 — Build now
   HNSW snapshot storage            Periodic local snapshots for rewind
   Shamir k-of-n                    sharks crate; extend for k > 3
   Noise Protocol sessions          snow crate
-  Dandelion++ gossip               libp2p-gossipsub; timeout retry
-  Veilid transport                 veilid-core (Rust)
+  Dandelion++ gossip               libp2p-gossipsub; broadcast fluff phase only; timeout retry
+  Loopix/Sphinx transport          katzenpost (Go); Sphinx packet format; SURB replies; provider-based NAT
   LSH                              FALCONN
   HNSW                             hnswlib / instant-distance
   Plonky3 proofs                   plonky3 crate
@@ -2319,7 +2327,7 @@ TIER 2 — Adapt prior work
   Double-signing detection         Standard BFT; epoch_id key structure
   Light client headers + proofs    Standard Merkle SPV
   Genesis transition protocol      Bootstrap behavioral cluster relaxation
-  Asymmetric PSI (Pinkas 2018)     Unbalanced; Jaccard threshold; Veilid-routed
+  Asymmetric PSI (Pinkas 2018)     Unbalanced; Jaccard threshold; Loopix mix-routed with SURB
   PSI cache asymmetric decay       Jøsang & Ismail basis
   Two-tier peer selection          Cluster + bridge logic
   Class 2 passive audit            Nonce-in-pull; hash-in-response
@@ -2387,7 +2395,7 @@ TIER 4 — Research required before deployment
 
 ```
 CONFIG A — Open (invite-only, maximum Sybil resistance)
-  Transport:      Veilid + Dandelion++
+  Transport:      Loopix/Sphinx + Dandelion++ (broadcast only)
   Identity:       Persistent (no epoch rotation)
   Noise:          Chopping + cover items
   ZK:             On by default
@@ -2395,7 +2403,7 @@ CONFIG A — Open (invite-only, maximum Sybil resistance)
   Chain:          Full participation (can be validator)
 
 CONFIG B — Balanced (recommended default)
-  Transport:      Veilid + Dandelion++
+  Transport:      Loopix/Sphinx + Dandelion++ (broadcast only)
   Identity:       Poseidon PRF rotation
   Noise:          Chopping + cover items
   ZK:             On by default
@@ -2403,7 +2411,7 @@ CONFIG B — Balanced (recommended default)
   Chain:          Light client
 
 CONFIG C — High-Security (sensitive content, political contexts)
-  Transport:      Veilid + Tor/I2P
+  Transport:      Loopix/Sphinx + Dandelion++ (broadcast only)
   Identity:       Poseidon PRF rotation
   Noise:          Chopping + cover items
   ZK:             On by default
@@ -2411,7 +2419,7 @@ CONFIG C — High-Security (sensitive content, political contexts)
   Chain:          Light client
 
 CONFIG D — Mainstream DP (formal guarantees on popular content)
-  Transport:      Veilid + Dandelion++
+  Transport:      Loopix/Sphinx + Dandelion++ (broadcast only)
   Identity:       Poseidon PRF rotation
   Noise:          Laplace S=2 per segment (head / long-tail), sign-bounded — NO chopping
   ZK:             On by default
@@ -2419,7 +2427,7 @@ CONFIG D — Mainstream DP (formal guarantees on popular content)
   Chain:          Light client
 
 CONFIG E — Binary Ratings (formal DSybil guarantee)
-  Transport:      Veilid + Dandelion++
+  Transport:      Loopix/Sphinx + Dandelion++ (broadcast only)
   Identity:       Poseidon PRF rotation
   Noise:          Chopping + cover items
   Ratings:        Binary (liked / not liked)
@@ -2441,7 +2449,7 @@ CONFIG E — Binary Ratings (formal DSybil guarantee)
 | Mobile / battery        | 5   | 4   | 2   | 4   | 4   |
 | Cold start speed        | 5   | 4   | 3   | 4   | 4   |
 
-_All configs: Veilid mandatory. Clearnet: dev/test only. Nullifier mechanism, SUSP_SMT, DECRYPTION_SMT, ForwardCommit, and commit-reveal verdict flow apply universally. commit_T is published every epoch regardless of n_commit setting._
+_All configs: Loopix/Sphinx mixnet mandatory. Dandelion++ retained for epidemic broadcast (fluff) phase only. Clearnet: dev/test only. Nullifier mechanism, SUSP_SMT, DECRYPTION_SMT, ForwardCommit, and commit-reveal verdict flow apply universally. commit_T is published every epoch regardless of n_commit setting._
 
 ---
 
@@ -2567,8 +2575,9 @@ PSI PEER SELECTION FLOW
 Node A                      Node B
     │                           │
     │── initiate PSI ──────────►│
-    │   (Veilid-routed,         │
-    │    content encrypted)     │
+    │   (Loopix mix-routed,     │
+    │    content encrypted,     │
+    │    SURB included)         │
     │                           │ compute Jaccard:
     │                           │ |A∩B| / |A∪B| ≥ θ?
     │◄── PSI result ────────────┤
