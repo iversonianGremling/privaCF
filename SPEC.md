@@ -53,8 +53,6 @@ Each participant holds a pseudonymous rotating identity tied to a computational 
 
 Suspension verdicts are permanent and survive identity rotation. A suspended node's nullifier — derived from their secret key — is inserted into a public Sparse Merkle Tree. Every future identity from the same key carries the same nullifier by construction; the membership proof fails by arithmetic, not by rule.
 
-A remaining gap — a node going dark before nullifier extraction — is closed by a forward-secure commitment scheme. Every epoch, each node publishes a commitment to their nullifier encrypted under their committee's threshold BLS key. A suspension verdict serves as the decryption key, making nullifier extraction possible without node cooperation. Critically, the committee must publicly commit to their verdict before decryption is possible, so any extraction attempt is visible to the entire network before a single nullifier is recovered.
-
 ---
 
 ## Table of Contents
