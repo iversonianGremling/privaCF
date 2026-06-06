@@ -1440,7 +1440,7 @@ Raw scores are held by the arbitration committee under threshold custody. The pu
 cluster_endorsement(v, T) = |{ p ∈ peers_v : p pulled from v in T }| / |peers_v|
 ```
 
-Excluded (not zeroed) for nodes with `|peers_v| = 0`: the w₄ term is omitted from the score computation and remaining weights are renormalized. This prevents penalizing nodes that have not yet grown a PSI peer neighborhood.
+Excluded (not zeroed) for nodes with `|peers_v| < k_min`: the w₄ term is omitted from the score computation and the remaining weights are renormalized to sum to the same total. This matches the k-anonymity gate of §7.4 — a node activates cluster-specific behavior (`cluster_endorsement` scoring and cluster-weighted `trust_total`) only once its PSI neighborhood reaches `k_min` — and serves two purposes at once: it avoids penalizing nodes that have not yet grown a neighborhood, and it blocks micro-cluster targeting, where an attacker assembles a tiny, highly specific peer set around a victim to manufacture an endorsement signal. Below `k_min` peers the node is scored on the global terms only.
 
 ### 6.2 Behavioral Cluster Computation
 
