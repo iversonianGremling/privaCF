@@ -1,0 +1,11 @@
+[package]
+name = "spike_stmt5_proving"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+plonky2 = "0.2"
+anyhow = "1.0"
+
+[profile.release]
+opt-level = 3
