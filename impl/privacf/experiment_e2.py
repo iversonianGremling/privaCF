@@ -86,27 +86,40 @@ def run(dataset="ml-1m", k=10, like_threshold=4.0, test_frac=0.2,
         tag = f"chop keep={f:.2f}" + (" +cover" if cover else "")
         _record(tag, _eval_cf(g, split, cfg, k, is_head, is_tail))
 
-    # --- laplace sweep ---
+    # --- laplace sweep (correct clamp-based ε-DP) ---
     for eps in epsilons:
-        g = obfuscate.laplace(split.pref_pos, epsilon=eps, seed=seed)
+        g = obfuscate.laplace(split.pref_pos, epsilon=eps, seed=seed, method="clamp")
         etag = "ε=∞ (norm only)" if not np.isfinite(eps) else f"ε={eps:g}"
-        _record(f"laplace {etag}", _eval_cf(g, split, cfg, k, is_head, is_tail))
+        _record(f"laplace[clamp] {etag}", _eval_cf(g, split, cfg, k, is_head, is_tail))
+
+    # --- legacy clip method (DP-voiding) shown for contrast: how much of the old
+    #     "ε-insensitive" result was the data-dependent-clip artifact ---
+    for eps in (e for e in epsilons if np.isfinite(e)):
+        g = obfuscate.laplace(split.pref_pos, epsilon=eps, seed=seed, method="clip_legacy")
+        _record(f"laplace[legacy] ε={eps:g}", _eval_cf(g, split, cfg, k, is_head, is_tail))
 
     # --- report ---
     print("\n" + "=" * 78)
     print(f"E2 — content discovery under noise (k={k}), per segment")
     print("=" * 78)
-    hdr = f"  {'config':<24} {'P@K all':>8} {'P@K head':>9} {'P@K tail':>9} {'R@K tail':>9}  gate"
+    hdr = f"  {'config':<26} {'P@K all':>8} {'P@K head':>9} {'P@K tail':>9} {'R@K tail':>9}  gate"
     print(hdr)
     print("  " + "-" * (len(hdr) - 2))
     for label, ov, hd, tl, passed in rows:
-        gate = "" if label == "popularity" else ("  ✅" if passed else "  ❌")
-        print(f"  {label:<24} {ov.precision:>8.4f} {hd.precision:>9.4f} "
+        if label == "popularity":
+            gate = ""
+        elif "legacy" in label:
+            gate = "  (contrast)"          # DP-voiding; shown for comparison, not gated
+        else:
+            gate = "  ✅" if passed else "  ❌"
+        print(f"  {label:<26} {ov.precision:>8.4f} {hd.precision:>9.4f} "
               f"{tl.precision:>9.4f} {tl.recall:>9.4f}{gate}")
 
     # E2 passes if CF beats popularity on long-tail precision at *every* tested
     # operating point (popularity tail precision = 0, so this means tail P > 0).
-    cf_rows = [r for r in rows if r[0] not in ("popularity",)]
+    # The legacy clip rows are excluded — they are not a valid DP deployment, shown
+    # only to expose the artifact in the old "ε-insensitive" claim.
+    cf_rows = [r for r in rows if r[0] != "popularity" and "legacy" not in r[0]]
     e2_pass = all(r[4] for r in cf_rows)
     worst = min(cf_rows, key=lambda r: r[3].precision)
     print("  " + "-" * (len(hdr) - 2))

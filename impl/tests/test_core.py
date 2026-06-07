@@ -128,15 +128,28 @@ def test_chop_cover_pads_back_to_original_count():
     assert int((g[0] > 0).sum()) == 10                 # padded back to original size
 
 
-def test_laplace_sign_preservation_keeps_support():
+def test_laplace_clamp_keeps_inactive_zero_and_nonneg():
     from privacf import obfuscate  # noqa: E402
     pref = np.zeros((1, 8), dtype=np.float32)
     pref[0, [1, 3, 5]] = np.array([1.0, 2.0, 1.0])
-    g = obfuscate.laplace(pref, epsilon=0.5, seed=3)   # heavy noise
-    # sign preservation: inactive dims get cap 0 -> stay exactly 0 (support preserved)
+    g = obfuscate.laplace(pref, epsilon=0.5, seed=3)   # heavy noise, default method="clamp"
+    # noise applied to active dims only -> inactive dims stay exactly 0 (which-items
+    # privacy is chopping's job, §4.5); clamp to [0,B] keeps everything non-negative
     assert np.all(g[0, [0, 2, 4, 6, 7]] == 0.0)
     assert np.all(g[0, [1, 3, 5]] >= 0.0)              # non-negative (positive-only gossip)
     assert not np.any(np.isnan(g))
+
+
+def test_laplace_clamp_is_data_independent_dp_post_processing():
+    from privacf import obfuscate  # noqa: E402
+    # clamp method bounds the output to [0, B] (data-independent) and renormalises;
+    # the legacy clip method (data-dependent, DP-voiding) is retained for the E2 contrast.
+    pref = np.zeros((1, 6), dtype=np.float32)
+    pref[0, [0, 2, 4]] = np.array([1.0, 1.0, 1.0])
+    clamp = obfuscate.laplace(pref, epsilon=1.0, seed=1, bound=0.5, normalize=False, method="clamp")
+    assert clamp.max() <= 0.5 + 1e-6                   # respects the public bound B
+    legacy = obfuscate.laplace(pref, epsilon=1.0, seed=1, method="clip_legacy")
+    assert not np.any(np.isnan(legacy)) and np.all(legacy >= 0.0)
 
 
 def test_laplace_inf_is_normalize_only():

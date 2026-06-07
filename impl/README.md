@@ -137,25 +137,45 @@ The gate (CF beats popularity on long-tail discovery) passes.
 
 ## What E2 shows
 
+> **Corrected 2026-06-06.** The DP mode now uses the **clean clamp-based ε-DP**
+> mechanism (SPEC §4.5 / SECURITY.md §P2): add Laplace on active dims, clamp the
+> output to `[0, B]` (data-independent), renormalise. The earlier "Laplace is flat
+> in ε / crank it down for free" headline was **partly an artifact** of the old
+> data-dependent noise-clip (`|noise_i| < |p_v[i]|`), which voided ε-DP and made the
+> perturbation proportional to each weight (hence ε-independent). E2 now sweeps both
+> and shows the contrast; numbers below are ml-1m.
+
 - **Chopping degrades gracefully.** Dropping transmitted preferences destroys item
   *support* (which items co-occur), so long-tail precision falls roughly linearly
   with the keep fraction — about half the tail precision is lost at 25 % retention.
-- **Sign-preserving Laplace is far gentler and flat in ε.** Because the §4.5
-  sign-preservation constraint caps noise at `|p_v[i]|` and is zero on inactive
-  dimensions, Laplace perturbs only the *magnitudes* of already-active items — item
-  support is fully preserved — so CF quality is nearly **independent of ε**: tail
-  precision is essentially the same at ε = 0.5 as at ε = 4. Most of Laplace's cost
-  is the L1 renormalisation, not the noise (the ε = ∞ "normalise-only" row isolates
-  this), and that renormalisation actually *raises* head/overall precision while
-  shifting a little weight off the tail.
+- **Correct clamp-based Laplace IS ε-sensitive — but not destructive, and the gate
+  holds at every ε.** Tail P@10: norm-only (ε=∞) 0.0296 → ε=4 0.0216 → ε=1 0.0246 →
+  ε=0.5 0.0253. Two things to read off it: (i) the curve is genuinely **non-flat**
+  (the old flat curve was the artifact); (ii) it's **non-monotone / U-shaped** — the
+  *worst* point is mid-range ε≈4, not the smallest ε. Why CF survives heavy noise:
+  because which-items privacy is chopping/permutation's job (§4.5), DP noise is added
+  to **active dims only**, so the item *support* is preserved; and at small ε the
+  clamp+renormalise degenerates toward a **randomised binarisation** of that support
+  (≈half the items survive at near-equal weight), which item-cosine CF — being
+  co-occurrence-driven — tolerates well. So tail precision dips at moderate ε (noise
+  corrupts weights without yet binarising) and partly recovers at small ε.
+- **The legacy clip rows expose the artifact.** `laplace[legacy]` is flat in ε
+  (tail P ≈ 0.025 at ε = 4, 1, 0.5) exactly as the old write-up reported — because the
+  data-dependent clip made the effective perturbation ε-independent. That flatness was
+  never a property of a *valid* DP mechanism; it's shown only for contrast and is
+  excluded from the gate.
 - The gate (long-tail precision ≥ popularity) holds at **every** tested operating
-  point of both modes — privacy does not eliminate long-tail discovery.
+  point of chopping and the correct clamp-Laplace — privacy does not eliminate
+  long-tail discovery.
 
-The practical reading: **the formal-DP mode is cheap and ε-insensitive for CF
-quality (you can crank ε down for a strong guarantee almost for free), while the
-niche-friendly chopping mode pays a steady, predictable price that scales with how
-much you drop** — a real deployment tradeoff between formal guarantees (Laplace)
-and small-anonymity-set friendliness (chopping), now quantified rather than assumed.
+The corrected practical reading: **the formal-DP mode is not "free" — tightening ε
+does cost CF quality (the old free-lunch claim was a DP-voiding artifact) — but the
+cost is bounded and the long-tail floor is never breached, because support is
+protected by a separate mechanism and item-cosine CF leans on co-occurrence, not exact
+weights.** Chopping still pays a steady, predictable price scaling with how much it
+drops. The real deployment tradeoff stands — formal guarantee (clamp-Laplace) vs.
+small-anonymity-set friendliness (chopping) — now with an *honest* ε/utility curve for
+the DP mode rather than a flat one.
 
 ## What E3 shows
 

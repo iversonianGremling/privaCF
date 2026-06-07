@@ -9,13 +9,26 @@ per head/long-tail segment.
   chopping (niche-friendly)  transmit exactly n_v(T) positive elements, the rest
                              dropped; optionally pad back up with cover items drawn
                              toward low-trust (novel) items.  §4.5 "Variable chopping"
-  laplace  (formal DP)       L1-normalise the row, add Laplace(0, S/ε) (S=2), then
-                             enforce sign preservation |noise_i| < |p_v[i]|.  §4.5
+  laplace  (formal DP)       L1-normalise the row, add Laplace(0, S/ε) (S=2) on the
+                             active dimensions, then **clamp the output to [0, B]**
+                             (B public) and renormalise.  §4.5
 
-Key faithful detail: under sign preservation, Laplace perturbs only the *magnitude*
-of already-active dimensions (cap = 0 on inactive dims), so it preserves item support
-(which items co-occur) while jittering weights. Chopping, by contrast, destroys
-support. This asymmetry is the headline of E2.
+Faithful detail (corrected 2026-06-06 to match SPEC §4.5 / SECURITY.md §P2): the DP
+mode now achieves sign preservation by a **data-independent output clamp** to [0, B],
+not by the old data-dependent noise-truncation |noise_i| < |p_v[i]|. The latter
+conditioned the output on a data-dependent event and therefore **voided nominal
+ε-DP** (neighbouring vectors got outputs with different supports). The clamp +
+renormalise are post-processing of the noised vector, so by DP's post-processing
+immunity the mechanism is **clean ε-DP (δ=0)**.
+
+Consequence for E2: the old "ε-insensitive, nearly free" Laplace result was partly an
+*artifact* of that DP-voiding clip — clipping noise to ±|p_v[i]| made the effective
+perturbation proportional to each weight (hence ε-independent) and never dropped an
+active item. Under the correct clamp, a small active weight whose draw goes negative
+clamps to 0 (mild support loss that grows as ε shrinks), so the corrected Laplace is
+genuinely ε-*sensitive*. The `method="clip_legacy"` path is retained so E2 can show
+the contrast directly. Which-items privacy remains chopping/permutation's job (§4.5),
+so noise is applied to active dimensions only — inactive dims stay 0.
 """
 
 from __future__ import annotations
@@ -77,16 +90,30 @@ def _add_cover(out, real_pos, n_cover, rng, cover_scale, trust_total, c):
 
 
 def laplace(pref_pos: np.ndarray, epsilon: float, seed: int = 0,
-            sensitivity: float = 2.0, sign_preserve: bool = True,
-            normalize: bool = True) -> np.ndarray:
-    """Laplace DP obfuscation (§4.5).
+            sensitivity: float = 2.0, bound: float = 1.0,
+            normalize: bool = True, method: str = "clamp") -> np.ndarray:
+    """Laplace DP obfuscation (§4.5, corrected to clean ε-DP).
 
     L1-normalise each row (so ‖p_v‖₁ = 1, making S = 2 meaningful), add
-    Laplace(0, S/ε), and enforce the sign-preservation constraint
-    |noise_i| < |p_v[i]| by per-dimension truncation. Only positive weights are
-    transmitted, so the result is clamped at 0. epsilon = inf gives the
-    normalize-only reference point (isolates the cost of noise from the cost of
-    the L1 renormalisation).
+    Laplace(0, S/ε) on the active dimensions, then post-process. Two methods:
+
+      method="clamp"  (default, **correct — clean ε-DP, δ=0**):
+          gossip = renormalise(clamp(p_v + noise·active, 0, B))
+          The clamp to [0, B] and the renormalise are data-independent functions of
+          the noised vector, so by post-processing immunity the mechanism stays ε-DP.
+          Sign preservation falls out of the non-negativity clamp (a sign-flipping
+          draw projects to 0 = "not endorsed"). B is a public deployment constant.
+
+      method="clip_legacy"  (**old — voids ε-DP; kept only for the E2 contrast**):
+          gossip = max(0, p_v + clip(noise, -|p_v|, |p_v|))
+          Truncating the noise to ±|p_v[i]| conditions on a data-dependent event,
+          which destroys nominal ε-DP. Retained so E2 can show how much of the old
+          "ε-insensitive" result was this artifact.
+
+    Noise is applied to active dims only — which-items privacy is chopping/
+    permutation's job (§4.5), so inactive dims stay exactly 0 in both methods.
+    epsilon = inf gives the normalise-only reference point (isolates the cost of
+    noise from the cost of the L1 renormalisation).
     """
     rng = np.random.default_rng(seed)
     out = pref_pos.astype(np.float32).copy()
@@ -98,9 +125,18 @@ def laplace(pref_pos: np.ndarray, epsilon: float, seed: int = 0,
     if not np.isfinite(epsilon):
         return np.maximum(0.0, out)
 
+    active = out > 0
     scale = sensitivity / epsilon
-    noise = rng.laplace(0.0, scale, size=out.shape).astype(np.float32)
-    if sign_preserve:
-        cap = np.abs(out)                # cap = 0 on inactive dims -> they stay 0
-        noise = np.clip(noise, -cap, cap)
-    return np.maximum(0.0, out + noise)
+    noise = (rng.laplace(0.0, scale, size=out.shape).astype(np.float32)) * active
+
+    if method == "clamp":
+        out = np.clip(out + noise, 0.0, bound)         # data-independent → ε-DP preserved
+        if normalize:
+            l1 = out.sum(axis=1, keepdims=True)         # renormalise (post-processing)
+            l1[l1 == 0] = 1.0
+            out = out / l1
+        return out
+    elif method == "clip_legacy":
+        cap = np.abs(out)                               # data-dependent cap (DP-voiding)
+        return np.maximum(0.0, out + np.clip(noise, -cap, cap))
+    raise ValueError(f"unknown laplace method: {method!r}")
