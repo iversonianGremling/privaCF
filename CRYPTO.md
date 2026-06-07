@@ -15,10 +15,10 @@ This document explains the cryptographic building blocks used in the PrivaCF spe
 - [Pedersen Commitments](#pedersen-commitments)
 - [Poseidon PRF](#poseidon-prf)
 - [PSI (Private Set Intersection)](#psi-private-set-intersection)
-- Boneh-Franklin IBE _(placeholder)_
-- VDF (Verifiable Delay Function) _(placeholder)_
-- Plonky3 / ZK Proof System _(placeholder)_
-- BLS12-381 Curve _(placeholder)_
+- [Boneh-Franklin IBE](#boneh-franklin-ibe)
+- [VDF (Verifiable Delay Function)](#vdf-verifiable-delay-function)
+- [Plonky3 / ZK Proof System](#plonky3--zk-proof-system)
+- [BLS12-381 Curve](#bls12-381-curve)
 
 ---
 
@@ -301,3 +301,121 @@ The key privacy property: a node that fails the Jaccard threshold learns only th
 ### What it does not protect against
 
 PSI reveals the intersection to the initiating party. Over many PSI runs with different peers, an adversary who controls many nodes can build up a partial picture of a target's item set by observing which items appear repeatedly in intersection results. PrivaCF mitigates this through the PSI cache (avoiding redundant runs), the cluster size limits (bounding the number of peers a node runs PSI with), and the preference obfuscation in transit (§4.5), but residual inference from repeated PSI is an acknowledged limitation.
+
+---
+
+## Boneh-Franklin IBE
+
+**Reference:** Boneh & Franklin, "Identity-Based Encryption from the Weil Pairing", CRYPTO 2001. "Encrypt-to-a-future-signature" usage: Gailly, Melissaris & Yoshida, "tlock: Practical Timelock Encryption from Threshold BLS", 2023.
+
+### What it is
+
+Identity-Based Encryption removes the need to fetch a recipient's public key before encrypting: the *public key is an arbitrary string* (an "identity"), and a trusted authority — the Private Key Generator (PKG) — derives the matching private key from its master secret. In the Boneh-Franklin construction over a bilinear pairing, encrypting to identity `id` uses the master *public* key plus `H(id)` hashed to a curve point; the private key for `id` is the master secret applied to `H(id)`. Decryption succeeds only for the holder of that derived key.
+
+The property PrivaCF actually exploits is a specific way of instantiating the PKG. If the master keypair is a **threshold BLS keypair**, then the BLS *signature* on the message `id` is exactly the IBE private key for identity `id` (both are "the master secret applied to `H(id)`"). This collapses "produce the decryption key for `id`" into "threshold-sign the string `id`". An identity can therefore be encrypted to *today*, and only becomes decryptable once a quorum signs that identity — possibly far in the future, possibly never.
+
+### What PrivaCF needs from it
+
+`ForwardCommit` (§4.9.4) is Boneh-Franklin IBE over BLS12-381 used in exactly this mode. A node's nullifier is additively split `null_v = s₁ + s₂` and the two shares are IBE-encrypted to two different identities:
+
+- `s₁` → identity `"SUSPEND epoch_id_T"`, under each fallback committee's threshold BLS public key (the committee is the PKG). The IBE private key is the committee's threshold signature on that string — which exists only if the committee runs the §4.9.6 verdict reveal.
+- `s₂` → identity `"VERDICT_FINALIZED epoch_id_T"`, under the standing validator-attestation key `VA_pub`. The IBE private key is `σ_T^VERDICT`, published only when a SUSPEND verdict is finalized on-chain.
+
+Because neither signature exists until the corresponding public event, `commit_T` is decryptable **iff and only when** a node is actually suspended — enforced by cryptography rather than by an escrow-deletion policy. See the spec's forward-secrecy argument (§4.9.4, §8.2 T12) for why the 2-of-2 split closes the lingering-shares gap.
+
+### Security property assumed
+
+IND-ID-CCA (or IND-ID-CPA for the basic scheme) reducing to the **Decisional Bilinear Diffie-Hellman (DBDH)** assumption on the pairing groups, in the random oracle model. On BLS12-381 this rests ultimately on the hardness of discrete log on the curve. The implementation falls out of `blst` (already in the stack).
+
+### What it does not provide
+
+IBE has **inherent key escrow**: whoever holds the master secret (or can assemble a signing threshold) can decrypt *any* identity, retroactively. In PrivaCF this is the intended semantics, not a flaw — but it is precisely why the construction must (a) split `null_v` across two independent PKGs so no single body can decrypt, and (b) tie one share to a public, slashable on-chain event. A **DST collision** between the IBE key-derivation hash-to-curve and any other BLS signing the committee or validators perform would let an unrelated signature serve as a decryption key; RFC 9380 governs the construction and a CI-enforced DST-uniqueness test is required (§4.9.4).
+
+---
+
+## VDF (Verifiable Delay Function)
+
+**Reference:** Boneh, Bonneau, Bünz & Fisch, "Verifiable Delay Functions", CRYPTO 2018. Efficient constructions: Wesolowski, EUROCRYPT 2019; Pietrzak, ITCS 2019.
+
+### What it is
+
+A Verifiable Delay Function takes a prescribed number of *sequential* steps to evaluate — and crucially **cannot be sped up by parallelism**: a thousand cores compute it no faster than one. Yet the result comes with a short proof that anyone can verify almost instantly. The canonical construction is repeated squaring in a group of unknown order, `y = x^(2^t)`, which is inherently sequential (each squaring needs the previous result), with a Wesolowski or Pietrzak proof that the squaring was done `t` times.
+
+The defining asymmetry — slow to compute, fast to verify, and *unparallelizable* — is what makes a VDF a clock that cannot be cheated by spending money on hardware.
+
+### What PrivaCF needs from it
+
+PrivaCF uses VDFs in two distinct roles:
+
+1. **Identity admission cost (§4.3).** Admission requires completing a *chain* of VDF evaluations over `n` epochs (`vdf_proof_T = VDF_eval(vdf_proof_{T-1}, δ_identity)`). Because the chain is sequential, an adversary cannot parallelize identity creation: minting `k` Sybil identities costs `k ×` the wall-clock delay per identity, not a constant amortized over a server farm. This is the structural backbone of Sybil rate-limiting — and the reason reputation-laundering by rapid rotation is bounded (OQ-57: rotation cannot parallelize the sequential chain).
+
+2. **Block-chain time and beacon unpredictability (§4.1).** Each block carries `vdf_output_T = VDF_eval(vdf_output_{T-1}, δ_block)`, chaining blocks through a verifiable delay and feeding `beacon_T = H(drand_T ‖ vdf_output_{T-1})`. The VDF ensures the beacon cannot be biased by a proposer who sees `drand_T` early, and that chain history cannot be cheaply re-forged.
+
+### Security property assumed
+
+The **sequentiality** assumption: no adversary (even with polynomially many parallel processors) evaluates the VDF in significantly fewer sequential steps than the honest evaluator. This is assumption A3 in the spec. Concrete instantiation: class groups of imaginary quadratic order (no trusted setup) or RSA groups (trusted-setup modulus), via the Chia `vdf` crate.
+
+### What it does not protect against
+
+A VDF **rate-limits, it does not block**. A single attacker with one fast machine still produces *one* identity per delay period; the defense against an attacker willing to pay that cost repeatedly with *fresh keys* falls to the other mechanisms (behavioral fingerprinting, non-overwhelming trust) — this is the I7 "new-key rotator, varied fingerprint" residual (§7.9 row 13, §8.1). VDF hardware does vary across devices (ASIC vs. mobile), so the *delay* a given `δ` imposes is hardware-dependent; gap-tolerance policy for slow/intermittent devices is OQ-18.
+
+---
+
+## Plonky3 / ZK Proof System
+
+**Reference:** Polygon Zero, Plonky3 (2024), successor to Plonky2 (2022). Underlying techniques: PLONK arithmetization (Gabizon, Williamson & Ciobotaru, 2019); FRI low-degree testing (Ben-Sasson et al., ICALP 2018).
+
+### What it is
+
+A zero-knowledge proof system lets a prover convince a verifier that "I know a witness `w` such that statement `C(x, w)` holds" while revealing nothing about `w` beyond the truth of the statement. Plonky3 is a modern, transparent (no trusted setup) SNARK toolkit: it arithmetizes a computation into polynomial constraints in the PLONK style, commits to those polynomials with a **FRI**-based scheme over a small prime field (Goldilocks, BabyBear, or Mersenne31), and applies Fiat-Shamir to make the proof non-interactive. The small-field choice and FRI make proving fast and recursion-friendly; the cost is paid in proof size relative to pairing-based SNARKs, which matters little for PrivaCF's on-device verification model.
+
+The reason PrivaCF pairs Plonky3 with **Poseidon** (not SHA-256) for in-circuit hashing is exactly the constraint-count argument in the Poseidon entry: a hash that costs a few hundred constraints instead of tens of thousands is the difference between a feasible and an infeasible handoff proof.
+
+### What PrivaCF needs from it
+
+Every privacy-preserving verification in PrivaCF is a Plonky3 statement:
+
+- The **handoff proof** evaluating Statements 1, 2, 3, and 5 together each epoch (§4.9.5): preference-norm validity, directional consistency, temporal consistency, and the big one — Statement 5: `null_v = Poseidon(sk, …)`, `epoch_id_T` derivation, **SUSP_SMT non-membership with `null_v` as a private witness**, and `ForwardCommit` certification across all `N_fallback` committee ciphertexts plus `d_T` and the `s₁ + s₂ = null_v` split.
+- The **cross-epoch continuity proof** (§4.7), a Poseidon-PRF relation submitted to the arbitration committee only.
+- The ZK **cluster-membership / justified-disclosure** circuits (OQ-11) and the **PSI-ack diversity predicate** (OQ-61).
+
+The verifier learns only proof validity — never `sk`, `null_v`, the preference vector, or which SMT position was checked.
+
+### Security property assumed
+
+**Knowledge-soundness** (a cheating prover cannot produce an accepting proof without a valid witness) from the FRI/PCP machinery, and **zero-knowledge** from the standard SNARK simulator, with Fiat-Shamir security in the random oracle model. Transparent setup — no toxic waste. The hash assumptions are shared with Poseidon, so the ZK layer introduces no *new* hardness assumption beyond those.
+
+### What it does not provide
+
+The binding constraint is **proving time, not verification**. Verification is cheap and succinct; generating the Statement 5 proof — dominated by the SMT path and the per-slot pairing checks — is the open feasibility question, benchmarked on desktop as a PoC gate and on mobile as data-only (OQ-3, the P-feasibility gate in [SECURITY.md](./SECURITY.md)). A statement that is sound and zero-knowledge but takes too long to prove per epoch on the target device is a *design* problem, not a parameter tweak.
+
+---
+
+## BLS12-381 Curve
+
+**Reference:** Bowe, "BLS12-381: New zk-SNARK Elliptic Curve Construction" (2017); Barreto, Lynn & Scott, "Constructing Elliptic Curves with Prescribed Embedding Degrees", SCN 2002.
+
+### What it is
+
+BLS12-381 is a *pairing-friendly* elliptic curve: a Barreto–Lynn–Scott curve with embedding degree 12 over a 381-bit base field, providing roughly 128-bit security. "Pairing-friendly" means it admits an efficiently computable bilinear pairing `e: G1 × G2 → GT` mapping points from two source groups into a target group — the algebraic structure every pairing-based primitive in PrivaCF relies on. Its scalar field has prime order `r` (a 255-bit prime); arithmetic "mod `p`" in the spec — for instance the additive nullifier split `s₁ + s₂ = null_v (mod p)` — is arithmetic in this scalar field.
+
+The curve is the one used by Ethereum's beacon chain, Filecoin, Zcash Sapling, and drand, so it has mature, audited, constant-time implementations (`blst`).
+
+### What PrivaCF needs from it
+
+BLS12-381 is the *single shared curve* under the entire cryptographic stack, which is deliberate — it lets one well-audited library back several primitives:
+
+- **BLS signatures and threshold BLS** for block finality and committee verdicts.
+- **Boneh-Franklin IBE** (`ForwardCommit`), whose pairing operations are over this curve.
+- **EC-VRF** for validator/committee/relay selection (RFC 9381 instantiated on the curve).
+- The **scalar field** as the modulus for the `null_v` split and other field arithmetic, and — via a Poseidon instance over a compatible field — the bridge between the signature layer and the ZK layer.
+
+Concrete sizes the spec quotes (e.g. `commit_T ≈ 96 × (N_fallback + 1)` bytes) come from G2 element encodings on this curve.
+
+### Security property assumed
+
+Hardness of the elliptic-curve discrete log on the curve, and the pairing-based assumptions that reduce to it: **co-CDH** (for BLS unforgeability) and **DBDH** (for Boneh-Franklin IBE). These are standard and widely deployed.
+
+### What it does not provide
+
+BLS12-381 is a **classical-security** curve — it is *not* post-quantum; a cryptographically relevant quantum computer would break every primitive built on it. This is out of PrivaCF's threat model (as for essentially all pairing-based systems today). The curve targets ~128-bit security, slightly below the once-assumed 128 due to refined tower-field discrete-log analysis, but comfortably within deployment norms.
