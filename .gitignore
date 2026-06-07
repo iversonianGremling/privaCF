@@ -1,0 +1,10 @@
+# Rust build artifacts
+target/
+
+# EasyCrypt compiled output
+*.eco
+
+# Python (also covered by impl/.gitignore)
+__pycache__/
+*.pyc
+.pytest_cache/
