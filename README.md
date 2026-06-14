@@ -152,8 +152,6 @@ python3 -m privacf.experiment_frontier --dataset ml-1m  # accuracy <-> discovery
 python3 -m privacf.experiment_temporal                  # temporal: convergence + on-off attack
 ```
 
-![E1 experiment — privacy-preserving CF beats a popularity baseline on long-tail discovery](docs/demo.gif)
-
 What it shows, in short: item-based CF over accumulated gossip vectors **beats a popularity
 baseline on long-tail discovery**; in-transit privacy (chopping or clamp-Laplace DP) costs
 bounded quality without ever breaching the long-tail floor; the novelty term is **genuine
