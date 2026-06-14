@@ -105,6 +105,14 @@ impl/            Reference implementation (proof-of-concept).
 A behavioral sketch; primitives are named here and defined precisely in
 [SPEC.md §4](./SPEC.md#4-identity-and-privacy).
 
+The design is easiest to read as a progression — plain collaborative filtering, then hardened one
+mechanism at a time (a PSI handshake, uniform-size noised vectors, identity rotation, a Loopix mixnet,
+decoy traffic), with the privacy and Sybil-resistance properties each layer buys. The end state
+(rendered from [`graphs/`](./graphs); [SPEC.md §5.1](./SPEC.md#5-recommendation) is authoritative where
+the older sketches and the spec disagree):
+
+![PrivaCF design progression — naive CF hardened step by step into the full private, Sybil-resistant protocol, with the properties each layer adds](docs/architecture.png)
+
 **Getting recommendations.** Your node keeps a preference vector entirely local. Each epoch it
 exchanges a *shuffled, partially transmitted* version of it with a few peers whose tastes
 overlap with yours — peers discovered without revealing what those tastes are. Exactly `n_v(T)`
@@ -151,6 +159,8 @@ python3 -m privacf.experiment_e4     --dataset ml-1m    # E4: PSI peer selection
 python3 -m privacf.experiment_frontier --dataset ml-1m  # accuracy <-> discovery sweep
 python3 -m privacf.experiment_temporal                  # temporal: convergence + on-off attack
 ```
+
+![E1 experiment — privacy-preserving CF beats a popularity baseline on long-tail discovery](docs/demo.gif)
 
 What it shows, in short: item-based CF over accumulated gossip vectors **beats a popularity
 baseline on long-tail discovery**; in-transit privacy (chopping or clamp-Laplace DP) costs
