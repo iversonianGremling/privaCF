@@ -4,7 +4,7 @@
 //! lowest-output leader, vote on its block, and finalize once a quorum certificate (≥ ⌊2N/3⌋+1
 //! votes) forms.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -17,7 +17,7 @@ use tracing::{debug, info};
 use crate::beacon::next_beacon;
 use crate::chain::{block_id, qc_valid, Block, BlockHeader, Chain, Vote};
 use crate::commit::{CommitT, StubVerEnc, VerEnc};
-use crate::consensus::{leader, quorum};
+use crate::consensus::{leader_for, quorum};
 use crate::epoch::EpochTransaction;
 use crate::field::{add_mod, from_u64, random_field, sub_mod, to_u64};
 use crate::identity::NodeIdentity;
@@ -57,19 +57,23 @@ pub struct NodeOutcome {
     pub split_ok: bool,
     /// True iff every non-genesis block carries a valid quorum certificate.
     pub all_qc_valid: bool,
+    /// Highest view any finalized block used (> 0 means view-change fired — a leader was skipped).
+    pub max_view: u64,
 }
 
 /// Per-height consensus state.
 struct Round {
     height: u64,
+    view: u64,                                         // current view (advances on leader timeout)
     beacon_t: u64,
     my_vrf: VrfClaim,
     claims: HashMap<[u8; 32], [u8; 32]>,               // peer -> vrf output
     blocks: HashMap<[u8; 32], Block>,                  // block_id -> proposed block
     votes: HashMap<[u8; 32], HashMap<[u8; 32], Vote>>, // block_id -> voter -> vote
-    proposed: bool,
-    voted: Option<[u8; 32]>,
-    vrf_deadline: Instant,
+    proposed_views: HashSet<u64>,                      // views I have already proposed in
+    voted: Option<[u8; 32]>,                           // block_id voted for in the CURRENT view
+    vrf_deadline: Instant,                             // when claim collection ends
+    view_deadline: Instant,                            // when to advance to the next view
 }
 
 pub struct Node {
@@ -77,6 +81,9 @@ pub struct Node {
     config: NodeConfig,
     verenc: StubVerEnc,
     validators: Vec<[u8; 32]>,
+    /// Test fault injection: participate in VRF + voting but never propose when elected leader,
+    /// forcing the other validators to view-change past us. Honest default is `false`.
+    withhold_proposals: bool,
 }
 
 impl Node {
@@ -85,7 +92,14 @@ impl Node {
             config.genesis_validators.iter().map(|(id, _)| *id).collect();
         validators.sort();
         validators.dedup();
-        Self { identity: Arc::new(identity), config, verenc: StubVerEnc, validators }
+        Self { identity: Arc::new(identity), config, verenc: StubVerEnc, validators, withhold_proposals: false }
+    }
+
+    /// Fault-injection builder: this node will never propose (Byzantine leader that withholds its
+    /// block), exercising the other validators' view-change path.
+    pub fn byzantine_withhold(mut self) -> Self {
+        self.withhold_proposals = true;
+        self
     }
 
     fn me(&self) -> [u8; 32] {
@@ -128,8 +142,23 @@ impl Node {
         Self::gossip(peers, Message::Vrf(my_vrf.clone()));
         let mut claims = HashMap::new();
         claims.insert(self.me(), my_vrf.output);
-        let vrf_deadline = Instant::now() + Duration::from_millis(self.config.window_ms / 3);
-        Round { height, beacon_t, my_vrf, claims, blocks: HashMap::new(), votes: HashMap::new(), proposed: false, voted: None, vrf_deadline }
+        let now = Instant::now();
+        let vrf_deadline = now + Duration::from_millis(self.config.window_ms / 3);
+        // view 0 runs from vrf_deadline until one view_timeout (= window) later.
+        let view_deadline = vrf_deadline + Duration::from_millis(self.config.window_ms);
+        Round {
+            height,
+            view: 0,
+            beacon_t,
+            my_vrf,
+            claims,
+            blocks: HashMap::new(),
+            votes: HashMap::new(),
+            proposed_views: HashSet::new(),
+            voted: None,
+            vrf_deadline,
+            view_deadline,
+        }
     }
 
     fn assemble_block(&self, chain: &Chain, r: &Round, pending: &HashMap<(u64, u64), EpochTransaction>) -> Block {
@@ -138,8 +167,9 @@ impl Node {
         let mut txs: Vec<EpochTransaction> =
             pending.iter().filter(|((h, _), _)| *h == r.height).map(|(_, v)| v.clone()).collect();
         txs.sort_by_key(|t| t.epoch_id);
-        let header =
-            BlockHeader::create(&self.identity, r.height, r.beacon_t, prev, my_epoch_id, &r.my_vrf);
+        let header = BlockHeader::create(
+            &self.identity, r.height, r.view, r.beacon_t, prev, my_epoch_id, &r.my_vrf,
+        );
         Block { header, txs, qc: Vec::new() }
     }
 
@@ -153,8 +183,8 @@ impl Node {
         Self::gossip(peers, Message::Vote(vote));
     }
 
-    /// Structural + VRF-leadership validity (no quorum certificate required — a live proposal).
-    fn valid_proposal(&self, chain: &Chain, b: &Block) -> bool {
+    /// Structural validity + a verifiable VRF leadership proof (does not check WHICH view's leader).
+    fn structural_and_vrf_ok(&self, chain: &Chain, b: &Block) -> bool {
         let head = &chain.head().header;
         if b.header.height != head.height + 1 || b.header.prev_block_hash != chain.head_hash() {
             return false;
@@ -174,12 +204,22 @@ impl Node {
         claim.verify(b.header.beacon_t)
     }
 
-    /// Full validity for appending a finalized/synced block: a valid proposal WITH a quorum cert.
-    fn valid_block(&self, chain: &Chain, b: &Block) -> bool {
-        self.valid_proposal(chain, b) && qc_valid(b, &self.validators)
+    /// Live-proposal validity (deciding whether to VOTE): structural + VRF + the proposer is the
+    /// correct leader for the block's view, per our claim set.
+    fn valid_proposal(&self, chain: &Chain, b: &Block, claims: &HashMap<[u8; 32], [u8; 32]>) -> bool {
+        self.structural_and_vrf_ok(chain, b)
+            && leader_for(claims, b.header.view) == Some(b.header.proposer_peer)
     }
 
-    /// Once the VRF window closes: the leader proposes, everyone votes for the leader's block.
+    /// Append validity for a finalized/synced block: structural + VRF + a valid quorum certificate.
+    /// The QC (≥ quorum honest votes) is itself the proof the proposer was the legitimate leader,
+    /// so this does not need the per-height claim set (which past/synced heights lack).
+    fn valid_block(&self, chain: &Chain, b: &Block) -> bool {
+        self.structural_and_vrf_ok(chain, b) && qc_valid(b, &self.validators)
+    }
+
+    /// After claim collection: advance the view on leader timeout, the current view's leader
+    /// proposes, and everyone votes for that leader's block.
     fn on_tick(
         &self,
         r: &mut Round,
@@ -187,23 +227,35 @@ impl Node {
         pending: &HashMap<(u64, u64), EpochTransaction>,
         peers: &PeersMap,
     ) {
-        if Instant::now() >= r.vrf_deadline {
-            if let Some(ldr) = leader(&r.claims) {
-                if ldr == self.me() && !r.proposed {
-                    let block = self.assemble_block(chain, r, pending);
-                    let bid = block_id(&block.header, &block.txs);
-                    debug!(height = r.height, txs = block.txs.len(), "proposing as VRF leader");
-                    r.blocks.insert(bid, block.clone());
-                    r.proposed = true;
-                    Self::gossip(peers, Message::Proposal(block));
+        let now = Instant::now();
+        if now < r.vrf_deadline {
+            return; // still collecting VRF claims
+        }
+        // view-change: the current leader didn't get us to a quorum certificate in time.
+        if now >= r.view_deadline {
+            r.view += 1;
+            r.voted = None;
+            r.view_deadline = now + Duration::from_millis(self.config.window_ms);
+            debug!(height = r.height, view = r.view, "view-change (leader timeout)");
+        }
+        if let Some(ldr) = leader_for(&r.claims, r.view) {
+            if ldr == self.me() && !r.proposed_views.contains(&r.view) && !self.withhold_proposals {
+                let block = self.assemble_block(chain, r, pending);
+                let bid = block_id(&block.header, &block.txs);
+                debug!(height = r.height, view = r.view, txs = block.txs.len(), "proposing as VRF leader");
+                r.blocks.insert(bid, block.clone());
+                r.proposed_views.insert(r.view);
+                Self::gossip(peers, Message::Proposal(block));
+                self.cast_vote(r, bid, peers);
+            }
+            if r.voted.is_none() {
+                if let Some((bid, _)) = r
+                    .blocks
+                    .iter()
+                    .find(|(_, b)| b.header.view == r.view && b.header.proposer_peer == ldr)
+                    .map(|(k, v)| (*k, v.clone()))
+                {
                     self.cast_vote(r, bid, peers);
-                }
-                if r.voted.is_none() {
-                    if let Some((bid, _)) =
-                        r.blocks.iter().find(|(_, b)| b.header.proposer_peer == ldr).map(|(k, v)| (*k, v.clone()))
-                    {
-                        self.cast_vote(r, bid, peers);
-                    }
                 }
             }
         }
@@ -251,15 +303,14 @@ impl Node {
             }
             Message::Proposal(b) => {
                 if let Some(r) = round {
-                    if b.header.height == r.height && self.valid_proposal(chain, &b) {
+                    if b.header.height == r.height && self.valid_proposal(chain, &b, &r.claims) {
+                        let bview = b.header.view;
                         let bid = block_id(&b.header, &b.txs);
                         r.blocks.entry(bid).or_insert(b);
-                        if Instant::now() >= r.vrf_deadline && r.voted.is_none() {
-                            if let Some(ldr) = leader(&r.claims) {
-                                if r.blocks.get(&bid).map(|b| b.header.proposer_peer) == Some(ldr) {
-                                    self.cast_vote(r, bid, peers);
-                                }
-                            }
+                        // valid_proposal already confirmed the proposer is the leader for `bview`,
+                        // so vote iff it matches our current view and we haven't voted in it yet.
+                        if Instant::now() >= r.vrf_deadline && r.voted.is_none() && bview == r.view {
+                            self.cast_vote(r, bid, peers);
                         }
                         self.try_finalize(r, chain, peers);
                     }
@@ -374,7 +425,8 @@ impl Node {
         }
 
         let all_qc_valid = chain.blocks.iter().skip(1).all(|b| qc_valid(b, &self.validators));
-        info!(peer = %hex::encode(&my_id[..4]), blocks = chain.blocks.len(), head = %hex::encode(&chain.head_hash()[..4]), all_qc_valid, "node done");
+        let max_view = chain.blocks.iter().map(|b| b.header.view).max().unwrap_or(0);
+        info!(peer = %hex::encode(&my_id[..4]), blocks = chain.blocks.len(), head = %hex::encode(&chain.head_hash()[..4]), all_qc_valid, max_view, "node done");
         NodeOutcome {
             peer_id: my_id,
             head_hash: chain.head_hash(),
@@ -382,6 +434,7 @@ impl Node {
             epoch_ids,
             split_ok,
             all_qc_valid,
+            max_view,
         }
     }
 }

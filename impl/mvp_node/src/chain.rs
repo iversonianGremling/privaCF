@@ -15,6 +15,7 @@ use crate::vrf::VrfClaim;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BlockHeader {
     pub height: u64,
+    pub view: u64,                     // view-change counter (0 = first leader; +1 per timeout)
     pub beacon_t: u64,
     pub prev_block_hash: [u8; 32],
     pub susp_smt_root: [u8; 32],       // zero stub — no suspensions in the MVP
@@ -73,9 +74,11 @@ impl Vote {
 }
 
 impl BlockHeader {
+    #[allow(clippy::too_many_arguments)]
     pub fn create(
         proposer: &NodeIdentity,
         height: u64,
+        view: u64,
         beacon_t: u64,
         prev_block_hash: [u8; 32],
         proposer_epoch_id: u64,
@@ -83,6 +86,7 @@ impl BlockHeader {
     ) -> Self {
         BlockHeader {
             height,
+            view,
             beacon_t,
             prev_block_hash,
             susp_smt_root: [0u8; 32],
@@ -113,6 +117,7 @@ impl Chain {
     pub fn genesis() -> Self {
         let header = BlockHeader {
             height: 0,
+            view: 0,
             beacon_t: GENESIS_BEACON,
             prev_block_hash: [0u8; 32],
             susp_smt_root: [0u8; 32],

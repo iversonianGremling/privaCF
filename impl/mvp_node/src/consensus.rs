@@ -15,11 +15,15 @@ pub fn quorum(n: usize) -> usize {
     (2 * n) / 3 + 1
 }
 
-/// The elected leader for a round: the validator with the smallest VRF output (peer id breaks ties).
-/// `claims` maps peer id → VRF output. Deterministic once every node has the same claim set.
-pub fn leader(claims: &HashMap<[u8; 32], [u8; 32]>) -> Option<[u8; 32]> {
-    claims
-        .iter()
-        .min_by(|a, b| a.1.cmp(b.1).then_with(|| a.0.cmp(b.0)))
-        .map(|(peer, _)| *peer)
+/// The elected leader for `(round, view)`: candidates sorted by VRF output (peer id breaks ties);
+/// view 0 is the lowest output, each view-change advances to the next candidate. `claims` maps
+/// peer id → VRF output. Deterministic once every node has the same claim set, so a timed-out
+/// (crashed) leader is skipped to the next-lowest VRF candidate without coordination.
+pub fn leader_for(claims: &HashMap<[u8; 32], [u8; 32]>, view: u64) -> Option<[u8; 32]> {
+    if claims.is_empty() {
+        return None;
+    }
+    let mut candidates: Vec<(&[u8; 32], &[u8; 32])> = claims.iter().collect();
+    candidates.sort_by(|a, b| a.1.cmp(b.1).then_with(|| a.0.cmp(b.0)));
+    Some(*candidates[(view as usize) % candidates.len()].0)
 }
