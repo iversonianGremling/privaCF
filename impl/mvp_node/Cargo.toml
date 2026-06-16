@@ -31,6 +31,8 @@ serde = { version = "1", features = ["derive"] }
 bincode = "1.3"
 # block-plumbing hash (NOT circuit-constrained; Poseidon is reserved for identity derivation)
 blake3 = "1"
+# BLS12-381 aggregate multisignatures for quorum certificates (isolated in bls.rs)
+blst = "0.3"
 # errors / cli / logging / config
 anyhow = "1.0"
 thiserror = "1"

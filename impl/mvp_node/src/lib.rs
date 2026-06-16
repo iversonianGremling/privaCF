@@ -7,6 +7,7 @@
 
 pub mod admission;
 pub mod beacon;
+pub mod bls;
 pub mod chain;
 pub mod commit;
 pub mod consensus;

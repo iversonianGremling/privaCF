@@ -1,15 +1,18 @@
 //! Minimal append-only chain with VRF-elected proposers and quorum-certificate finality
 //! (SPEC §4.1, MVP subset). Each block is produced by the VRF-elected leader (`vrf.rs`,
-//! `consensus.rs`) and is only appendable once it carries a quorum certificate: ≥ ⌊2N/3⌋+1
-//! distinct validator votes over its block id. The SMT roots remain zero stubs (no suspensions).
+//! `consensus.rs`) and is only appendable once it carries a quorum certificate: an aggregate
+//! BLS signature (`bls.rs`) of ≥ ⌊2N/3⌋+1 distinct validator votes over its block id. The SMT
+//! roots remain zero stubs (no suspensions).
 
-use ed25519_dalek::Signature;
+use std::collections::{HashMap, HashSet};
+
 use serde::{Deserialize, Serialize};
 
 use crate::beacon::GENESIS_BEACON;
+use crate::bls;
 use crate::consensus::quorum;
 use crate::epoch::EpochTransaction;
-use crate::identity::{verify, NodeIdentity};
+use crate::identity::NodeIdentity;
 use crate::vrf::VrfClaim;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -26,21 +29,30 @@ pub struct BlockHeader {
     pub vrf_proof: Vec<u8>,            // proof of that VRF output (verifiable leadership)
 }
 
-/// A validator's vote over a block id — the unit of the quorum certificate.
+/// A validator's BLS vote over a block id — the unit aggregated into the quorum certificate. The
+/// signed message is the block id itself, so every voter for a block signs the same bytes (required
+/// for same-message aggregation).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Vote {
     pub height: u64,
     pub block_id: [u8; 32],
     pub voter: [u8; 32],
-    pub sig: Vec<u8>, // ed25519 over vote_signing_bytes
+    pub bls_sig: Vec<u8>, // BLS12-381 signature over block_id (96 B compressed)
+}
+
+/// A quorum certificate: the aggregate BLS signature of a quorum of votes plus the signer set.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct QuorumCert {
+    pub signers: Vec<[u8; 32]>,
+    pub agg_sig: Vec<u8>, // aggregate BLS signature over block_id (96 B)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Block {
     pub header: BlockHeader,
     pub txs: Vec<EpochTransaction>,
-    /// Quorum certificate: ≥ quorum distinct validator votes over `block_id(header, txs)`.
-    pub qc: Vec<Vote>,
+    /// Quorum certificate over `block_id(header, txs)`.
+    pub qc: QuorumCert,
 }
 
 /// The block id is the convergence/linking identity. It EXCLUDES the quorum certificate so it is
@@ -50,24 +62,16 @@ pub fn block_id(header: &BlockHeader, txs: &[EpochTransaction]) -> [u8; 32] {
     *blake3::hash(&bytes).as_bytes()
 }
 
-/// Canonical bytes a voter signs for `(height, block_id)`.
-pub fn vote_signing_bytes(height: u64, block_id: &[u8; 32]) -> Vec<u8> {
-    bincode::serialize(&("vote", height, block_id)).expect("vote serialize")
-}
-
 impl Vote {
     pub fn create(voter: &NodeIdentity, height: u64, block_id: [u8; 32]) -> Self {
-        let sig = voter.sign(&vote_signing_bytes(height, &block_id)).to_bytes().to_vec();
-        Self { height, block_id, voter: voter.peer_id(), sig }
+        let bls_sig = voter.bls_sign(&block_id).to_vec();
+        Self { height, block_id, voter: voter.peer_id(), bls_sig }
     }
 
-    pub fn verify_sig(&self) -> bool {
-        match <[u8; 64]>::try_from(self.sig.as_slice()) {
-            Ok(arr) => verify(
-                &self.voter,
-                &vote_signing_bytes(self.height, &self.block_id),
-                &Signature::from_bytes(&arr),
-            ),
+    /// Verify this vote's BLS signature over its block id, given the voter's BLS public key.
+    pub fn verify(&self, bls_pk: &[u8; 48]) -> bool {
+        match <[u8; 96]>::try_from(self.bls_sig.as_slice()) {
+            Ok(sig) => bls::verify(bls_pk, &self.block_id, &sig),
             Err(_) => false,
         }
     }
@@ -127,7 +131,7 @@ impl Chain {
             vrf_output: [0u8; 32],
             vrf_proof: Vec::new(),
         };
-        Chain { blocks: vec![Block { header, txs: Vec::new(), qc: Vec::new() }] }
+        Chain { blocks: vec![Block { header, txs: Vec::new(), qc: QuorumCert::default() }] }
     }
 
     pub fn head(&self) -> &Block {
@@ -159,23 +163,28 @@ impl Chain {
     }
 }
 
-/// Verify a block's quorum certificate against the validator set: ≥ quorum distinct, valid votes
-/// from validators, all over this block's id.
-pub fn qc_valid(block: &Block, validators: &[[u8; 32]]) -> bool {
+/// Verify a block's quorum certificate: ≥ quorum distinct validator signers, and their aggregate
+/// BLS signature verifies over this block's id under the aggregated signer public keys.
+pub fn qc_valid(block: &Block, validators: &[[u8; 32]], bls_pks: &HashMap<[u8; 32], [u8; 48]>) -> bool {
     let bid = block_id(&block.header, &block.txs);
-    let mut seen = std::collections::HashSet::new();
-    let mut count = 0usize;
-    for v in &block.qc {
-        if v.height != block.header.height || v.block_id != bid {
-            return false;
-        }
-        if !validators.contains(&v.voter) || !seen.insert(v.voter) {
-            return false;
-        }
-        if !v.verify_sig() {
-            return false;
-        }
-        count += 1;
+    let signers = &block.qc.signers;
+    if signers.len() < quorum(validators.len()) {
+        return false;
     }
-    count >= quorum(validators.len())
+    let mut seen = HashSet::new();
+    let mut pks = Vec::with_capacity(signers.len());
+    for s in signers {
+        if !validators.contains(s) || !seen.insert(*s) {
+            return false;
+        }
+        match bls_pks.get(s) {
+            Some(pk) => pks.push(*pk),
+            None => return false,
+        }
+    }
+    let agg: [u8; 96] = match <[u8; 96]>::try_from(block.qc.agg_sig.as_slice()) {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    bls::verify_aggregate(&pks, &bid, &agg)
 }

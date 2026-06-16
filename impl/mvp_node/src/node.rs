@@ -15,7 +15,8 @@ use tokio::time::{interval, Instant};
 use tracing::{debug, info};
 
 use crate::beacon::next_beacon;
-use crate::chain::{block_id, qc_valid, Block, BlockHeader, Chain, Vote};
+use crate::bls;
+use crate::chain::{block_id, qc_valid, Block, BlockHeader, Chain, QuorumCert, Vote};
 use crate::commit::{CommitT, StubVerEnc, VerEnc};
 use crate::consensus::{leader_for, quorum};
 use crate::epoch::EpochTransaction;
@@ -28,12 +29,12 @@ use crate::vrf::VrfClaim;
 type PeersMap = Arc<Mutex<HashMap<[u8; 32], mpsc::UnboundedSender<Message>>>>;
 
 /// The genesis validator set for a seed-derived demo/test network: node `i` has identity
-/// `from_seed(i)` and listens on `127.0.0.1:(base_port + i)`.
-pub fn genesis_validator_set(nodes: u64, base_port: u16) -> Vec<([u8; 32], String)> {
+/// `from_seed(i)`, listens on `127.0.0.1:(base_port + i)`, and advertises its BLS public key.
+pub fn genesis_validator_set(nodes: u64, base_port: u16) -> Vec<([u8; 32], String, [u8; 48])> {
     (0..nodes)
         .map(|i| {
             let id = NodeIdentity::from_seed(i);
-            (id.peer_id(), format!("127.0.0.1:{}", base_port + i as u16))
+            (id.peer_id(), format!("127.0.0.1:{}", base_port + i as u16), id.bls_pk())
         })
         .collect()
 }
@@ -41,7 +42,8 @@ pub fn genesis_validator_set(nodes: u64, base_port: u16) -> Vec<([u8; 32], Strin
 #[derive(Clone)]
 pub struct NodeConfig {
     pub listen_addr: String,
-    pub genesis_validators: Vec<([u8; 32], String)>,
+    /// Genesis validators: (stable peer id, listen addr, BLS public key).
+    pub genesis_validators: Vec<([u8; 32], String, [u8; 48])>,
     pub window_ms: u64,
     pub max_height: u64,
     pub grace_ms: u64,
@@ -81,6 +83,7 @@ pub struct Node {
     config: NodeConfig,
     verenc: StubVerEnc,
     validators: Vec<[u8; 32]>,
+    bls_pks: HashMap<[u8; 32], [u8; 48]>,
     /// Test fault injection: participate in VRF + voting but never propose when elected leader,
     /// forcing the other validators to view-change past us. Honest default is `false`.
     withhold_proposals: bool,
@@ -89,10 +92,12 @@ pub struct Node {
 impl Node {
     pub fn new(identity: NodeIdentity, config: NodeConfig) -> Self {
         let mut validators: Vec<[u8; 32]> =
-            config.genesis_validators.iter().map(|(id, _)| *id).collect();
+            config.genesis_validators.iter().map(|(id, _, _)| *id).collect();
         validators.sort();
         validators.dedup();
-        Self { identity: Arc::new(identity), config, verenc: StubVerEnc, validators, withhold_proposals: false }
+        let bls_pks: HashMap<[u8; 32], [u8; 48]> =
+            config.genesis_validators.iter().map(|(id, _, pk)| (*id, *pk)).collect();
+        Self { identity: Arc::new(identity), config, verenc: StubVerEnc, validators, bls_pks, withhold_proposals: false }
     }
 
     /// Fault-injection builder: this node will never propose (Byzantine leader that withholds its
@@ -170,7 +175,7 @@ impl Node {
         let header = BlockHeader::create(
             &self.identity, r.height, r.view, r.beacon_t, prev, my_epoch_id, &r.my_vrf,
         );
-        Block { header, txs, qc: Vec::new() }
+        Block { header, txs, qc: QuorumCert::default() }
     }
 
     fn cast_vote(&self, r: &mut Round, bid: [u8; 32], peers: &PeersMap) {
@@ -215,7 +220,7 @@ impl Node {
     /// The QC (≥ quorum honest votes) is itself the proof the proposer was the legitimate leader,
     /// so this does not need the per-height claim set (which past/synced heights lack).
     fn valid_block(&self, chain: &Chain, b: &Block) -> bool {
-        self.structural_and_vrf_ok(chain, b) && qc_valid(b, &self.validators)
+        self.structural_and_vrf_ok(chain, b) && qc_valid(b, &self.validators, &self.bls_pks)
     }
 
     /// After claim collection: advance the view on leader timeout, the current view's leader
@@ -262,7 +267,7 @@ impl Node {
         self.try_finalize(r, chain, peers);
     }
 
-    /// Append a block whose quorum certificate is complete, and broadcast it.
+    /// Once a block has a quorum of votes, aggregate them into a quorum certificate, append, broadcast.
     fn try_finalize(&self, r: &mut Round, chain: &mut Chain, peers: &PeersMap) {
         let q = quorum(self.validators.len());
         let ready = r
@@ -271,10 +276,22 @@ impl Node {
             .find(|(bid, vs)| vs.len() >= q && r.blocks.contains_key(*bid))
             .map(|(bid, _)| *bid);
         if let Some(bid) = ready {
+            let mut signers = Vec::new();
+            let mut sigs: Vec<[u8; 96]> = Vec::new();
+            for (peer, vote) in &r.votes[&bid] {
+                if let Ok(sig) = <[u8; 96]>::try_from(vote.bls_sig.as_slice()) {
+                    signers.push(*peer);
+                    sigs.push(sig);
+                }
+            }
+            let agg = match bls::aggregate(&sigs) {
+                Some(a) => a,
+                None => return,
+            };
             let mut fb = r.blocks[&bid].clone();
-            fb.qc = r.votes[&bid].values().cloned().collect();
+            fb.qc = QuorumCert { signers: signers.clone(), agg_sig: agg.to_vec() };
             if chain.try_append(fb.clone()).is_ok() {
-                info!(height = fb.header.height, votes = fb.qc.len(), leader = %hex::encode(&fb.header.proposer_peer[..3]), "finalized block (quorum cert)");
+                info!(height = fb.header.height, signers = signers.len(), leader = %hex::encode(&fb.header.proposer_peer[..3]), "finalized block (aggregate BLS quorum cert)");
                 Self::gossip(peers, Message::Finalized(fb));
             }
         }
@@ -318,7 +335,10 @@ impl Node {
             }
             Message::Vote(v) => {
                 if let Some(r) = round {
-                    if v.height == r.height && self.validators.contains(&v.voter) && v.verify_sig() {
+                    let ok = v.height == r.height
+                        && self.validators.contains(&v.voter)
+                        && self.bls_pks.get(&v.voter).is_some_and(|pk| v.verify(pk));
+                    if ok {
                         r.votes.entry(v.block_id).or_default().insert(v.voter, v);
                         self.try_finalize(r, chain, peers);
                     }
@@ -366,7 +386,7 @@ impl Node {
                 }
             });
         }
-        for (pid, addr) in self.config.genesis_validators.iter() {
+        for (pid, addr, _bls) in self.config.genesis_validators.iter() {
             if *pid > my_id {
                 let addr = addr.clone();
                 let peers = peers.clone();
@@ -424,7 +444,8 @@ impl Node {
             }
         }
 
-        let all_qc_valid = chain.blocks.iter().skip(1).all(|b| qc_valid(b, &self.validators));
+        let all_qc_valid =
+            chain.blocks.iter().skip(1).all(|b| qc_valid(b, &self.validators, &self.bls_pks));
         let max_view = chain.blocks.iter().map(|b| b.header.view).max().unwrap_or(0);
         info!(peer = %hex::encode(&my_id[..4]), blocks = chain.blocks.len(), head = %hex::encode(&chain.head_hash()[..4]), all_qc_valid, max_view, "node done");
         NodeOutcome {

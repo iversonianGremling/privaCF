@@ -5,10 +5,11 @@
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
+use crate::bls::{keypair_from_ikm, sign as bls_sign_bytes};
 use crate::field::{from_u64, random_field, Fp};
 use crate::hash::{poseidon_scalar, DOM_EPOCH, DOM_NULL};
 
-/// A node's long-term identity. The signing key and `sk` never leave the device.
+/// A node's long-term identity. The signing key, `sk`, and BLS secret key never leave the device.
 pub struct NodeIdentity {
     pub signing: SigningKey,
     pub verifying: VerifyingKey,
@@ -16,16 +17,33 @@ pub struct NodeIdentity {
     pub sk: Fp,
     /// Cached permanent nullifier `null_v = Poseidon(sk, "null_v")`.
     pub null_v: Fp,
+    /// BLS12-381 secret key bytes (for consensus vote signatures).
+    bls_sk: [u8; 32],
+    /// BLS12-381 compressed public key (advertised in the validator set).
+    bls_pk: [u8; 48],
 }
 
 impl NodeIdentity {
-    /// Generate a fresh identity: new ed25519 keypair + fresh `sk` + derived `null_v`.
+    /// Generate a fresh identity: new ed25519 keypair + fresh `sk` + derived `null_v` + BLS keypair.
     pub fn generate(rng: &mut (impl rand::RngCore + rand::CryptoRng)) -> Self {
         let signing = SigningKey::generate(rng);
         let verifying = signing.verifying_key();
         let sk = random_field(rng);
         let null_v = poseidon_scalar(&[sk, from_u64(DOM_NULL)]);
-        Self { signing, verifying, sk, null_v }
+        let mut ikm = [0u8; 32];
+        rng.fill_bytes(&mut ikm);
+        let (bls_sk, bls_pk) = keypair_from_ikm(&ikm);
+        Self { signing, verifying, sk, null_v, bls_sk, bls_pk }
+    }
+
+    /// Compressed BLS public key (advertised to peers in the validator set).
+    pub fn bls_pk(&self) -> [u8; 48] {
+        self.bls_pk
+    }
+
+    /// BLS-sign a message (consensus votes).
+    pub fn bls_sign(&self, msg: &[u8]) -> [u8; 96] {
+        bls_sign_bytes(&self.bls_sk, msg)
     }
 
     /// Deterministic identity from a `u64` seed — so the demo/test can know every node's stable

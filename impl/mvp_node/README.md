@@ -21,8 +21,10 @@ Companion to `SPEC.md` §4.1 (chain/epochs), §4.2/§4.9.1 (identity derivation)
   participate in consensus on the next block.
 - **Consensus — simplified single-round BFT with view-change**: each height the validators
   broadcast a VRF claim (`vrf.rs`), deterministically elect the lowest-output leader, vote on its
-  block, and **finalize only once a quorum certificate forms — ≥ ⌊2N/3⌋+1 distinct validator votes
-  over the block id**. Honest validators vote only for the elected leader, so at most one block per
+  block with a **BLS12-381 signature** (`bls.rs`), and **finalize once a quorum certificate forms —
+  an aggregate BLS signature of ≥ ⌊2N/3⌋+1 distinct validator votes over the block id** (one 96-byte
+  signature, verified against the aggregated signer public keys; the spec's `validator_sigs`
+  mechanism, §4.1). Honest validators vote only for the elected leader, so at most one block per
   height can finalize under a <1/3 Byzantine assumption (safety). If the elected leader fails to
   produce a quorum in time, validators **view-change** to the next-lowest-VRF candidate, so a dead
   or withholding leader no longer stalls the height (liveness under leader failure).
@@ -56,7 +58,7 @@ distinctness and the publish-`s₁` split.
 | Seam (trait → stub / real future impl) | MVP behavior | Deferred to |
 |---|---|---|
 | `Transport` → `TcpTransport` / `LoopixTransport` | **clearnet, plaintext** — no Noise, no mixing; fully linkable to a network observer | SPEC §5.1 |
-| consensus — VRF election + quorum cert + view-change (real) → +threshold-BLS | **safety + leader-failure liveness done** (≥2/3 QC, view-change skips dead leaders); the QC is still a list of ed25519 votes rather than an aggregated threshold-BLS signature, and there is no slashing/equivocation detection | SPEC §4.1 |
+| consensus — VRF election + aggregate-BLS quorum cert + view-change (real) → +slashing/+DKG | **safety + leader-failure liveness + aggregate-BLS finality done** (≥2/3 BLS quorum cert, view-change skips dead leaders); remaining: no equivocation/slashing detection, and the QC is an aggregatable MULTISIG (signer set recorded), not a DKG threshold key (`VA_pub` is the separate DKG construct) | SPEC §4.1 |
 | `vrf` → ed25519-sig stand-in / EC-VRF | leader lottery works + is verifiable, but it is an ed25519-deterministic-sig stand-in, not a true VRF; and the beacon it binds to is grindable | SPEC EC-VRF |
 | `Admission` → `AcceptAll` / `VdfAdmission` | declared seam; membership is the static genesis set (Sybil-trivial) | SPEC §4.3 |
 | `Discovery` → `ConnectKnown` / `PsiDiscovery` | declared seam; peers come from the static genesis validator set | SPEC §5.3/§5.4 |
@@ -66,18 +68,17 @@ distinctness and the publish-`s₁` split.
 | ZK proof in the loop | omitted entirely | SPEC §4.9.5 |
 
 So the MVP demonstrates node creation, network formation, epoch cycling, `epoch_id` **rotation**,
-and **BFT-style consensus** (VRF leader election + ≥2/3 quorum-certificate finality + view-change
-past failed leaders) — but NOT the *unlinkability* rotation exists for (plaintext transport), Sybil
-cost, or any sealing/verdict/ZK property.
+and **BFT-style consensus** (VRF leader election + aggregate-BLS ≥2/3 quorum-certificate finality +
+view-change past failed leaders) — but NOT the *unlinkability* rotation exists for (plaintext
+transport), Sybil cost, or any sealing/verdict/ZK property.
 
 ## What to make real next
 
-Inside the consensus seam: **threshold-BLS QC aggregation** (so the quorum certificate is one
-aggregate signature, not a list of votes) + **equivocation/slashing detection**, plus a true
-**EC-VRF** in place of the ed25519-sig stand-in. Then the **`Transport` seam** (Noise → Loopix) to
-actually exercise unlinkability. *(Globally, separate from this node roadmap, the optimized
-non-native ZK **bridge gadget** — see `../spike_bridge_cost/` and `SPIKE-statement5.md` §10 —
-remains the standing P-feasibility item.)*
+Inside the consensus seam: **equivocation/slashing detection** (punish a leader that double-signs or
+a validator that votes for conflicting blocks) and a true **EC-VRF** in place of the ed25519-sig
+stand-in. Then the **`Transport` seam** (Noise → Loopix) to actually exercise unlinkability.
+*(Globally, separate from this node roadmap, the optimized non-native ZK **bridge gadget** — see
+`../spike_bridge_cost/` and `SPIKE-statement5.md` §10 — remains the standing P-feasibility item.)*
 
 ## Toolchain caveat
 
