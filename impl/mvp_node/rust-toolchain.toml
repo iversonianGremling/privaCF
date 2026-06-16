@@ -1,0 +1,4 @@
+# plonky2 0.2 (used in hash.rs for the Goldilocks Poseidon) requires nightly.
+# Pinned so bare `cargo` does not silently fall back to stable and fail to build.
+[toolchain]
+channel = "nightly"

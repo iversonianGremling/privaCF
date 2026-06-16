@@ -1,0 +1,46 @@
+[package]
+name = "mvp_node"
+version = "0.1.0"
+edition = "2021"
+description = "PrivaCF substrate thin-skeleton MVP — nodes that join a network and cycle staggered epochs"
+
+[lib]
+name = "mvp_node"
+path = "src/lib.rs"
+
+[[bin]]
+name = "node"
+path = "src/bin/node.rs"
+
+[[bin]]
+name = "demo"
+path = "src/bin/demo.rs"
+
+[dependencies]
+# Goldilocks Poseidon ONLY (isolated in hash.rs) — matches the eventual ZK circuit (spike_stmt5_proving).
+# Forces the nightly toolchain; see rust-toolchain.toml and hash.rs.
+plonky2 = "0.2"
+# async TCP networking
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+# identity signing keys (v2 is the maintained line; v1 is dead)
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+rand_core = "0.6"
+# wire serialization
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"
+# block-plumbing hash (NOT circuit-constrained; Poseidon is reserved for identity derivation)
+blake3 = "1"
+# errors / cli / logging / config
+anyhow = "1.0"
+thiserror = "1"
+hex = "0.4"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "test-util", "sync"] }
+
+[profile.release]
+opt-level = 3
