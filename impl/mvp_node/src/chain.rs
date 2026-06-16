@@ -6,13 +6,14 @@
 
 use std::collections::{HashMap, HashSet};
 
+use ed25519_dalek::Signature;
 use serde::{Deserialize, Serialize};
 
 use crate::beacon::GENESIS_BEACON;
 use crate::bls;
 use crate::consensus::quorum;
 use crate::epoch::EpochTransaction;
-use crate::identity::NodeIdentity;
+use crate::identity::{verify, NodeIdentity};
 use crate::vrf::VrfClaim;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -51,15 +52,66 @@ pub struct QuorumCert {
 pub struct Block {
     pub header: BlockHeader,
     pub txs: Vec<EpochTransaction>,
+    /// Proposer's ed25519 signature over `proposal_sig_bytes(height, view, block_id)` — binds the
+    /// proposer to THIS block (the VRF proof only proves leadership, not content) and is the
+    /// non-repudiable evidence used to detect equivocation.
+    pub proposer_sig: Vec<u8>,
     /// Quorum certificate over `block_id(header, txs)`.
     pub qc: QuorumCert,
 }
 
-/// The block id is the convergence/linking identity. It EXCLUDES the quorum certificate so it is
-/// stable before votes are gathered (votes are cast over this id).
+/// The block id is the convergence/linking identity. It EXCLUDES the proposer signature and the
+/// quorum certificate (both added after the id is fixed: votes are cast over this id).
 pub fn block_id(header: &BlockHeader, txs: &[EpochTransaction]) -> [u8; 32] {
     let bytes = bincode::serialize(&(header, txs)).expect("block serialize");
     *blake3::hash(&bytes).as_bytes()
+}
+
+/// What a proposer signs to bind itself to a block at a given slot: `(height, view, block_id)`.
+pub fn proposal_sig_bytes(height: u64, view: u64, block_id: &[u8; 32]) -> Vec<u8> {
+    bincode::serialize(&("proposal", height, view, block_id)).expect("proposal serialize")
+}
+
+impl Block {
+    /// Verify the proposer's signature binds `proposer_peer` to this block.
+    pub fn verify_proposer_sig(&self) -> bool {
+        let bid = block_id(&self.header, &self.txs);
+        let bytes = proposal_sig_bytes(self.header.height, self.header.view, &bid);
+        match <[u8; 64]>::try_from(self.proposer_sig.as_slice()) {
+            Ok(arr) => verify(&self.header.proposer_peer, &bytes, &Signature::from_bytes(&arr)),
+            Err(_) => false,
+        }
+    }
+}
+
+/// Non-repudiable proof that `proposer` signed two different blocks at the same `(height, view)`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EquivocationProof {
+    pub proposer: [u8; 32],
+    pub height: u64,
+    pub view: u64,
+    pub id_a: [u8; 32],
+    pub sig_a: Vec<u8>,
+    pub id_b: [u8; 32],
+    pub sig_b: Vec<u8>,
+}
+
+impl EquivocationProof {
+    /// Valid iff the two ids differ and both signatures are the proposer's over their own
+    /// `(height, view, id)` — i.e. the proposer provably double-signed the slot.
+    pub fn verify(&self) -> bool {
+        if self.id_a == self.id_b {
+            return false;
+        }
+        let check = |id: &[u8; 32], sig: &[u8]| -> bool {
+            let bytes = proposal_sig_bytes(self.height, self.view, id);
+            match <[u8; 64]>::try_from(sig) {
+                Ok(arr) => verify(&self.proposer, &bytes, &Signature::from_bytes(&arr)),
+                Err(_) => false,
+            }
+        };
+        check(&self.id_a, &self.sig_a) && check(&self.id_b, &self.sig_b)
+    }
 }
 
 impl Vote {
@@ -131,7 +183,14 @@ impl Chain {
             vrf_output: [0u8; 32],
             vrf_proof: Vec::new(),
         };
-        Chain { blocks: vec![Block { header, txs: Vec::new(), qc: QuorumCert::default() }] }
+        Chain {
+            blocks: vec![Block {
+                header,
+                txs: Vec::new(),
+                proposer_sig: Vec::new(),
+                qc: QuorumCert::default(),
+            }],
+        }
     }
 
     pub fn head(&self) -> &Block {

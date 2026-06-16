@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::chain::{Block, Vote};
+use crate::chain::{Block, EquivocationProof, Vote};
 use crate::epoch::EpochTransaction;
 use crate::vrf::VrfClaim;
 
@@ -20,6 +20,8 @@ pub enum Message {
     Vote(Vote),
     /// A block that reached a quorum certificate (finalized) — lets laggards adopt it directly.
     Finalized(Block),
+    /// Proof that a proposer double-signed a slot — slashes the offender network-wide.
+    Slash(EquivocationProof),
     /// Request all finalized blocks at height ≥ `from_height`.
     GetChain { from_height: u64 },
     /// Response to `GetChain`.

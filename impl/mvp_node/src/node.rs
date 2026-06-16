@@ -16,7 +16,10 @@ use tracing::{debug, info};
 
 use crate::beacon::next_beacon;
 use crate::bls;
-use crate::chain::{block_id, qc_valid, Block, BlockHeader, Chain, QuorumCert, Vote};
+use crate::chain::{
+    block_id, proposal_sig_bytes, qc_valid, Block, BlockHeader, Chain, EquivocationProof,
+    QuorumCert, Vote,
+};
 use crate::commit::{CommitT, StubVerEnc, VerEnc};
 use crate::consensus::{leader_for, quorum};
 use crate::epoch::EpochTransaction;
@@ -61,6 +64,8 @@ pub struct NodeOutcome {
     pub all_qc_valid: bool,
     /// Highest view any finalized block used (> 0 means view-change fired — a leader was skipped).
     pub max_view: u64,
+    /// Validators this node slashed for equivocation (sorted), network-consistent under honest majority.
+    pub slashed: Vec<[u8; 32]>,
 }
 
 /// Per-height consensus state.
@@ -74,6 +79,7 @@ struct Round {
     votes: HashMap<[u8; 32], HashMap<[u8; 32], Vote>>, // block_id -> voter -> vote
     proposed_views: HashSet<u64>,                      // views I have already proposed in
     voted: Option<[u8; 32]>,                           // block_id voted for in the CURRENT view
+    seen_proposals: HashMap<([u8; 32], u64), ([u8; 32], Vec<u8>)>, // (proposer,view) -> (id, sig)
     vrf_deadline: Instant,                             // when claim collection ends
     view_deadline: Instant,                            // when to advance to the next view
 }
@@ -87,6 +93,9 @@ pub struct Node {
     /// Test fault injection: participate in VRF + voting but never propose when elected leader,
     /// forcing the other validators to view-change past us. Honest default is `false`.
     withhold_proposals: bool,
+    /// Test fault injection: when elected leader, propose TWO conflicting blocks for the slot
+    /// (double-sign), to exercise equivocation detection + slashing. Honest default is `false`.
+    equivocate: bool,
 }
 
 impl Node {
@@ -97,13 +106,28 @@ impl Node {
         validators.dedup();
         let bls_pks: HashMap<[u8; 32], [u8; 48]> =
             config.genesis_validators.iter().map(|(id, _, pk)| (*id, *pk)).collect();
-        Self { identity: Arc::new(identity), config, verenc: StubVerEnc, validators, bls_pks, withhold_proposals: false }
+        Self {
+            identity: Arc::new(identity),
+            config,
+            verenc: StubVerEnc,
+            validators,
+            bls_pks,
+            withhold_proposals: false,
+            equivocate: false,
+        }
     }
 
     /// Fault-injection builder: this node will never propose (Byzantine leader that withholds its
     /// block), exercising the other validators' view-change path.
     pub fn byzantine_withhold(mut self) -> Self {
         self.withhold_proposals = true;
+        self
+    }
+
+    /// Fault-injection builder: this node double-signs its slot (proposes two conflicting blocks),
+    /// exercising equivocation detection + slashing.
+    pub fn byzantine_equivocate(mut self) -> Self {
+        self.equivocate = true;
         self
     }
 
@@ -161,21 +185,46 @@ impl Node {
             votes: HashMap::new(),
             proposed_views: HashSet::new(),
             voted: None,
+            seen_proposals: HashMap::new(),
             vrf_deadline,
             view_deadline,
         }
     }
 
-    fn assemble_block(&self, chain: &Chain, r: &Round, pending: &HashMap<(u64, u64), EpochTransaction>) -> Block {
+    /// The elected leader for `(view)` after excluding slashed validators.
+    fn elected_leader(
+        &self,
+        claims: &HashMap<[u8; 32], [u8; 32]>,
+        view: u64,
+        slashed: &HashSet<[u8; 32]>,
+    ) -> Option<[u8; 32]> {
+        let live: HashMap<[u8; 32], [u8; 32]> =
+            claims.iter().filter(|(p, _)| !slashed.contains(*p)).map(|(p, o)| (*p, *o)).collect();
+        leader_for(&live, view)
+    }
+
+    fn assemble_block(
+        &self,
+        chain: &Chain,
+        r: &Round,
+        pending: &HashMap<(u64, u64), EpochTransaction>,
+        alt: bool,
+    ) -> Block {
         let prev = chain.head_hash();
         let my_epoch_id = to_u64(self.identity.epoch_id(from_u64(r.beacon_t)));
         let mut txs: Vec<EpochTransaction> =
             pending.iter().filter(|((h, _), _)| *h == r.height).map(|(_, v)| v.clone()).collect();
         txs.sort_by_key(|t| t.epoch_id);
+        if alt {
+            txs.clear(); // a conflicting variant of the same slot -> a different block id
+        }
         let header = BlockHeader::create(
             &self.identity, r.height, r.view, r.beacon_t, prev, my_epoch_id, &r.my_vrf,
         );
-        Block { header, txs, qc: QuorumCert::default() }
+        let bid = block_id(&header, &txs);
+        let proposer_sig =
+            self.identity.sign(&proposal_sig_bytes(r.height, r.view, &bid)).to_bytes().to_vec();
+        Block { header, txs, proposer_sig, qc: QuorumCert::default() }
     }
 
     fn cast_vote(&self, r: &mut Round, bid: [u8; 32], peers: &PeersMap) {
@@ -206,14 +255,20 @@ impl Node {
             output: b.header.vrf_output,
             proof: b.header.vrf_proof.clone(),
         };
-        claim.verify(b.header.beacon_t)
+        claim.verify(b.header.beacon_t) && b.verify_proposer_sig()
     }
 
-    /// Live-proposal validity (deciding whether to VOTE): structural + VRF + the proposer is the
-    /// correct leader for the block's view, per our claim set.
-    fn valid_proposal(&self, chain: &Chain, b: &Block, claims: &HashMap<[u8; 32], [u8; 32]>) -> bool {
+    /// Live-proposal validity (deciding whether to VOTE): structural + VRF + proposer signature +
+    /// the proposer is the correct (non-slashed) leader for the block's view, per our claim set.
+    fn valid_proposal(
+        &self,
+        chain: &Chain,
+        b: &Block,
+        claims: &HashMap<[u8; 32], [u8; 32]>,
+        slashed: &HashSet<[u8; 32]>,
+    ) -> bool {
         self.structural_and_vrf_ok(chain, b)
-            && leader_for(claims, b.header.view) == Some(b.header.proposer_peer)
+            && self.elected_leader(claims, b.header.view, slashed) == Some(b.header.proposer_peer)
     }
 
     /// Append validity for a finalized/synced block: structural + VRF + a valid quorum certificate.
@@ -231,6 +286,7 @@ impl Node {
         chain: &mut Chain,
         pending: &HashMap<(u64, u64), EpochTransaction>,
         peers: &PeersMap,
+        slashed: &HashSet<[u8; 32]>,
     ) {
         let now = Instant::now();
         if now < r.vrf_deadline {
@@ -243,15 +299,24 @@ impl Node {
             r.view_deadline = now + Duration::from_millis(self.config.window_ms);
             debug!(height = r.height, view = r.view, "view-change (leader timeout)");
         }
-        if let Some(ldr) = leader_for(&r.claims, r.view) {
+        if let Some(ldr) = self.elected_leader(&r.claims, r.view, slashed) {
             if ldr == self.me() && !r.proposed_views.contains(&r.view) && !self.withhold_proposals {
-                let block = self.assemble_block(chain, r, pending);
-                let bid = block_id(&block.header, &block.txs);
-                debug!(height = r.height, view = r.view, txs = block.txs.len(), "proposing as VRF leader");
-                r.blocks.insert(bid, block.clone());
                 r.proposed_views.insert(r.view);
-                Self::gossip(peers, Message::Proposal(block));
-                self.cast_vote(r, bid, peers);
+                if self.equivocate {
+                    // Byzantine: double-sign two conflicting blocks for this slot.
+                    let a = self.assemble_block(chain, r, pending, false);
+                    let b = self.assemble_block(chain, r, pending, true);
+                    debug!(height = r.height, view = r.view, "EQUIVOCATING (double-signing the slot)");
+                    Self::gossip(peers, Message::Proposal(a));
+                    Self::gossip(peers, Message::Proposal(b));
+                } else {
+                    let block = self.assemble_block(chain, r, pending, false);
+                    let bid = block_id(&block.header, &block.txs);
+                    debug!(height = r.height, view = r.view, txs = block.txs.len(), "proposing as VRF leader");
+                    r.blocks.insert(bid, block.clone());
+                    Self::gossip(peers, Message::Proposal(block));
+                    self.cast_vote(r, bid, peers);
+                }
             }
             if r.voted.is_none() {
                 if let Some((bid, _)) = r
@@ -297,6 +362,7 @@ impl Node {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn on_msg(
         &self,
         msg: Message,
@@ -304,6 +370,7 @@ impl Node {
         chain: &mut Chain,
         pending: &mut HashMap<(u64, u64), EpochTransaction>,
         peers: &PeersMap,
+        slashed: &mut HashSet<[u8; 32]>,
     ) {
         match msg {
             Message::Tx(tx) => {
@@ -320,9 +387,32 @@ impl Node {
             }
             Message::Proposal(b) => {
                 if let Some(r) = round {
-                    if b.header.height == r.height && self.valid_proposal(chain, &b, &r.claims) {
+                    if b.header.height == r.height && self.valid_proposal(chain, &b, &r.claims, slashed) {
                         let bview = b.header.view;
                         let bid = block_id(&b.header, &b.txs);
+                        let proposer = b.header.proposer_peer;
+                        let key = (proposer, bview);
+                        // equivocation: same proposer already signed a DIFFERENT block at this slot.
+                        if let Some((prev_id, prev_sig)) = r.seen_proposals.get(&key).cloned() {
+                            if prev_id != bid {
+                                let proof = EquivocationProof {
+                                    proposer,
+                                    height: r.height,
+                                    view: bview,
+                                    id_a: prev_id,
+                                    sig_a: prev_sig,
+                                    id_b: bid,
+                                    sig_b: b.proposer_sig.clone(),
+                                };
+                                if proof.verify() && slashed.insert(proposer) {
+                                    info!(slashed = %hex::encode(&proposer[..4]), height = r.height, view = bview, "slashed equivocating proposer");
+                                    Self::gossip(peers, Message::Slash(proof));
+                                }
+                                return; // never store or vote for an equivocator's block
+                            }
+                        } else {
+                            r.seen_proposals.insert(key, (bid, b.proposer_sig.clone()));
+                        }
                         r.blocks.entry(bid).or_insert(b);
                         // valid_proposal already confirmed the proposer is the leader for `bview`,
                         // so vote iff it matches our current view and we haven't voted in it yet.
@@ -347,6 +437,11 @@ impl Node {
             Message::Finalized(b) => {
                 if self.valid_block(chain, &b) {
                     let _ = chain.try_append(b);
+                }
+            }
+            Message::Slash(proof) => {
+                if self.validators.contains(&proof.proposer) && proof.verify() && slashed.insert(proof.proposer) {
+                    info!(slashed = %hex::encode(&proof.proposer[..4]), "slashed via gossiped equivocation evidence");
                 }
             }
             Message::GetChain { from_height } => {
@@ -411,6 +506,7 @@ impl Node {
         let mut epoch_ids: Vec<(u64, u64)> = Vec::new();
         let mut split_ok = true;
         let mut round: Option<Round> = None;
+        let mut slashed: HashSet<[u8; 32]> = HashSet::new();
         let mut done_at: Option<Instant> = None;
         let mut ticker = interval(Duration::from_millis(10));
 
@@ -435,11 +531,11 @@ impl Node {
             tokio::select! {
                 _ = ticker.tick() => {
                     if let Some(r) = round.as_mut() {
-                        self.on_tick(r, &mut chain, &pending, &peers);
+                        self.on_tick(r, &mut chain, &pending, &peers, &slashed);
                     }
                 }
                 Some(msg) = inbox_rx.recv() => {
-                    self.on_msg(msg, round.as_mut(), &mut chain, &mut pending, &peers);
+                    self.on_msg(msg, round.as_mut(), &mut chain, &mut pending, &peers, &mut slashed);
                 }
             }
         }
@@ -447,7 +543,9 @@ impl Node {
         let all_qc_valid =
             chain.blocks.iter().skip(1).all(|b| qc_valid(b, &self.validators, &self.bls_pks));
         let max_view = chain.blocks.iter().map(|b| b.header.view).max().unwrap_or(0);
-        info!(peer = %hex::encode(&my_id[..4]), blocks = chain.blocks.len(), head = %hex::encode(&chain.head_hash()[..4]), all_qc_valid, max_view, "node done");
+        let mut slashed_vec: Vec<[u8; 32]> = slashed.iter().copied().collect();
+        slashed_vec.sort();
+        info!(peer = %hex::encode(&my_id[..4]), blocks = chain.blocks.len(), head = %hex::encode(&chain.head_hash()[..4]), all_qc_valid, max_view, slashed = slashed_vec.len(), "node done");
         NodeOutcome {
             peer_id: my_id,
             head_hash: chain.head_hash(),
@@ -456,6 +554,7 @@ impl Node {
             split_ok,
             all_qc_valid,
             max_view,
+            slashed: slashed_vec,
         }
     }
 }

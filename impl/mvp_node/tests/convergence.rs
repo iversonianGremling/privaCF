@@ -111,3 +111,58 @@ async fn view_change_recovers_from_a_withholding_leader() {
     let max_view = outs.iter().map(|o| o.max_view).max().unwrap();
     assert!(max_view >= 1, "view-change should have advanced past the withholding leader (got {max_view})");
 }
+
+/// Equivocation slashing: make the height-1 VRF leader a Byzantine node that double-signs its slot
+/// (proposes two conflicting blocks). The honest validators must detect the equivocation from the
+/// two signed proposals, slash the offender network-wide, and still converge on one chain with no
+/// fork. (Whether the offender's first block finalizes or it is skipped depends on gossip order —
+/// both are safe; the invariants asserted here hold either way.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slashing_detects_and_punishes_an_equivocating_leader() {
+    let nodes = 4u64;
+    let epochs = 6u64;
+    let base_port = 9500u16;
+    let window_ms = 200u64;
+
+    let validators = genesis_validator_set(nodes, base_port);
+    let beacon1 = next_beacon(GENESIS_BEACON, 1);
+    let faulty = (0..nodes)
+        .min_by_key(|&i| VrfClaim::create(&NodeIdentity::from_seed(i), 1, beacon1).output)
+        .unwrap();
+    let faulty_peer = NodeIdentity::from_seed(faulty).peer_id();
+
+    let mut handles = Vec::new();
+    for i in 0..nodes {
+        let cfg = NodeConfig {
+            listen_addr: format!("127.0.0.1:{}", base_port + i as u16),
+            genesis_validators: validators.clone(),
+            window_ms,
+            max_height: epochs,
+            grace_ms: window_ms * 12,
+        };
+        let node = Node::new(NodeIdentity::from_seed(i), cfg);
+        let node = if i == faulty { node.byzantine_equivocate() } else { node };
+        handles.push(tokio::spawn(node.run()));
+    }
+
+    let mut outs = Vec::new();
+    for h in handles {
+        outs.push(h.await.expect("node task panicked"));
+    }
+
+    // No fork: every node converges to one head and chain length, each block a valid quorum cert.
+    let head0 = outs[0].head_hash;
+    for o in &outs {
+        assert_eq!(o.head_hash, head0, "node {} forked", hex::encode(&o.peer_id[..4]));
+        assert_eq!(o.blocks_len as u64, epochs + 1, "chain still progressed every height");
+        assert!(o.all_qc_valid, "every finalized block carries a valid quorum certificate");
+    }
+    // Every honest node detected the equivocation and slashed the offender.
+    for o in outs.iter().filter(|o| o.peer_id != faulty_peer) {
+        assert!(
+            o.slashed.contains(&faulty_peer),
+            "honest node {} did not slash the equivocator",
+            hex::encode(&o.peer_id[..4])
+        );
+    }
+}
