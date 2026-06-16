@@ -1,20 +1,25 @@
-//! Consensus / proposer seam. Stub: a single round-robin proposer per epoch over the sorted
-//! genesis validator set — NO Byzantine fault tolerance (a single proposer is trusted per height;
-//! equivocation is undetected, and a dead proposer stalls that height).
+//! Consensus seam — now a simplified single-round BFT: VRF leader election (`vrf.rs`) + a
+//! quorum certificate (≥ ⌊2N/3⌋+1 validator votes) for finality. Honest validators vote only for
+//! the lowest-VRF leader's block, so at most one block per height can gather a quorum certificate
+//! under a <1/3 Byzantine assumption — that is the safety argument.
 //!
-//! Real future impl: `BftConsensus` — EC-VRF proposer selection over registered `epoch_id`s plus
-//! threshold-BLS `validator_sigs` and a real fork-choice (SPEC §4.1). This is the first seam to
-//! harden, since every later property builds on an equivocation-resistant ledger.
+//! Still stubbed / next: NO view-change (a dead leader stalls that height — liveness under failure),
+//! and the quorum certificate is a list of individual ed25519 votes rather than an aggregated
+//! threshold-BLS signature. Real future impl: BFT with view-change + threshold-BLS `validator_sigs`
+//! (SPEC §4.1).
 
-pub trait Proposer: Send + Sync {
-    /// The stable peer id that proposes block `height`, given the sorted validator set.
-    fn proposer_for(&self, height: u64, validators_sorted: &[[u8; 32]]) -> [u8; 32];
+use std::collections::HashMap;
+
+/// BFT quorum size for `n` validators: ⌊2n/3⌋ + 1 (tolerates ⌊(n-1)/3⌋ Byzantine).
+pub fn quorum(n: usize) -> usize {
+    (2 * n) / 3 + 1
 }
 
-pub struct RoundRobinProposer;
-
-impl Proposer for RoundRobinProposer {
-    fn proposer_for(&self, height: u64, validators_sorted: &[[u8; 32]]) -> [u8; 32] {
-        validators_sorted[(height as usize) % validators_sorted.len()]
-    }
+/// The elected leader for a round: the validator with the smallest VRF output (peer id breaks ties).
+/// `claims` maps peer id → VRF output. Deterministic once every node has the same claim set.
+pub fn leader(claims: &HashMap<[u8; 32], [u8; 32]>) -> Option<[u8; 32]> {
+    claims
+        .iter()
+        .min_by(|a, b| a.1.cmp(b.1).then_with(|| a.0.cmp(b.0)))
+        .map(|(peer, _)| *peer)
 }

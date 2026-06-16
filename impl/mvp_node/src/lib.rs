@@ -18,6 +18,7 @@ pub mod identity;
 pub mod message;
 pub mod node;
 pub mod transport;
+pub mod vrf;
 
 #[cfg(test)]
 mod tests {

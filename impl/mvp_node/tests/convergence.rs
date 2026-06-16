@@ -41,12 +41,14 @@ async fn nodes_converge_and_rotate_epoch_ids() {
     }
     assert_eq!(len0 as u64, epochs + 1, "expected genesis + {epochs} blocks");
 
-    // 2. Each node rotated distinct epoch_ids across the K epochs, and the publish-s1 split held.
+    // 2. Each node rotated distinct epoch_ids across the K epochs, the split held, and every
+    //    finalized block carries a valid quorum certificate (BFT finality).
     for o in &outs {
         let ids: HashSet<u64> = o.epoch_ids.iter().map(|(_, e)| *e).collect();
         assert_eq!(ids.len(), o.epoch_ids.len(), "epoch_ids must be distinct across epochs");
         assert_eq!(o.epoch_ids.len() as u64, epochs, "one epoch_id per epoch");
         assert!(o.split_ok, "publish-s1 split s1+s2=null_v must hold every epoch");
+        assert!(o.all_qc_valid, "every block must carry a valid quorum certificate");
     }
 
     // 3. At a fixed height, distinct nodes (distinct sk) produce distinct epoch_ids.

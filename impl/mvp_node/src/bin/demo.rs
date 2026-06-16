@@ -62,11 +62,12 @@ async fn main() {
     println!("\n=== DEMO SUMMARY ===");
     for o in &outcomes {
         println!(
-            "  node {}  blocks={}  head={}  split_ok={}  epoch_ids={:?}",
+            "  node {}  blocks={}  head={}  split_ok={}  qc_valid={}  epoch_ids={:?}",
             hex::encode(&o.peer_id[..4]),
             o.blocks_len,
             hex::encode(&o.head_hash[..4]),
             o.split_ok,
+            o.all_qc_valid,
             o.epoch_ids.iter().map(|(_, e)| e % 100000).collect::<Vec<_>>(),
         );
     }
