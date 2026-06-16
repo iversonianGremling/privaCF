@@ -118,15 +118,26 @@ not `(N_fallback+1)` full pairings**:
 | 1 in-circuit `G₁` **Pedersen opening** (bridge, per share) | ~0.2–0.4 M each, ×1–2 |
 | Poseidon (`null_v`, `epoch_id`) + SMT path + arithmetic | ~10⁴–10⁵ |
 
-**Corrected cost estimate: ~0.3–1 M constraints total** (dominated by 1–2 bridge openings), i.e.
-**AMBER — sub-second to a few seconds on desktop, mobile-marginal.** This is ~10× better than the
-in-circuit pairings and almost certainly past the desktop gate, but it is **not** the deep-GREEN
-~10⁴ that [SPIKE §8](./SPIKE-statement5.md#8-phase-0a-result--constraint-estimate-2026-06-06)
-quoted for "no pairing" — that figure omitted the bridge. The bridge is the irreducible residual
-of doing verifiable encryption across the two worlds.
+**Cost estimate: ~0.3–1 M constraints total** (dominated by 1–2 bridge openings). This is ~10×
+better than the in-circuit pairings, but it is **not** the deep-GREEN ~10⁴ that
+[SPIKE §8](./SPIKE-statement5.md#8-phase-0a-result--constraint-estimate-2026-06-06) quoted for "no
+pairing" — that figure omitted the bridge. The bridge is the irreducible residual of doing
+verifiable encryption across the two worlds.
+
+> **⚠️ Measured update (2026-06-16) — this estimate's "AMBER, sub-second to a few seconds" was
+> optimistic; the bridge is the real wall.** A direct measurement of the non-native field multiply
+> in Plonky2/Goldilocks ([`impl/spike_bridge_cost/`](./impl/spike_bridge_cost/),
+> [SPIKE §10](./SPIKE-statement5.md#10-phase-1b-result--the-bridge-measured-packing-factor-collapsed-2026-06-16))
+> puts a single in-circuit BLS12-381 `G₁` scalar-mult at **~2²¹ trace rows ≈ ~2 min desktop** with
+> a naive gadget (RED), and the Pedersen 2-MSM at ~2²² rows ≈ ~4 min. A purpose-built non-native
+> gadget (dedicated range-check gates, Karatsuba, CRT reduction, arithmetic-tuned config) plausibly
+> reaches **AMBER (~5–40 s)**; only an implausible >30× packing gain reaches GREEN. So the bridge is
+> **AMBER-at-best**, and a purpose-built non-native gadget is a **Phase-1 deliverable with a tracked
+> exit criterion** (target ≤ ~2²⁰ rows / ≤ ~30 s desktop), not a near-free term.
 
 *(Optimization: a single Pedersen opening that commits both shares, or batching the two via a
-random linear combination, keeps it to one in-circuit scalar-mult. Phase-1 should try this.)*
+random linear combination, keeps it to one in-circuit scalar-mult — measured ~2²¹ rather than ~2²²
+rows above. Phase-1 should build this.)*
 
 ---
 

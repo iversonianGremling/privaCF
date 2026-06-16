@@ -281,4 +281,56 @@ flat "AMBER." The measurement shows the bridge verdict genuinely swings RED↔GR
 it is **not** safe to assume AMBER without building the gadget. **Decisive Phase-1b step:** build
 the native-group VE gadget (DESIGN §3–§4) in-circuit, read its `degree_bits`, and plug the row
 count into the rate measured here — that collapses the band to a single verdict. Until then:
-**core GREEN, bridge open, rate known.**
+**core GREEN, bridge open, rate known.** *(Now done — see §10.)*
+
+## 10. Phase-1b result — the bridge measured, packing factor collapsed (2026-06-16)
+
+The §9 "decisive Phase-1b step" is now executed: [`impl/spike_bridge_cost/`](./impl/spike_bridge_cost/)
+**measures** the bridge's dominant primitive — a non-native modular field multiplication — as a
+real, provable Plonky2/Goldilocks circuit, instead of guessing a packing factor. It reads the true
+trace-row cost of a range-checked limb multiply, then composes the BLS12-381 `G₁` scalar-mult /
+Pedersen-MSM gate count on top of it. This converts the bridge from "estimate ÷ unknown packing"
+into "measured-multiply × standard-EC-op-count".
+
+**Why this route (not the published EC gadget):** `plonky2_ecdsa`/`plonky2_u32` (the would-be
+off-the-shelf non-native EC gadgets) are pinned to the abandoned plonky2 0.1.1 era and no longer
+compile against any consistent toolchain (internal `itertools`/`hashbrown`/`WitnessGenerator` API
+skew that does not converge under version pinning). So the gadget was built directly on the working
+plonky2 0.2 stack: 16-bit limbs (the largest that keeps a limb·limb product + column accumulation
+safely below Goldilocks' ~2⁶⁴ modulus), schoolbook product, `split_le` carry propagation, all
+range-checked — a genuine provable circuit whose `degree_bits` is read off, not modelled.
+
+**Measured (20-core desktop):**
+
+| Quantity | Result |
+|---|---|
+| non-native field multiply (256-bit / 16-limb, **and** 384-bit / 24-limb) | **~256 trace rows/mul**, measured marginal (limb count packs into row slack at this granularity) |
+| prover rate | ~6×10⁻⁵ s/row (consistent with §9) |
+| BLS12-381 `G₁` scalar-mult (~3 825 modular muls, modmul = 2× measured multiply) | **~1.96 M rows → 2²¹ → ~130 s — RED** |
+| Pedersen 2-MSM `s₂·G + γ·H` (conservative independent, ~7 650 muls) | **~3.9 M rows → 2²² → ~260 s — RED** |
+| same, tuned gadget ÷10× | ~13 s — **AMBER** |
+| same, tuned gadget ÷30× | ~4 s — GREEN (implausible packing gain) |
+
+**The correction — the bridge is heavier than DESIGN-f1 §5 estimated.** DESIGN §5 put one scalar-mult
+at ~0.2–0.4 M constraints and the whole bridge at "AMBER — sub-second to a few seconds." The
+*measured* composition puts a single scalar-mult at ~2²¹ trace rows ≈ **~2 minutes** with this
+(naive) gadget. A purpose-built non-native gadget (dedicated u32 range-check gates, Karatsuba,
+CRT reduction, an arithmetic-tuned config rather than the recursion config) plausibly buys 10–30×,
+landing the bridge at **AMBER (~5–40 s)**; only an implausible >30× reaches GREEN. This is
+consistent with the known reality that non-native EC over a small FRI field is expensive (plonky2
+ECDSA verification is minutes-class).
+
+**Verdict — bridge band collapsed to AMBER-at-best (not the near-free term the design implied).**
+The two spikes together now read: pairing-removal buys back the **core (GREEN, §9)**, but the
+publish-`s₁` **bridge is AMBER at best and RED if built naively** — it is the real desktop cost and
+**requires a purpose-built non-native gadget as a Phase-1 deliverable**, not an afterthought. The
+P-feasibility gate is therefore *passable but conditional on bridge-gadget engineering*: green-light
+the substrate build, but treat the optimized bridge gadget (target ≤ ~2²⁰ rows / ≤ ~30 s desktop)
+as a tracked Phase-1 exit criterion, and re-measure the real gadget's `degree_bits` before
+committing the rest of Layer-1.
+
+**Caveats (honest):** the limb-*multiply* is measured; the modular reduction is accounted as 2×
+(the `a·b` and `q·p` products) rather than separately built; the EC op-counts are standard Jacobian
+doubling/addition formula counts, not a fully assembled in-circuit scalar-mult; Plonky2 stands in
+for Plonky3 (same FRI/Goldilocks cost class, constant-factor caveat per §9). All three biases are
+named in the crate output; none flips the AMBER-at-best conclusion.
