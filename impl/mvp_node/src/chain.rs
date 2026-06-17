@@ -14,6 +14,7 @@ use crate::bls;
 use crate::consensus::quorum;
 use crate::epoch::EpochTransaction;
 use crate::identity::{verify, NodeIdentity};
+use crate::membership::MembershipOp;
 use crate::vrf::VrfClaim;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -29,6 +30,10 @@ pub struct BlockHeader {
     pub vrf_output: [u8; 32],          // proposer's VRF output (leadership lottery)
     pub vrf_preout: [u8; 32],          // proposer's VRF pre-output (needed to verify the proof)
     pub vrf_proof: Vec<u8>,            // proof of that VRF output (verifiable leadership)
+    /// Self-authorized validator-set changes carried by this block. They are part of the header, so
+    /// `block_id` covers them (proposer-signed and voted-over); they take effect at the NEXT height,
+    /// once this block is finalized and identical for every node (see `membership.rs`).
+    pub membership_ops: Vec<MembershipOp>,
 }
 
 /// A validator's BLS vote over a slot — the unit aggregated into the quorum certificate. The signed
@@ -196,6 +201,7 @@ impl BlockHeader {
             vrf_output: vrf.output,
             vrf_preout: vrf.preout,
             vrf_proof: vrf.proof.clone(),
+            membership_ops: Vec::new(), // set by the proposer (assemble_block) before block_id is fixed
         }
     }
 }
@@ -228,6 +234,7 @@ impl Chain {
             vrf_output: [0u8; 32],
             vrf_preout: [0u8; 32],
             vrf_proof: Vec::new(),
+            membership_ops: Vec::new(),
         };
         Chain {
             blocks: vec![Block {

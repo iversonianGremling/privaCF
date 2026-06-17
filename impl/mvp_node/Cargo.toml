@@ -44,6 +44,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Noise Protocol Framework (XX handshake) for confidential, forward-secret peer channels (isolated in transport.rs)
 snow = "0.9"
+serde-big-array = "0.5"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "test-util", "sync"] }

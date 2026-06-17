@@ -16,6 +16,7 @@ pub mod epoch;
 pub mod field;
 pub mod hash;
 pub mod identity;
+pub mod membership;
 pub mod message;
 pub mod node;
 pub mod transport;

@@ -41,6 +41,20 @@ Companion to `SPEC.md` §4.1 (chain/epochs), §4.2/§4.9.1 (identity derivation)
   the same slot, any node turns the two votes into a `VoteEquivocationProof`, **slashes** the
   offender, ignores its votes, and gossips the proof network-wide. (Both fault sides — proposer
   equivocation and voter double-vote — are now caught.)
+- **Dynamic validator-set membership + quorum reconfiguration**: the validator set is no longer
+  frozen at genesis. A validator **joins** or **leaves** by gossiping a **self-signed** membership op
+  (`membership.rs`); the next leader records it in its block header (so `block_id` covers it,
+  proposer-signs it, and it is voted over). The op activates at the **next** height, by which point
+  the carrying block is finalized and identical for everyone. The **active set — and therefore the
+  BFT quorum `⌊2N/3⌋+1` — at any height is a pure function of the finalized chain below it**, so
+  every node derives the identical set with no extra coordination (the reconfiguration-safety crux:
+  no split-brain). Leader election, vote counting, and quorum-certificate verification all use the
+  height's active set; a departed validator can no longer lead, vote, or count toward quorum.
+  Authorization is **AcceptAll** beyond proving key-control — anyone proving they hold the keys may
+  join (Sybil-trivial; the real gate is the deferred `Admission`/`VdfAdmission` seam), but nobody can
+  inject or evict a validator that did not sign the change. This rides on the existing aggregatable
+  multisig (no DKG needed for a *changing* set; a fixed DKG threshold key stays the deferred
+  `VA_pub` construct).
 - **Minimal chain**: append-only, deterministic genesis, one finalized block per epoch; structural
   validation (height + prev-hash) plus semantic checks (beacon, VRF leadership, quorum certificate).
 - **Networking — Noise-encrypted channels**: every peer connection runs a real **Noise XX**
@@ -78,9 +92,9 @@ distinctness and the publish-`s₁` split.
 | Seam (trait → stub / real future impl) | MVP behavior | Deferred to |
 |---|---|---|
 | `Transport` — Noise XX + ed25519 channel binding (real) → `LoopixTransport` | **confidential, authenticated, forward-secret** channels done (no plaintext wire); still **linkable** — a network observer sees who-talks-to-whom (no mixing/cover traffic) | SPEC §5.1 |
-| consensus — VRF election + aggregate-BLS quorum cert + view-change + proposer-equivocation + double-vote slashing (real) → +more | **safety + leader-failure liveness + aggregate-BLS finality + proposer-equivocation + validator-double-vote slashing done**; remaining: the QC is an aggregatable MULTISIG (signer set recorded) not a DKG threshold key (`VA_pub` is the separate DKG construct), and the validator set is static (no admission/eviction beyond slashing) | SPEC §4.1 |
+| consensus — VRF election + aggregate-BLS quorum cert + view-change + proposer-equivocation + double-vote slashing + dynamic membership (real) → +DKG threshold key | **safety + leader-failure liveness + aggregate-BLS finality + both equivocation-slashing paths + dynamic validator-set membership with chain-derived quorum reconfiguration done**; remaining: the QC is an aggregatable MULTISIG (signer set recorded) not a DKG threshold key (`VA_pub` is the separate DKG construct); join admission is AcceptAll (the Sybil gate is the `Admission` seam) | SPEC §4.1, §4.3 |
 | `vrf` — real EC-VRF (sr25519, `schnorrkel`) | **real VRF done** (unique, ungrindable lottery value per key+input); the beacon it binds to is now VRF-chained too (see the beacon row), leaving only the residual last-revealer bias → VDF/drand | SPEC EC-VRF, §4.1 |
-| `Admission` → `AcceptAll` / `VdfAdmission` | declared seam; membership is the static genesis set (Sybil-trivial) | SPEC §4.3 |
+| `Admission` — AcceptAll (real) → `VdfAdmission` | membership is now **dynamic** (join/leave, §4.1 row), but admission is **AcceptAll**: proving key-control suffices to join (Sybil-trivial). The real gate — a VDF proof-of-work cost per admission — is deferred | SPEC §4.3 |
 | `Discovery` → `ConnectKnown` / `PsiDiscovery` | declared seam; peers come from the static genesis validator set | SPEC §5.3/§5.4 |
 | `VerEnc` → `StubVerEnc` / `NativeGroupVerEnc` | `d_T` is a placeholder; `s₂` is **not** sealed | DESIGN-f1, SPEC §4.9.4 |
 | beacon — VRF-chained (real) → +VDF/drand | `beacon_T = Poseidon(beacon_{T-1}, T, fold(vrf_output_{T-1}))` — folds in the prior block's *ungrindable* VRF output, so the leader schedule is no longer computable from genesis; residual last-revealer (withhold-to-regrind) bias remains → VDF/drand for full unbiasability | SPEC §4.1 |
@@ -90,23 +104,25 @@ distinctness and the publish-`s₁` split.
 So the MVP demonstrates node creation, network formation over **Noise-encrypted authenticated
 channels**, epoch cycling, `epoch_id` **rotation**, and **BFT-style consensus** (VRF leader election
 + aggregate-BLS ≥2/3 quorum-certificate finality + view-change past failed leaders +
-proposer-equivocation + validator-double-vote slashing) — but NOT the *unlinkability* rotation exists
+proposer-equivocation + validator-double-vote slashing + dynamic membership with chain-derived quorum
+reconfiguration) — but NOT the *unlinkability* rotation exists
 for (Noise authenticates and conceals *content*, but a network observer still sees the
 who-talks-to-whom traffic pattern — that needs Loopix mixing), Sybil cost, or any sealing/verdict/ZK
 property.
 
 ## What to make real next
 
-Consensus now has a real EC-VRF, a VRF-chained beacon, and catches both equivocation faults — a
-coherent BFT-ish core — and the wire is now a real **Noise XX** channel (confidential, authenticated,
-forward-secret). The remaining steps each open a larger, decision-laden subsystem: **Loopix mixing**
-on the `Transport` seam (the actual *unlinkability* the epoch_id rotation exists to provide — Noise
-hides content but not the who-talks-to-whom pattern; research-grade: Sphinx packets, Poisson per-hop
-delay, cover traffic, SURBs), a **VDF/drand beacon** (to remove the residual last-revealer bias —
-needs a VDF artifact or an external drand network), and **dynamic validator-set membership**
-(admission/eviction + a DKG threshold key in place of the aggregatable multisig). *(Globally,
-separate from this node roadmap, the optimized non-native ZK **bridge gadget** — see
-`../spike_bridge_cost/` and `SPIKE-statement5.md` §10 — remains the standing P-feasibility item.)*
+Consensus now has a real EC-VRF, a VRF-chained beacon, catches both equivocation faults, and supports
+**dynamic membership** with chain-derived quorum reconfiguration — a coherent BFT-ish core — and the
+wire is a real **Noise XX** channel (confidential, authenticated, forward-secret). The remaining steps
+each open a larger, decision-laden subsystem: **Loopix mixing** on the `Transport` seam (the actual
+*unlinkability* the epoch_id rotation exists to provide — Noise hides content but not the
+who-talks-to-whom pattern; research-grade: Sphinx packets, Poisson per-hop delay, cover traffic,
+SURBs), a **VDF/drand beacon** (to remove the residual last-revealer bias — needs a VDF artifact or an
+external drand network), a **VDF `Admission` gate** (the real Sybil cost replacing AcceptAll joins),
+and a **DKG threshold key** (`VA_pub`) in place of the aggregatable multisig. *(Globally, separate
+from this node roadmap, the optimized non-native ZK **bridge gadget** — see `../spike_bridge_cost/`
+and `SPIKE-statement5.md` §10 — remains the standing P-feasibility item.)*
 
 ## Toolchain caveat
 

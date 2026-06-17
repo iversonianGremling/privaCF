@@ -25,29 +25,25 @@ use crate::consensus::{leader_for, quorum};
 use crate::epoch::EpochTransaction;
 use crate::field::{add_mod, from_u64, random_field, sub_mod, to_u64};
 use crate::identity::{verify as verify_ed25519, NodeIdentity};
+use crate::membership::{MembershipOp, ValidatorRecord, ValidatorSet};
 use crate::message::Message;
 use crate::transport::{noise_handshake, read_frame, write_frame};
 use crate::vrf::VrfClaim;
 
 type PeersMap = Arc<Mutex<HashMap<[u8; 32], mpsc::UnboundedSender<Message>>>>;
 
-/// A genesis validator's public record: stable id, where to reach it, and the public keys peers
-/// need to verify its consensus votes (BLS) and leadership claims (VRF).
-#[derive(Clone)]
-pub struct ValidatorInfo {
-    pub peer_id: [u8; 32],
-    pub addr: String,
-    pub bls_pk: [u8; 48],
-    pub vrf_pk: [u8; 32],
-}
+/// A membership change recorded in block `H` activates for consensus at height `H + ACTIVATION_DELAY`.
+/// With a delay of 1, the change is live as soon as the block carrying it is finalized — at which
+/// point that block is identical for every node, so all derive the same active set (no split-brain).
+const ACTIVATION_DELAY: u64 = 1;
 
 /// The genesis validator set for a seed-derived demo/test network: node `i` has identity
 /// `from_seed(i)`, listens on `127.0.0.1:(base_port + i)`, and advertises its BLS + VRF public keys.
-pub fn genesis_validator_set(nodes: u64, base_port: u16) -> Vec<ValidatorInfo> {
+pub fn genesis_validator_set(nodes: u64, base_port: u16) -> Vec<ValidatorRecord> {
     (0..nodes)
         .map(|i| {
             let id = NodeIdentity::from_seed(i);
-            ValidatorInfo {
+            ValidatorRecord {
                 peer_id: id.peer_id(),
                 addr: format!("127.0.0.1:{}", base_port + i as u16),
                 bls_pk: id.bls_pk(),
@@ -60,7 +56,7 @@ pub fn genesis_validator_set(nodes: u64, base_port: u16) -> Vec<ValidatorInfo> {
 #[derive(Clone)]
 pub struct NodeConfig {
     pub listen_addr: String,
-    pub genesis_validators: Vec<ValidatorInfo>,
+    pub genesis_validators: Vec<ValidatorRecord>,
     pub window_ms: u64,
     pub max_height: u64,
     pub grace_ms: u64,
@@ -82,6 +78,9 @@ pub struct NodeOutcome {
     pub max_view: u64,
     /// Validators this node slashed for equivocation (sorted), network-consistent under honest majority.
     pub slashed: Vec<[u8; 32]>,
+    /// The active validator set in effect at the height AFTER the final block (sorted) — reflects
+    /// every finalized membership change, so all honest nodes agree on it.
+    pub final_active: Vec<[u8; 32]>,
 }
 
 /// Per-height consensus state.
@@ -89,6 +88,7 @@ struct Round {
     height: u64,
     view: u64,                                         // current view (advances on leader timeout)
     beacon_t: u64,
+    vset: ValidatorSet,                                // active validator set for THIS height (fixed)
     my_vrf: VrfClaim,
     claims: HashMap<[u8; 32], [u8; 32]>,               // peer -> vrf output
     blocks: HashMap<[u8; 32], Block>,                  // block_id -> proposed block
@@ -105,9 +105,8 @@ pub struct Node {
     identity: Arc<NodeIdentity>,
     config: NodeConfig,
     verenc: StubVerEnc,
-    validators: Vec<[u8; 32]>,
-    bls_pks: HashMap<[u8; 32], [u8; 48]>,
-    vrf_pks: HashMap<[u8; 32], [u8; 32]>,
+    /// The genesis validator records — the base the active set is folded forward from.
+    genesis: Vec<ValidatorRecord>,
     /// Test fault injection: participate in VRF + voting but never propose when elected leader,
     /// forcing the other validators to view-change past us. Honest default is `false`.
     withhold_proposals: bool,
@@ -118,29 +117,42 @@ pub struct Node {
     /// block id in the same slot (double-vote), to exercise vote-equivocation slashing. Honest
     /// default is `false`.
     double_vote: bool,
+    /// If set, this node gossips a self-signed leave op upon reaching this height, exercising
+    /// dynamic membership: from the next height the active set (and quorum) no longer include it.
+    leave_at: Option<u64>,
 }
 
 impl Node {
     pub fn new(identity: NodeIdentity, config: NodeConfig) -> Self {
-        let mut validators: Vec<[u8; 32]> =
-            config.genesis_validators.iter().map(|v| v.peer_id).collect();
-        validators.sort();
-        validators.dedup();
-        let bls_pks: HashMap<[u8; 32], [u8; 48]> =
-            config.genesis_validators.iter().map(|v| (v.peer_id, v.bls_pk)).collect();
-        let vrf_pks: HashMap<[u8; 32], [u8; 32]> =
-            config.genesis_validators.iter().map(|v| (v.peer_id, v.vrf_pk)).collect();
+        let mut genesis = config.genesis_validators.clone();
+        genesis.sort_by_key(|r| r.peer_id);
+        genesis.dedup_by_key(|r| r.peer_id);
         Self {
             identity: Arc::new(identity),
             config,
             verenc: StubVerEnc,
-            validators,
-            bls_pks,
-            vrf_pks,
+            genesis,
             withhold_proposals: false,
             equivocate: false,
             double_vote: false,
+            leave_at: None,
         }
+    }
+
+    /// The active validator set in effect AT `height`: genesis folded forward by every membership op
+    /// in finalized blocks strictly below `height - (ACTIVATION_DELAY - 1)`. Pure function of the
+    /// finalized chain, so every node computes the identical set (the reconfiguration-safety crux).
+    fn active_set_at(&self, blocks: &[Block], height: u64) -> ValidatorSet {
+        let cutoff = height.saturating_sub(ACTIVATION_DELAY - 1); // ops in blocks at h < cutoff apply
+        let mut vs = ValidatorSet::from_records(&self.genesis);
+        for b in blocks {
+            if b.header.height >= 1 && b.header.height < cutoff {
+                for op in &b.header.membership_ops {
+                    vs.apply(op);
+                }
+            }
+        }
+        vs
     }
 
     /// Fault-injection builder: this node will never propose (Byzantine leader that withholds its
@@ -161,6 +173,13 @@ impl Node {
     /// exercising validator vote-equivocation detection + slashing.
     pub fn byzantine_double_vote(mut self) -> Self {
         self.double_vote = true;
+        self
+    }
+
+    /// Builder: this node gracefully leaves the validator set on reaching `height` (gossips a
+    /// self-signed leave op), exercising dynamic membership + quorum reconfiguration.
+    pub fn leaves_at(mut self, height: u64) -> Self {
+        self.leave_at = Some(height);
         self
     }
 
@@ -191,6 +210,14 @@ impl Node {
         let head = &chain.head().header;
         let beacon_t = next_beacon(head.beacon_t, &head.vrf_output, height);
         beacons.push((height, beacon_t));
+        // Active validator set for this height — fixed by the finalized chain below it.
+        let vset = self.active_set_at(&chain.blocks, height);
+        // Dynamic membership: if configured to leave at this height (and still a member), gossip a
+        // self-signed leave op for the current leader to record; it activates at the next height.
+        if self.leave_at == Some(height) && vset.contains(&self.me()) {
+            debug!(height, "broadcasting self-signed LEAVE op");
+            Self::gossip(peers, Message::Membership(MembershipOp::remove(&self.identity)));
+        }
         // per-epoch commitment (publish-s1)
         let epoch_id_fp = self.identity.epoch_id(from_u64(beacon_t));
         let epoch_id = to_u64(epoch_id_fp);
@@ -215,6 +242,7 @@ impl Node {
             height,
             view: 0,
             beacon_t,
+            vset,
             my_vrf,
             claims,
             blocks: HashMap::new(),
@@ -228,15 +256,20 @@ impl Node {
         }
     }
 
-    /// The elected leader for `(view)` after excluding slashed validators.
+    /// The elected leader for `(view)`, considering only active (non-slashed) validators. A VRF
+    /// claim from a non-member (e.g. a just-departed validator) cannot win the lottery.
     fn elected_leader(
         &self,
         claims: &HashMap<[u8; 32], [u8; 32]>,
         view: u64,
         slashed: &HashSet<[u8; 32]>,
+        vset: &ValidatorSet,
     ) -> Option<[u8; 32]> {
-        let live: HashMap<[u8; 32], [u8; 32]> =
-            claims.iter().filter(|(p, _)| !slashed.contains(*p)).map(|(p, o)| (*p, *o)).collect();
+        let live: HashMap<[u8; 32], [u8; 32]> = claims
+            .iter()
+            .filter(|(p, _)| !slashed.contains(*p) && vset.contains(p))
+            .map(|(p, o)| (*p, *o))
+            .collect();
         leader_for(&live, view)
     }
 
@@ -245,6 +278,7 @@ impl Node {
         chain: &Chain,
         r: &Round,
         pending: &HashMap<(u64, u64), EpochTransaction>,
+        pending_membership: &[MembershipOp],
         alt: bool,
     ) -> Block {
         let prev = chain.head_hash();
@@ -252,12 +286,30 @@ impl Node {
         let mut txs: Vec<EpochTransaction> =
             pending.iter().filter(|((h, _), _)| *h == r.height).map(|(_, v)| v.clone()).collect();
         txs.sort_by_key(|t| t.epoch_id);
+        // Include self-authorized membership ops that actually change the current set, one per
+        // subject (so finalizing this block applies each exactly once).
+        let mut ops: Vec<MembershipOp> = Vec::new();
+        let mut subjects: HashSet<[u8; 32]> = HashSet::new();
+        for op in pending_membership {
+            if !op.verify() || !subjects.insert(op.subject()) {
+                continue;
+            }
+            let changes = match op {
+                MembershipOp::Add { record, .. } => !r.vset.contains(&record.peer_id),
+                MembershipOp::Remove { peer_id, .. } => r.vset.contains(peer_id),
+            };
+            if changes {
+                ops.push(op.clone());
+            }
+        }
         if alt {
             txs.clear(); // a conflicting variant of the same slot -> a different block id
+            ops.clear();
         }
-        let header = BlockHeader::create(
+        let mut header = BlockHeader::create(
             &self.identity, r.height, r.view, r.beacon_t, prev, my_epoch_id, &r.my_vrf,
         );
+        header.membership_ops = ops;
         let bid = block_id(&header, &txs);
         let proposer_sig =
             self.identity.sign(&proposal_sig_bytes(r.height, r.view, &bid)).to_bytes().to_vec();
@@ -265,8 +317,8 @@ impl Node {
     }
 
     fn cast_vote(&self, r: &mut Round, bid: [u8; 32], peers: &PeersMap) {
-        if r.voted.is_some() {
-            return;
+        if r.voted.is_some() || !r.vset.contains(&self.me()) {
+            return; // only active validators vote (a departed validator no longer does)
         }
         let vote = Vote::create(&self.identity, r.height, r.view, bid);
         r.votes.entry(bid).or_default().insert(self.me(), vote.clone());
@@ -283,7 +335,8 @@ impl Node {
     }
 
     /// Structural validity + a verifiable VRF leadership proof (does not check WHICH view's leader).
-    fn structural_and_vrf_ok(&self, chain: &Chain, b: &Block) -> bool {
+    /// `vset` is the active validator set in effect at the block's height.
+    fn structural_and_vrf_ok(&self, chain: &Chain, b: &Block, vset: &ValidatorSet) -> bool {
         let head = &chain.head().header;
         if b.header.height != head.height + 1 || b.header.prev_block_hash != chain.head_hash() {
             return false;
@@ -291,10 +344,14 @@ impl Node {
         if b.header.beacon_t != next_beacon(head.beacon_t, &head.vrf_output, b.header.height) {
             return false;
         }
-        if !self.validators.contains(&b.header.proposer_peer) {
+        // Every membership op the block carries must be self-authorized (the safety-critical check).
+        if !b.header.membership_ops.iter().all(|op| op.verify()) {
             return false;
         }
-        let vrf_pk = match self.vrf_pks.get(&b.header.proposer_peer) {
+        if !vset.contains(&b.header.proposer_peer) {
+            return false;
+        }
+        let vrf_pk = match vset.vrf.get(&b.header.proposer_peer) {
             Some(pk) => pk,
             None => return false,
         };
@@ -309,23 +366,28 @@ impl Node {
     }
 
     /// Live-proposal validity (deciding whether to VOTE): structural + VRF + proposer signature +
-    /// the proposer is the correct (non-slashed) leader for the block's view, per our claim set.
+    /// the proposer is the correct (non-slashed) leader for the block's view, per our claim set and
+    /// the round's active validator set.
     fn valid_proposal(
         &self,
         chain: &Chain,
         b: &Block,
         claims: &HashMap<[u8; 32], [u8; 32]>,
         slashed: &HashSet<[u8; 32]>,
+        vset: &ValidatorSet,
     ) -> bool {
-        self.structural_and_vrf_ok(chain, b)
-            && self.elected_leader(claims, b.header.view, slashed) == Some(b.header.proposer_peer)
+        self.structural_and_vrf_ok(chain, b, vset)
+            && self.elected_leader(claims, b.header.view, slashed, vset)
+                == Some(b.header.proposer_peer)
     }
 
-    /// Append validity for a finalized/synced block: structural + VRF + a valid quorum certificate.
-    /// The QC (≥ quorum honest votes) is itself the proof the proposer was the legitimate leader,
-    /// so this does not need the per-height claim set (which past/synced heights lack).
+    /// Append validity for a finalized/synced block: structural + VRF + a valid quorum certificate
+    /// under the active set in effect at the block's height. The QC (≥ quorum honest votes) is
+    /// itself the proof the proposer was the legitimate leader, so this does not need the per-height
+    /// claim set (which past/synced heights lack). The active set IS reconstructible from the chain.
     fn valid_block(&self, chain: &Chain, b: &Block) -> bool {
-        self.structural_and_vrf_ok(chain, b) && qc_valid(b, &self.validators, &self.bls_pks)
+        let vset = self.active_set_at(&chain.blocks, b.header.height);
+        self.structural_and_vrf_ok(chain, b, &vset) && qc_valid(b, &vset.peers, &vset.bls)
     }
 
     /// After claim collection: advance the view on leader timeout, the current view's leader
@@ -335,6 +397,7 @@ impl Node {
         r: &mut Round,
         chain: &mut Chain,
         pending: &HashMap<(u64, u64), EpochTransaction>,
+        pending_membership: &[MembershipOp],
         peers: &PeersMap,
         slashed: &HashSet<[u8; 32]>,
     ) {
@@ -349,18 +412,18 @@ impl Node {
             r.view_deadline = now + Duration::from_millis(self.config.window_ms);
             debug!(height = r.height, view = r.view, "view-change (leader timeout)");
         }
-        if let Some(ldr) = self.elected_leader(&r.claims, r.view, slashed) {
+        if let Some(ldr) = self.elected_leader(&r.claims, r.view, slashed, &r.vset) {
             if ldr == self.me() && !r.proposed_views.contains(&r.view) && !self.withhold_proposals {
                 r.proposed_views.insert(r.view);
                 if self.equivocate {
                     // Byzantine: double-sign two conflicting blocks for this slot.
-                    let a = self.assemble_block(chain, r, pending, false);
-                    let b = self.assemble_block(chain, r, pending, true);
+                    let a = self.assemble_block(chain, r, pending, pending_membership, false);
+                    let b = self.assemble_block(chain, r, pending, pending_membership, true);
                     debug!(height = r.height, view = r.view, "EQUIVOCATING (double-signing the slot)");
                     Self::gossip(peers, Message::Proposal(a));
                     Self::gossip(peers, Message::Proposal(b));
                 } else {
-                    let block = self.assemble_block(chain, r, pending, false);
+                    let block = self.assemble_block(chain, r, pending, pending_membership, false);
                     let bid = block_id(&block.header, &block.txs);
                     debug!(height = r.height, view = r.view, txs = block.txs.len(), "proposing as VRF leader");
                     r.blocks.insert(bid, block.clone());
@@ -384,15 +447,16 @@ impl Node {
 
     /// Once a block has a quorum of votes, aggregate them into a quorum certificate, append, broadcast.
     fn try_finalize(&self, r: &mut Round, chain: &mut Chain, peers: &PeersMap) {
-        let q = quorum(self.validators.len());
-        // A block finalizes on a quorum of votes whose view matches the block's own view (a vote
-        // claiming a different view signed different bytes and cannot count toward this block).
+        let q = quorum(r.vset.len());
+        // A block finalizes on a quorum of votes from CURRENT members whose view matches the block's
+        // own view (a vote claiming a different view signed different bytes and cannot count, and a
+        // non-member's vote — e.g. a departed validator — does not count toward the new quorum).
         let ready = r.blocks.iter().find_map(|(bid, b)| {
             let bview = b.header.view;
             let n = r
                 .votes
                 .get(bid)
-                .map(|vs| vs.values().filter(|v| v.view == bview).count())
+                .map(|vs| vs.values().filter(|v| v.view == bview && r.vset.contains(&v.voter)).count())
                 .unwrap_or(0);
             (n >= q).then_some(*bid)
         });
@@ -401,7 +465,7 @@ impl Node {
             let mut signers = Vec::new();
             let mut sigs: Vec<[u8; 96]> = Vec::new();
             for (peer, vote) in &r.votes[&bid] {
-                if vote.view != bview {
+                if vote.view != bview || !r.vset.contains(peer) {
                     continue;
                 }
                 if let Ok(sig) = <[u8; 96]>::try_from(vote.bls_sig.as_slice()) {
@@ -429,6 +493,7 @@ impl Node {
         round: Option<&mut Round>,
         chain: &mut Chain,
         pending: &mut HashMap<(u64, u64), EpochTransaction>,
+        pending_membership: &mut Vec<MembershipOp>,
         peers: &PeersMap,
         slashed: &mut HashSet<[u8; 32]>,
     ) {
@@ -438,10 +503,17 @@ impl Node {
                     pending.insert((tx.height, tx.epoch_id), tx);
                 }
             }
+            Message::Membership(op) => {
+                // Pool self-authorized membership ops for the next leader to record on-chain.
+                if op.verify() && !pending_membership.iter().any(|o| o.subject() == op.subject()) {
+                    pending_membership.push(op);
+                }
+            }
             Message::Vrf(c) => {
                 if let Some(r) = round {
+                    // Only a current member's VRF claim counts (its vrf_pk is in the active set).
                     let ok = c.height == r.height
-                        && self.vrf_pks.get(&c.peer).is_some_and(|pk| c.verify(r.beacon_t, pk));
+                        && r.vset.vrf.get(&c.peer).is_some_and(|pk| c.verify(r.beacon_t, pk));
                     if ok {
                         r.claims.insert(c.peer, c.output);
                     }
@@ -449,7 +521,9 @@ impl Node {
             }
             Message::Proposal(b) => {
                 if let Some(r) = round {
-                    if b.header.height == r.height && self.valid_proposal(chain, &b, &r.claims, slashed) {
+                    if b.header.height == r.height
+                        && self.valid_proposal(chain, &b, &r.claims, slashed, &r.vset)
+                    {
                         let bview = b.header.view;
                         let bid = block_id(&b.header, &b.txs);
                         let proposer = b.header.proposer_peer;
@@ -491,8 +565,8 @@ impl Node {
                         return; // ignore votes from an already-slashed validator
                     }
                     let ok = v.height == r.height
-                        && self.validators.contains(&v.voter)
-                        && self.bls_pks.get(&v.voter).is_some_and(|pk| v.verify(pk));
+                        && r.vset.contains(&v.voter)
+                        && r.vset.bls.get(&v.voter).is_some_and(|pk| v.verify(pk));
                     if ok {
                         let key = (v.voter, v.view);
                         // double-vote: this voter already signed a DIFFERENT block id at this slot.
@@ -508,7 +582,7 @@ impl Node {
                                     sig_b: v.bls_sig.clone(),
                                 };
                                 let verified =
-                                    self.bls_pks.get(&v.voter).is_some_and(|pk| proof.verify(pk));
+                                    r.vset.bls.get(&v.voter).is_some_and(|pk| proof.verify(pk));
                                 if verified && slashed.insert(v.voter) {
                                     info!(slashed = %hex::encode(&v.voter[..4]), height = r.height, view = v.view, "slashed double-voting validator");
                                     Self::gossip(peers, Message::SlashVote(proof));
@@ -529,13 +603,15 @@ impl Node {
                 }
             }
             Message::Slash(proof) => {
-                if self.validators.contains(&proof.proposer) && proof.verify() && slashed.insert(proof.proposer) {
+                let vset = self.active_set_at(&chain.blocks, proof.height);
+                if vset.contains(&proof.proposer) && proof.verify() && slashed.insert(proof.proposer) {
                     info!(slashed = %hex::encode(&proof.proposer[..4]), "slashed via gossiped equivocation evidence");
                 }
             }
             Message::SlashVote(proof) => {
-                if self.validators.contains(&proof.voter)
-                    && self.bls_pks.get(&proof.voter).is_some_and(|pk| proof.verify(pk))
+                let vset = self.active_set_at(&chain.blocks, proof.height);
+                if vset.contains(&proof.voter)
+                    && vset.bls.get(&proof.voter).is_some_and(|pk| proof.verify(pk))
                     && slashed.insert(proof.voter)
                 {
                     info!(slashed = %hex::encode(&proof.voter[..4]), "slashed via gossiped double-vote evidence");
@@ -604,11 +680,12 @@ impl Node {
             }
         }
         tokio::time::sleep(Duration::from_millis(400)).await;
-        info!(peer = %hex::encode(&my_id[..4]), validators = self.validators.len(), quorum = quorum(self.validators.len()), "node up, entering consensus loop");
+        info!(peer = %hex::encode(&my_id[..4]), validators = self.genesis.len(), quorum = quorum(self.genesis.len()), "node up, entering consensus loop");
 
         let mut rng = rand::rngs::StdRng::from_entropy();
         let mut chain = Chain::genesis();
         let mut pending: HashMap<(u64, u64), EpochTransaction> = HashMap::new();
+        let mut pending_membership: Vec<MembershipOp> = Vec::new();
         let mut epoch_ids: Vec<(u64, u64)> = Vec::new();
         let mut beacons: Vec<(u64, u64)> = Vec::new();
         let mut split_ok = true;
@@ -633,27 +710,37 @@ impl Node {
                         &mut split_ok, &mut rng,
                     ));
                     pending.retain(|(h, _), _| *h > head_h); // prune finalized heights
+                    // Drop membership ops already realized by the finalized chain (self-healing: an
+                    // op still pending here means no finalized block has applied it yet).
+                    let next = self.active_set_at(&chain.blocks, need);
+                    pending_membership.retain(|op| match op {
+                        MembershipOp::Add { record, .. } => !next.contains(&record.peer_id),
+                        MembershipOp::Remove { peer_id, .. } => next.contains(peer_id),
+                    });
                 }
             }
 
             tokio::select! {
                 _ = ticker.tick() => {
                     if let Some(r) = round.as_mut() {
-                        self.on_tick(r, &mut chain, &pending, &peers, &slashed);
+                        self.on_tick(r, &mut chain, &pending, &pending_membership, &peers, &slashed);
                     }
                 }
                 Some(msg) = inbox_rx.recv() => {
-                    self.on_msg(msg, round.as_mut(), &mut chain, &mut pending, &peers, &mut slashed);
+                    self.on_msg(msg, round.as_mut(), &mut chain, &mut pending, &mut pending_membership, &peers, &mut slashed);
                 }
             }
         }
 
-        let all_qc_valid =
-            chain.blocks.iter().skip(1).all(|b| qc_valid(b, &self.validators, &self.bls_pks));
+        let all_qc_valid = chain.blocks.iter().skip(1).all(|b| {
+            let vs = self.active_set_at(&chain.blocks, b.header.height);
+            qc_valid(b, &vs.peers, &vs.bls)
+        });
         let max_view = chain.blocks.iter().map(|b| b.header.view).max().unwrap_or(0);
         let mut slashed_vec: Vec<[u8; 32]> = slashed.iter().copied().collect();
         slashed_vec.sort();
-        info!(peer = %hex::encode(&my_id[..4]), blocks = chain.blocks.len(), head = %hex::encode(&chain.head_hash()[..4]), all_qc_valid, max_view, slashed = slashed_vec.len(), "node done");
+        let final_active = self.active_set_at(&chain.blocks, chain.head().header.height + 1).peers;
+        info!(peer = %hex::encode(&my_id[..4]), blocks = chain.blocks.len(), head = %hex::encode(&chain.head_hash()[..4]), all_qc_valid, max_view, slashed = slashed_vec.len(), active = final_active.len(), "node done");
         NodeOutcome {
             peer_id: my_id,
             head_hash: chain.head_hash(),
@@ -664,6 +751,7 @@ impl Node {
             all_qc_valid,
             max_view,
             slashed: slashed_vec,
+            final_active,
         }
     }
 }

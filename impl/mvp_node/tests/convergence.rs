@@ -274,3 +274,64 @@ async fn beacon_is_vrf_chained_and_unpredictable_from_genesis() {
         "height-2 beacon must fold in block-1's real VRF output (not predictable from genesis)"
     );
 }
+
+/// Dynamic membership + quorum reconfiguration: a validator gracefully leaves mid-run by gossiping a
+/// self-signed leave op. The current leader records it on-chain; once that block finalizes, every
+/// node derives the same reduced active set (5 → 4) — so the BFT quorum shrinks from 4 to 3 — and
+/// the network keeps finalizing blocks whose quorum certificates are now validated under the smaller
+/// set. All nodes (including the leaver, which stays connected and follows the chain) agree on the
+/// final membership: the safety crux is that the active set is a pure function of the finalized chain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dynamic_membership_lets_a_validator_leave_and_reconfigures_quorum() {
+    let nodes = 5u64;
+    let epochs = 6u64;
+    let base_port = 9800u16;
+    let window_ms = 200u64;
+    let leave_height = 2u64; // leave op recorded at height 2 → active from height 3
+
+    let validators = genesis_validator_set(nodes, base_port);
+    let leaver = nodes - 1;
+    let leaver_peer = NodeIdentity::from_seed(leaver).peer_id();
+
+    let mut handles = Vec::new();
+    for i in 0..nodes {
+        let cfg = NodeConfig {
+            listen_addr: format!("127.0.0.1:{}", base_port + i as u16),
+            genesis_validators: validators.clone(),
+            window_ms,
+            max_height: epochs,
+            grace_ms: window_ms * 14,
+        };
+        let node = Node::new(NodeIdentity::from_seed(i), cfg);
+        let node = if i == leaver { node.leaves_at(leave_height) } else { node };
+        handles.push(tokio::spawn(node.run()));
+    }
+
+    let mut outs = Vec::new();
+    for h in handles {
+        outs.push(h.await.expect("node task panicked"));
+    }
+
+    // The expected post-leave membership: the genesis set minus the leaver.
+    let mut expected_active: Vec<[u8; 32]> =
+        (0..nodes).filter(|&i| i != leaver).map(|i| NodeIdentity::from_seed(i).peer_id()).collect();
+    expected_active.sort();
+
+    let head0 = outs[0].head_hash;
+    for o in &outs {
+        // 1. Convergence held through the reconfiguration: one head, full length, valid QCs at every
+        //    height (each validated under the active set in effect at that height).
+        assert_eq!(o.head_hash, head0, "node {} forked", hex::encode(&o.peer_id[..4]));
+        assert_eq!(o.blocks_len as u64, epochs + 1, "chain progressed every height post-leave");
+        assert!(o.all_qc_valid, "every block's QC valid under its height's active set");
+        // 2. Every node — the leaver included — agrees the active set is now the genesis set minus
+        //    the leaver, i.e. the quorum shrank from 4 to 3.
+        assert_eq!(
+            o.final_active, expected_active,
+            "node {} disagrees on final membership",
+            hex::encode(&o.peer_id[..4])
+        );
+        assert!(!o.final_active.contains(&leaver_peer), "leaver must be out of the active set");
+        assert_eq!(o.final_active.len() as u64, nodes - 1, "active set must be one smaller");
+    }
+}

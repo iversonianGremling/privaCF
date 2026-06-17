@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::chain::{Block, EquivocationProof, Vote, VoteEquivocationProof};
 use crate::epoch::EpochTransaction;
+use crate::membership::MembershipOp;
 use crate::vrf::VrfClaim;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -26,6 +27,8 @@ pub enum Message {
     Slash(EquivocationProof),
     /// Proof that a validator double-voted a slot — slashes the offender network-wide.
     SlashVote(VoteEquivocationProof),
+    /// A self-signed validator-set change (join/leave) awaiting inclusion by the next leader.
+    Membership(MembershipOp),
     /// Request all finalized blocks at height ≥ `from_height`.
     GetChain { from_height: u64 },
     /// Response to `GetChain`.
