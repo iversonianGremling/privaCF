@@ -82,6 +82,41 @@ async fn a_message_routes_through_a_chain_selected_path_to_its_destination() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_large_message_fragments_across_packets_and_reassembles_at_the_destination() {
+    let base = 19300u16;
+    let (ids, dir) = network(5, base);
+
+    let mut handles = Vec::new();
+    for (i, id) in ids.iter().enumerate() {
+        let cfg = config(&dir, format!("127.0.0.1:{}", base + i as u16));
+        handles.push(loopix::spawn(id.clone(), cfg).await.expect("spawn mix"));
+    }
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    // A ~6 KB payload — far larger than one fixed Sphinx packet — must split into many fragments,
+    // each routed independently, and reassemble byte-exact at the destination.
+    let (src, dst) = (0usize, 4usize);
+    let payload: Vec<u8> = (0..6000u32).map(|i| (i * 31 + 7) as u8).collect();
+    handles[src]
+        .inject
+        .send(Injection {
+            payload: payload.clone(),
+            dest: ids[dst].peer_id(),
+            hops: 3,
+            beacon: 0x5152_5354,
+            nonce: 11,
+            mean_delay_ms: 10,
+        })
+        .expect("inject");
+
+    let got = tokio::time::timeout(Duration::from_secs(4), handles[dst].delivered.recv())
+        .await
+        .expect("destination must reassemble within the timeout")
+        .expect("delivered channel open");
+    assert_eq!(got, payload, "the multi-fragment message reassembles byte-exact");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn loop_cover_traffic_returns_to_its_sender() {
     let base = 19200u16;
     let (ids, dir) = network(5, base);

@@ -26,10 +26,10 @@ use crate::consensus::{leader_for, quorum};
 use crate::epoch::EpochTransaction;
 use crate::field::{add_mod, from_u64, random_field, sub_mod, to_u64};
 use crate::identity::{verify as verify_ed25519, NodeIdentity};
-use crate::loopix::{sample_delays, select_full_path, MixDirectory};
+use crate::loopix::{fragment, sample_delays, select_full_path, MixDirectory, Reassembler};
 use crate::membership::{MembershipOp, ValidatorRecord, ValidatorSet};
 use crate::message::Message;
-use crate::sphinx::{self, Processed, SphinxPacket, MAX_BODY};
+use crate::sphinx::{self, Processed, SphinxPacket};
 use crate::transport::{noise_handshake, read_frame, write_frame};
 use crate::vrf::VrfClaim;
 
@@ -57,16 +57,21 @@ struct Mixer {
     me: [u8; 32],
     mix_sk: [u8; 32],
     settings: MixSettings,
-    /// Per-message nonce diversifying chain-seeded paths (a message to N peers takes N paths).
+    /// Per-fragment nonce diversifying chain-seeded paths (each fragment to each peer takes a path).
     nonce: AtomicU64,
+    /// Monotonic id for the messages we originate, so a message's fragments share one `msg_id`.
+    msg_seq: AtomicU64,
+    /// Reassembles inbound fragments into whole messages before re-injection.
+    reasm: Mutex<Reassembler>,
     /// Re-injects mixnet-delivered consensus messages so they flow through the normal inbox path.
     inbox_tx: mpsc::UnboundedSender<Message>,
 }
 
 impl Mixer {
-    /// Small control-plane messages that fit one Sphinx payload and whose *pattern* (who-claims,
-    /// who-votes, who-changes-set) is what mixing hides. Block-bearing/sync messages are too large
-    /// for one fixed packet and stay on the direct mesh (fragmenting them is the next hardening step).
+    /// Messages routed through the mixnet (when enabled): the consensus control plane plus the
+    /// block-bearing broadcasts (`Proposal`/`Finalized`), now that fragmentation lets a message
+    /// exceed one Sphinx payload. Left direct: the catch-up/sync subsystem (`GetChain`/`ChainRange`,
+    /// a point-to-point bulk response) and `Hello`/`Sphinx` (transport-level frames).
     fn is_routable(msg: &Message) -> bool {
         matches!(
             msg,
@@ -76,50 +81,66 @@ impl Mixer {
                 | Message::Membership(_)
                 | Message::Slash(_)
                 | Message::SlashVote(_)
+                | Message::Proposal(_)
+                | Message::Finalized(_)
         )
     }
 
-    /// Publish a consensus message. When mixing is enabled and the message is routable, send it as a
-    /// chain-routed Sphinx packet to every other mix-directory member; otherwise broadcast directly.
+    /// Publish a consensus message. When mixing is enabled and the message is routable, fragment it
+    /// and send each fragment as a chain-routed Sphinx packet to every other mix-directory member;
+    /// otherwise broadcast directly.
     fn publish(&self, peers: &PeersMap, beacon: u64, msg: Message) {
         if !self.enabled || !Self::is_routable(&msg) {
             Node::gossip(peers, msg);
             return;
         }
         let bytes = match bincode::serialize(&msg) {
-            Ok(b) if b.len() <= MAX_BODY => b,
-            _ => {
-                Node::gossip(peers, msg); // oversize: fall back to direct (keeps liveness)
+            Ok(b) => b,
+            Err(_) => {
+                Node::gossip(peers, msg);
                 return;
             }
         };
+        // One msg_id for all fragments of this message (reused across destinations, which reassemble
+        // independently); the sender-id prefix keeps it distinct from other nodes' ids.
+        let sid = self.msg_seq.fetch_add(1, Ordering::Relaxed);
+        let mut msg_id = [0u8; 16];
+        msg_id[..8].copy_from_slice(&self.me[..8]);
+        msg_id[8..].copy_from_slice(&sid.to_le_bytes());
+        let frags = fragment(msg_id, &bytes);
         for dest in self.settings.directory.ids() {
             if dest == self.me {
                 continue;
             }
-            let nonce = self.nonce.fetch_add(1, Ordering::Relaxed);
-            let path = match select_full_path(
-                &self.settings.directory, &self.me, &dest, self.settings.hops, beacon, nonce,
-            ) {
-                Some(p) => p,
-                None => continue,
-            };
-            let delays = sample_delays(path.len(), self.settings.mean_delay_ms, beacon, nonce ^ 0x5d);
-            if let Ok(pkt) = sphinx::create(&path, &delays, &bytes) {
-                if let Some(first) = path.first() {
-                    Node::send_to(peers, &first.id, Message::Sphinx(pkt));
+            for frag in &frags {
+                let nonce = self.nonce.fetch_add(1, Ordering::Relaxed);
+                let path = match select_full_path(
+                    &self.settings.directory, &self.me, &dest, self.settings.hops, beacon, nonce,
+                ) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let delays =
+                    sample_delays(path.len(), self.settings.mean_delay_ms, beacon, nonce ^ 0x5d);
+                if let Ok(pkt) = sphinx::create(&path, &delays, frag) {
+                    if let Some(first) = path.first() {
+                        Node::send_to(peers, &first.id, Message::Sphinx(pkt));
+                    }
                 }
             }
         }
     }
 
-    /// Peel an inbound Sphinx packet: deliver (re-inject the inner consensus message) or forward to
-    /// the next hop after honoring its per-hop delay.
+    /// Peel an inbound Sphinx packet: deliver (reassemble fragments, then re-inject the recovered
+    /// consensus message once complete) or forward to the next hop after its per-hop delay.
     fn handle_sphinx(&self, pkt: SphinxPacket, peers: &PeersMap) {
         match sphinx::process(&self.mix_sk, &pkt) {
             Ok(Processed::Deliver { data }) => {
-                if let Ok(inner) = bincode::deserialize::<Message>(&data) {
-                    let _ = self.inbox_tx.send(inner);
+                let complete = self.reasm.lock().unwrap().accept(&data);
+                if let Some(bytes) = complete {
+                    if let Ok(inner) = bincode::deserialize::<Message>(&bytes) {
+                        let _ = self.inbox_tx.send(inner);
+                    }
                 }
             }
             Ok(Processed::Forward { next, delay_ms, packet }) => {
@@ -565,14 +586,14 @@ impl Node {
                     let a = self.assemble_block(chain, r, pending, pending_membership, false);
                     let b = self.assemble_block(chain, r, pending, pending_membership, true);
                     debug!(height = r.height, view = r.view, "EQUIVOCATING (double-signing the slot)");
-                    Self::gossip(peers, Message::Proposal(a));
-                    Self::gossip(peers, Message::Proposal(b));
+                    mixer.publish(peers, r.beacon_t, Message::Proposal(a));
+                    mixer.publish(peers, r.beacon_t, Message::Proposal(b));
                 } else {
                     let block = self.assemble_block(chain, r, pending, pending_membership, false);
                     let bid = block_id(&block.header, &block.txs);
                     debug!(height = r.height, view = r.view, txs = block.txs.len(), "proposing as VRF leader");
                     r.blocks.insert(bid, block.clone());
-                    Self::gossip(peers, Message::Proposal(block));
+                    mixer.publish(peers, r.beacon_t, Message::Proposal(block));
                     self.cast_vote(r, bid, peers, mixer);
                 }
             }
@@ -587,11 +608,11 @@ impl Node {
                 }
             }
         }
-        self.try_finalize(r, chain, peers);
+        self.try_finalize(r, chain, peers, mixer);
     }
 
     /// Once a block has a quorum of votes, aggregate them into a quorum certificate, append, broadcast.
-    fn try_finalize(&self, r: &mut Round, chain: &mut Chain, peers: &PeersMap) {
+    fn try_finalize(&self, r: &mut Round, chain: &mut Chain, peers: &PeersMap, mixer: &Mixer) {
         let q = quorum(r.vset.len());
         // A block finalizes on a quorum of votes from CURRENT members whose view matches the block's
         // own view (a vote claiming a different view signed different bytes and cannot count, and a
@@ -626,7 +647,7 @@ impl Node {
             fb.qc = QuorumCert { signers: signers.clone(), agg_sig: agg.to_vec() };
             if chain.try_append(fb.clone()).is_ok() {
                 info!(height = fb.header.height, signers = signers.len(), leader = %hex::encode(&fb.header.proposer_peer[..3]), "finalized block (aggregate BLS quorum cert)");
-                Self::gossip(peers, Message::Finalized(fb));
+                mixer.publish(peers, r.beacon_t, Message::Finalized(fb));
             }
         }
     }
@@ -707,7 +728,7 @@ impl Node {
                         if Instant::now() >= r.vrf_deadline && r.voted.is_none() && bview == r.view {
                             self.cast_vote(r, bid, peers, mixer);
                         }
-                        self.try_finalize(r, chain, peers);
+                        self.try_finalize(r, chain, peers, mixer);
                     }
                 }
             }
@@ -745,7 +766,7 @@ impl Node {
                             r.seen_votes.insert(key, (v.block_id, v.bls_sig.clone()));
                         }
                         r.votes.entry(v.block_id).or_default().insert(v.voter, v);
-                        self.try_finalize(r, chain, peers);
+                        self.try_finalize(r, chain, peers, mixer);
                     }
                 }
             }
@@ -887,6 +908,8 @@ impl Node {
                     mix_sk: self.identity.mix_sk(),
                     settings: s.clone(),
                     nonce: AtomicU64::new(0),
+                    msg_seq: AtomicU64::new(0),
+                    reasm: Mutex::new(Reassembler::new(512)),
                     inbox_tx: inbox_tx.clone(),
                 }
             }
@@ -896,6 +919,8 @@ impl Node {
                 mix_sk: self.identity.mix_sk(),
                 settings: MixSettings { directory: MixDirectory::default(), hops: 0, mean_delay_ms: 0 },
                 nonce: AtomicU64::new(0),
+                msg_seq: AtomicU64::new(0),
+                reasm: Mutex::new(Reassembler::new(512)),
                 inbox_tx: inbox_tx.clone(),
             },
         };

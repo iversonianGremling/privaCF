@@ -201,6 +201,98 @@ pub fn sample_delays(n: usize, mean_ms: u64, beacon: u64, nonce: u64) -> Vec<u64
         .collect()
 }
 
+// --- fragmentation / reassembly -------------------------------------------------------------------
+//
+// A Sphinx payload is a fixed `PAYLOAD_LEN`; a serialized message (a block-bearing `Proposal` or
+// `Finalized` especially) can exceed the `MAX_BODY` one packet carries. So every mix-routed message
+// is split into one or more **fragments**, each its own Sphinx packet, reassembled at the
+// destination. Single-packet messages are just a 1-fragment message (uniform path). Each fragment is
+// framed `msg_id(16) ‖ index(u16 LE) ‖ count(u16 LE) ‖ chunk`.
+
+/// Fragment framing header length.
+pub const FRAG_HEADER: usize = 16 + 2 + 2;
+/// Max original-message bytes carried per fragment (the rest of the Sphinx body is the header).
+pub const FRAG_CHUNK: usize = sphinx::MAX_BODY - FRAG_HEADER;
+
+/// Split `payload` into framed fragments (≥1) sharing `msg_id`, each ≤ `sphinx::MAX_BODY` and ready
+/// to hand to `sphinx::create`.
+pub fn fragment(msg_id: [u8; 16], payload: &[u8]) -> Vec<Vec<u8>> {
+    let chunks: Vec<&[u8]> =
+        if payload.is_empty() { vec![&[][..]] } else { payload.chunks(FRAG_CHUNK).collect() };
+    let count = chunks.len().min(u16::MAX as usize) as u16;
+    chunks
+        .into_iter()
+        .take(count as usize)
+        .enumerate()
+        .map(|(i, c)| {
+            let mut f = Vec::with_capacity(FRAG_HEADER + c.len());
+            f.extend_from_slice(&msg_id);
+            f.extend_from_slice(&(i as u16).to_le_bytes());
+            f.extend_from_slice(&count.to_le_bytes());
+            f.extend_from_slice(c);
+            f
+        })
+        .collect()
+}
+
+struct Partial {
+    count: u16,
+    parts: Vec<Option<Vec<u8>>>,
+    seq: u64,
+}
+
+/// Reassembles fragments back into whole messages, keyed by `msg_id`. Bounded: at most
+/// `max_partials` incomplete messages are buffered; the oldest is evicted past that (so lost
+/// fragments cannot grow memory without limit).
+pub struct Reassembler {
+    partials: HashMap<[u8; 16], Partial>,
+    seq: u64,
+    max_partials: usize,
+}
+
+impl Reassembler {
+    pub fn new(max_partials: usize) -> Self {
+        Self { partials: HashMap::new(), seq: 0, max_partials: max_partials.max(1) }
+    }
+
+    /// Accept one framed fragment; returns the fully reassembled message bytes once its last
+    /// fragment arrives (fragments may arrive out of order, interleaved across messages).
+    pub fn accept(&mut self, frag: &[u8]) -> Option<Vec<u8>> {
+        if frag.len() < FRAG_HEADER {
+            return None;
+        }
+        let mut id = [0u8; 16];
+        id.copy_from_slice(&frag[..16]);
+        let index = u16::from_le_bytes([frag[16], frag[17]]) as usize;
+        let count = u16::from_le_bytes([frag[18], frag[19]]);
+        if count == 0 || index >= count as usize {
+            return None;
+        }
+        let chunk = frag[FRAG_HEADER..].to_vec();
+        let seq = self.seq;
+        self.seq += 1;
+        let entry = self
+            .partials
+            .entry(id)
+            .or_insert_with(|| Partial { count, parts: vec![None; count as usize], seq });
+        if entry.count != count {
+            return None; // inconsistent re-use of a msg_id; ignore
+        }
+        entry.parts[index] = Some(chunk);
+        if entry.parts.iter().all(|p| p.is_some()) {
+            let p = self.partials.remove(&id).expect("present");
+            return Some(p.parts.into_iter().flatten().flatten().collect());
+        }
+        if self.partials.len() > self.max_partials {
+            let oldest = self.partials.iter().min_by_key(|(_, v)| v.seq).map(|(k, _)| *k);
+            if let Some(old) = oldest {
+                self.partials.remove(&old);
+            }
+        }
+        None
+    }
+}
+
 // --- the mix node engine --------------------------------------------------------------------------
 
 type Peers = Arc<Mutex<HashMap<[u8; 32], mpsc::UnboundedSender<Message>>>>;
@@ -288,15 +380,19 @@ pub async fn spawn(identity: Arc<NodeIdentity>, config: MixConfig) -> std::io::R
         });
     }
 
-    // Inbound packet processor: peel each Sphinx packet, then forward (after its delay) or deliver.
+    // Inbound packet processor: peel each Sphinx packet, then forward (after its delay) or
+    // reassemble-and-deliver. The reassembler is owned by this single task (no lock needed).
     {
         let (peers, mix_sk) = (peers.clone(), mix_sk);
         tokio::spawn(async move {
+            let mut reasm = Reassembler::new(256);
             while let Some((_from, msg)) = inbox_rx.recv().await {
                 if let Message::Sphinx(pkt) = msg {
                     match sphinx::process(&mix_sk, &pkt) {
                         Ok(Processed::Deliver { data }) => {
-                            let _ = delivered_tx.send(data);
+                            if let Some(full) = reasm.accept(&data) {
+                                let _ = delivered_tx.send(full);
+                            }
                         }
                         Ok(Processed::Forward { next, delay_ms, packet }) => {
                             let peers = peers.clone();
@@ -314,15 +410,19 @@ pub async fn spawn(identity: Arc<NodeIdentity>, config: MixConfig) -> std::io::R
         });
     }
 
-    // Injector: turn outbound requests into chain-routed Sphinx packets sent to the first hop.
+    // Injector: fragment each outbound request and route every fragment as its own chain-selected
+    // Sphinx packet, so a payload larger than one fixed packet still routes through the mixnet.
     {
         let (peers, dir) = (peers.clone(), directory.clone());
         tokio::spawn(async move {
+            let mut msg_seq = 0u64;
             while let Some(inj) = inject_rx.recv().await {
-                if let Some(packet) = build_packet(&dir, &my_id, &inj) {
-                    if let Some(first) = select_path(&dir, &my_id, &inj.dest, inj.hops, inj.beacon, inj.nonce) {
-                        send_to(&peers, &first.id, Message::Sphinx(packet));
-                    }
+                let mut msg_id = [0u8; 16];
+                msg_id[..8].copy_from_slice(&my_id[..8]);
+                msg_id[8..].copy_from_slice(&msg_seq.to_le_bytes());
+                msg_seq = msg_seq.wrapping_add(1);
+                for (first, pkt) in route_message(&dir, &my_id, &inj, msg_id) {
+                    send_to(&peers, &first, Message::Sphinx(pkt));
                 }
             }
         });
@@ -357,11 +457,28 @@ pub async fn spawn(identity: Arc<NodeIdentity>, config: MixConfig) -> std::io::R
     Ok(MixHandle { delivered: delivered_rx, inject: inject_tx })
 }
 
-/// Build the Sphinx packet for an injection, selecting the path and per-hop delays from chain entropy.
-fn build_packet(dir: &MixDirectory, source: &[u8; 32], inj: &Injection) -> Option<SphinxPacket> {
-    let path = select_full_path(dir, source, &inj.dest, inj.hops, inj.beacon, inj.nonce)?;
-    let delays = sample_delays(path.len(), inj.mean_delay_ms, inj.beacon, inj.nonce ^ 0x5d);
-    sphinx::create(&path, &delays, &inj.payload).ok()
+/// Fragment an injection's payload and build one chain-routed Sphinx packet per fragment, returning
+/// each with its first-hop id. Each fragment takes its own path (nonce varied by index).
+fn route_message(
+    dir: &MixDirectory,
+    source: &[u8; 32],
+    inj: &Injection,
+    msg_id: [u8; 16],
+) -> Vec<([u8; 32], SphinxPacket)> {
+    let frags = fragment(msg_id, &inj.payload);
+    let mut out = Vec::with_capacity(frags.len());
+    for (i, frag) in frags.iter().enumerate() {
+        let nonce = inj.nonce.wrapping_add(i as u64);
+        let path = match select_full_path(dir, source, &inj.dest, inj.hops, inj.beacon, nonce) {
+            Some(p) => p,
+            None => continue,
+        };
+        let delays = sample_delays(path.len(), inj.mean_delay_ms, inj.beacon, nonce ^ 0x5d);
+        if let (Ok(pkt), Some(first)) = (sphinx::create(&path, &delays, frag), path.first()) {
+            out.push((first.id, pkt));
+        }
+    }
+    out
 }
 
 fn send_to(peers: &Peers, peer: &[u8; 32], msg: Message) {
@@ -490,6 +607,44 @@ mod tests {
         let (dir, ids) = dir_of(2);
         // 4 hops needs 3 distinct intermediates, but only 2 mixes exist beyond source/dest.
         assert!(select_full_path(&dir, &ids[0], &ids[1], 4, 1, 0).is_none());
+    }
+
+    #[test]
+    fn a_large_message_fragments_and_reassembles_even_out_of_order() {
+        // A payload several packets long splits, then reassembles from shuffled fragments.
+        let payload: Vec<u8> = (0..(FRAG_CHUNK * 3 + 17) as u32).map(|i| (i % 251) as u8).collect();
+        let frags = fragment([7u8; 16], &payload);
+        assert_eq!(frags.len(), 4, "3 full chunks + a remainder = 4 fragments");
+        assert!(frags.iter().all(|f| f.len() <= sphinx::MAX_BODY), "each fragment fits a packet");
+
+        let mut r = Reassembler::new(16);
+        // Feed out of order (reversed); only the last one completes the message.
+        let mut done = None;
+        for f in frags.iter().rev() {
+            if let Some(msg) = r.accept(f) {
+                done = Some(msg);
+            }
+        }
+        assert_eq!(done.as_deref(), Some(payload.as_slice()), "reassembled bytes match the original");
+    }
+
+    #[test]
+    fn a_single_fragment_message_reassembles_immediately() {
+        let frags = fragment([1u8; 16], b"small");
+        assert_eq!(frags.len(), 1);
+        let mut r = Reassembler::new(16);
+        assert_eq!(r.accept(&frags[0]).as_deref(), Some(&b"small"[..]));
+    }
+
+    #[test]
+    fn two_interleaved_messages_reassemble_independently() {
+        let a = fragment([0xAA; 16], &vec![1u8; FRAG_CHUNK + 5]); // 2 fragments
+        let b = fragment([0xBB; 16], &vec![2u8; FRAG_CHUNK + 5]); // 2 fragments
+        let mut r = Reassembler::new(16);
+        assert!(r.accept(&a[0]).is_none());
+        assert!(r.accept(&b[1]).is_none());
+        assert!(r.accept(&a[1]).is_some(), "a completes when its second fragment lands");
+        assert!(r.accept(&b[0]).is_some(), "b completes independently");
     }
 
     #[test]
