@@ -335,3 +335,71 @@ async fn dynamic_membership_lets_a_validator_leave_and_reconfigures_quorum() {
         assert_eq!(o.final_active.len() as u64, nodes - 1, "active set must be one smaller");
     }
 }
+
+/// The join side of dynamic membership: a brand-new node — NOT in the genesis set — boots with the
+/// genesis set as its bootstrap peers, gossips a self-signed join op until admitted, and becomes a
+/// full validator. The dial layer reaches the newcomer once its address is known, and every node
+/// (genesis and newcomer alike) converges on the grown 4 → 5 validator set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dynamic_membership_lets_a_new_validator_join() {
+    let genesis_n = 4u64;
+    let epochs = 8u64;
+    let base_port = 9900u16;
+    let window_ms = 200u64;
+
+    let validators = genesis_validator_set(genesis_n, base_port);
+    // Choose a newcomer whose peer id is below every genesis id, so it dials the whole bootstrap set
+    // and forms a full mesh deterministically (a larger-id newcomer relies on reverse-dialing, which
+    // is also implemented but timing-sensitive to assert on).
+    let genesis_min =
+        (0..genesis_n).map(|i| NodeIdentity::from_seed(i).peer_id()).min().unwrap();
+    let join_seed =
+        (1000u64..).find(|&s| NodeIdentity::from_seed(s).peer_id() < genesis_min).unwrap();
+    let joiner_peer = NodeIdentity::from_seed(join_seed).peer_id();
+
+    let mut handles = Vec::new();
+    for i in 0..genesis_n {
+        let cfg = NodeConfig {
+            listen_addr: format!("127.0.0.1:{}", base_port + i as u16),
+            genesis_validators: validators.clone(),
+            window_ms,
+            max_height: epochs,
+            grace_ms: window_ms * 16,
+        };
+        handles.push(tokio::spawn(Node::new(NodeIdentity::from_seed(i), cfg).run()));
+    }
+    // The newcomer: not in genesis, uses the genesis set purely as bootstrap, and asks to join.
+    let joiner_cfg = NodeConfig {
+        listen_addr: format!("127.0.0.1:{}", base_port + genesis_n as u16),
+        genesis_validators: validators.clone(),
+        window_ms,
+        max_height: epochs,
+        grace_ms: window_ms * 16,
+    };
+    handles.push(tokio::spawn(Node::new(NodeIdentity::from_seed(join_seed), joiner_cfg).joining().run()));
+
+    let mut outs = Vec::new();
+    for h in handles {
+        outs.push(h.await.expect("node task panicked"));
+    }
+
+    // Expected final membership: the genesis set plus the newcomer.
+    let mut expected_active: Vec<[u8; 32]> =
+        (0..genesis_n).map(|i| NodeIdentity::from_seed(i).peer_id()).collect();
+    expected_active.push(joiner_peer);
+    expected_active.sort();
+
+    let head0 = outs[0].head_hash;
+    for o in &outs {
+        assert_eq!(o.head_hash, head0, "node {} forked", hex::encode(&o.peer_id[..4]));
+        assert_eq!(o.blocks_len as u64, epochs + 1, "chain progressed every height");
+        assert!(o.all_qc_valid, "every block's QC valid under its height's active set");
+        assert_eq!(
+            o.final_active, expected_active,
+            "node {} disagrees on final membership",
+            hex::encode(&o.peer_id[..4])
+        );
+        assert!(o.final_active.contains(&joiner_peer), "newcomer must have joined the active set");
+        assert_eq!(o.final_active.len() as u64, genesis_n + 1, "active set grew by the newcomer");
+    }
+}

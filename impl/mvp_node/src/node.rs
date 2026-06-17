@@ -120,6 +120,9 @@ pub struct Node {
     /// If set, this node gossips a self-signed leave op upon reaching this height, exercising
     /// dynamic membership: from the next height the active set (and quorum) no longer include it.
     leave_at: Option<u64>,
+    /// If true, this node is NOT in the genesis set and seeks to join: each height until admitted it
+    /// gossips a self-signed join op (`config.genesis_validators` is its bootstrap peer list).
+    joining: bool,
 }
 
 impl Node {
@@ -136,6 +139,7 @@ impl Node {
             equivocate: false,
             double_vote: false,
             leave_at: None,
+            joining: false,
         }
     }
 
@@ -183,6 +187,14 @@ impl Node {
         self
     }
 
+    /// Builder: this node is a newcomer (not in the genesis set) that wants to join. It uses
+    /// `genesis_validators` purely as a bootstrap peer list and gossips a self-signed join op until
+    /// admitted, after which it is a full validator.
+    pub fn joining(mut self) -> Self {
+        self.joining = true;
+        self
+    }
+
     fn me(&self) -> [u8; 32] {
         self.identity.peer_id()
     }
@@ -217,6 +229,13 @@ impl Node {
         if self.leave_at == Some(height) && vset.contains(&self.me()) {
             debug!(height, "broadcasting self-signed LEAVE op");
             Self::gossip(peers, Message::Membership(MembershipOp::remove(&self.identity)));
+        }
+        // A newcomer keeps gossiping its self-signed join op until it is admitted (self-healing: it
+        // stops once it appears in the active set).
+        if self.joining && !vset.contains(&self.me()) {
+            debug!(height, "broadcasting self-signed JOIN op");
+            let op = MembershipOp::add(&self.identity, self.config.listen_addr.clone());
+            Self::gossip(peers, Message::Membership(op));
         }
         // per-epoch commitment (publish-s1)
         let epoch_id_fp = self.identity.epoch_id(from_u64(beacon_t));
@@ -504,9 +523,12 @@ impl Node {
                 }
             }
             Message::Membership(op) => {
-                // Pool self-authorized membership ops for the next leader to record on-chain.
+                // Pool self-authorized membership ops for the next leader to record on-chain, and
+                // re-gossip the first time we see one so it reaches the full mesh even when the
+                // originator is only partially connected (bounded: dedup by subject stops the flood).
                 if op.verify() && !pending_membership.iter().any(|o| o.subject() == op.subject()) {
-                    pending_membership.push(op);
+                    pending_membership.push(op.clone());
+                    Self::gossip(peers, Message::Membership(op));
                 }
             }
             Message::Vrf(c) => {
@@ -641,43 +663,70 @@ impl Node {
         let my_id = self.me();
         let listen_addr = self.config.listen_addr.clone();
 
+        // Shared address book of known validators (peer_id -> dial addr), seeded from the bootstrap
+        // set and grown as the chain admits new members (and from peers' Hellos). The dial task
+        // consults it, so a newly-joined validator becomes dialable once the network learns its addr.
+        let known: Arc<Mutex<HashMap<[u8; 32], String>>> = Arc::new(Mutex::new(
+            self.config.genesis_validators.iter().map(|v| (v.peer_id, v.addr.clone())).collect(),
+        ));
+
         let listener = TcpListener::bind(&self.config.listen_addr).await.expect("bind");
         {
             let peers = peers.clone();
             let inbox = inbox_tx.clone();
             let identity = self.identity.clone();
             let listen_addr = listen_addr.clone();
+            let known = known.clone();
             tokio::spawn(async move {
                 loop {
                     if let Ok((stream, _)) = listener.accept().await {
                         // Inbound dial: we are the Noise responder.
                         tokio::spawn(run_conn(
-                            stream, identity.clone(), listen_addr.clone(), false, inbox.clone(), peers.clone(),
+                            stream, identity.clone(), listen_addr.clone(), false, inbox.clone(),
+                            peers.clone(), known.clone(),
                         ));
                     }
                 }
             });
         }
-        for v in self.config.genesis_validators.iter() {
-            if v.peer_id > my_id {
-                let addr = v.addr.clone();
-                let peers = peers.clone();
-                let inbox = inbox_tx.clone();
-                let identity = self.identity.clone();
-                let listen_addr = listen_addr.clone();
-                tokio::spawn(async move {
-                    loop {
-                        if let Ok(stream) = TcpStream::connect(&addr).await {
-                            // Outbound dial: we are the Noise initiator.
-                            run_conn(
-                                stream, identity.clone(), listen_addr.clone(), true, inbox.clone(), peers.clone(),
-                            )
-                            .await;
+        // Dynamic dial task: periodically dial every known peer with a larger id we are not already
+        // connected to (the smaller-id side dials, so each pair forms exactly one connection). Driven
+        // by `known`, it naturally picks up validators that join after genesis.
+        {
+            let peers = peers.clone();
+            let inbox = inbox_tx.clone();
+            let identity = self.identity.clone();
+            let listen_addr = listen_addr.clone();
+            let known = known.clone();
+            let inflight: Arc<Mutex<HashSet<[u8; 32]>>> = Arc::new(Mutex::new(HashSet::new()));
+            tokio::spawn(async move {
+                let mut ticker = interval(Duration::from_millis(150));
+                loop {
+                    ticker.tick().await;
+                    let targets: Vec<([u8; 32], String)> = {
+                        let k = known.lock().unwrap();
+                        k.iter().filter(|(pid, _)| **pid > my_id).map(|(p, a)| (*p, a.clone())).collect()
+                    };
+                    for (pid, addr) in targets {
+                        let busy = peers.lock().unwrap().contains_key(&pid)
+                            || !inflight.lock().unwrap().insert(pid);
+                        if busy {
+                            continue;
                         }
-                        tokio::time::sleep(Duration::from_millis(150)).await;
+                        let (peers, inbox, identity, listen_addr, known, inflight) = (
+                            peers.clone(), inbox.clone(), identity.clone(), listen_addr.clone(),
+                            known.clone(), inflight.clone(),
+                        );
+                        tokio::spawn(async move {
+                            if let Ok(stream) = TcpStream::connect(&addr).await {
+                                // Outbound dial: we are the Noise initiator.
+                                run_conn(stream, identity, listen_addr, true, inbox, peers, known).await;
+                            }
+                            inflight.lock().unwrap().remove(&pid);
+                        });
                     }
-                });
-            }
+                }
+            });
         }
         tokio::time::sleep(Duration::from_millis(400)).await;
         info!(peer = %hex::encode(&my_id[..4]), validators = self.genesis.len(), quorum = quorum(self.genesis.len()), "node up, entering consensus loop");
@@ -717,6 +766,14 @@ impl Node {
                         MembershipOp::Add { record, .. } => !next.contains(&record.peer_id),
                         MembershipOp::Remove { peer_id, .. } => next.contains(peer_id),
                     });
+                    // Learn the dial addresses of all current members so the dial task can reach a
+                    // newly-admitted validator.
+                    {
+                        let mut k = known.lock().unwrap();
+                        for (p, a) in &next.addr {
+                            k.insert(*p, a.clone());
+                        }
+                    }
                 }
             }
 
@@ -769,6 +826,7 @@ fn binding_msg(hs_hash: &[u8; 32]) -> Vec<u8> {
 /// Drive one peer connection: run the Noise XX handshake, then exchange a `Hello` whose ed25519
 /// `binding` authenticates the remote's identity against the handshake hash (defeating a MITM on
 /// the anonymous-static XX exchange), register a writer, and forward decrypted reads to the inbox.
+#[allow(clippy::too_many_arguments)]
 async fn run_conn(
     stream: TcpStream,
     identity: Arc<NodeIdentity>,
@@ -776,6 +834,7 @@ async fn run_conn(
     initiator: bool,
     inbox: mpsc::UnboundedSender<Message>,
     peers: PeersMap,
+    known: Arc<Mutex<HashMap<[u8; 32], String>>>,
 ) {
     let _ = stream.set_nodelay(true);
     let mut stream = stream;
@@ -797,7 +856,7 @@ async fn run_conn(
         return;
     }
     let remote = match read_frame(&mut rd, &chan, &mut recv_nonce).await {
-        Ok(Message::Hello { peer_id, binding, .. }) => {
+        Ok(Message::Hello { peer_id, listen_addr: remote_addr, binding }) => {
             // The remote must prove it controls `peer_id` AND that this is the same channel — a
             // valid ed25519 signature over our shared handshake hash establishes both.
             let sig = match ed25519_dalek::Signature::from_slice(&binding) {
@@ -807,12 +866,22 @@ async fn run_conn(
             if !verify_ed25519(&peer_id, &binding_msg(&hs_hash), &sig) {
                 return;
             }
+            // Learn the peer's advertised dial address (helps reverse-dial a newcomer we have not
+            // yet seen on-chain).
+            known.lock().unwrap().insert(peer_id, remote_addr);
             peer_id
         }
         _ => return,
     };
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-    peers.lock().unwrap().insert(remote, tx);
+    {
+        // Dedup: if we already hold a connection to this peer, drop this redundant one.
+        let mut p = peers.lock().unwrap();
+        if p.contains_key(&remote) {
+            return;
+        }
+        p.insert(remote, tx);
+    }
     let chan_w = chan.clone();
     let writer = tokio::spawn(async move {
         while let Some(m) = rx.recv().await {

@@ -54,7 +54,11 @@ Companion to `SPEC.md` §4.1 (chain/epochs), §4.2/§4.9.1 (identity derivation)
   join (Sybil-trivial; the real gate is the deferred `Admission`/`VdfAdmission` seam), but nobody can
   inject or evict a validator that did not sign the change. This rides on the existing aggregatable
   multisig (no DKG needed for a *changing* set; a fixed DKG threshold key stays the deferred
-  `VA_pub` construct).
+  `VA_pub` construct). A **newcomer** boots with the genesis set as bootstrap peers and gossips its
+  join op until admitted; peer **dialing is dynamic** (a shared address book grown from the chain and
+  from peers' `Hello`s), so the network reaches a validator that joined after genesis. (Gossip is
+  single-hop, so a newcomer meshes fully; a newcomer whose id exceeds every existing one's still
+  needs reverse-dialing — implemented — but the demo/test newcomer dials the whole bootstrap set.)
 - **Minimal chain**: append-only, deterministic genesis, one finalized block per epoch; structural
   validation (height + prev-hash) plus semantic checks (beacon, VRF leadership, quorum certificate).
 - **Networking — Noise-encrypted channels**: every peer connection runs a real **Noise XX**
@@ -95,7 +99,7 @@ distinctness and the publish-`s₁` split.
 | consensus — VRF election + aggregate-BLS quorum cert + view-change + proposer-equivocation + double-vote slashing + dynamic membership (real) → +DKG threshold key | **safety + leader-failure liveness + aggregate-BLS finality + both equivocation-slashing paths + dynamic validator-set membership with chain-derived quorum reconfiguration done**; remaining: the QC is an aggregatable MULTISIG (signer set recorded) not a DKG threshold key (`VA_pub` is the separate DKG construct); join admission is AcceptAll (the Sybil gate is the `Admission` seam) | SPEC §4.1, §4.3 |
 | `vrf` — real EC-VRF (sr25519, `schnorrkel`) | **real VRF done** (unique, ungrindable lottery value per key+input); the beacon it binds to is now VRF-chained too (see the beacon row), leaving only the residual last-revealer bias → VDF/drand | SPEC EC-VRF, §4.1 |
 | `Admission` — AcceptAll (real) → `VdfAdmission` | membership is now **dynamic** (join/leave, §4.1 row), but admission is **AcceptAll**: proving key-control suffices to join (Sybil-trivial). The real gate — a VDF proof-of-work cost per admission — is deferred | SPEC §4.3 |
-| `Discovery` → `ConnectKnown` / `PsiDiscovery` | declared seam; peers come from the static genesis validator set | SPEC §5.3/§5.4 |
+| `Discovery` — bootstrap + chain-driven address book (partial) → `PsiDiscovery` | peers come from the genesis bootstrap set plus a dynamic address book grown from on-chain joins and peers' `Hello`s; the private set-intersection discovery is deferred | SPEC §5.3/§5.4 |
 | `VerEnc` → `StubVerEnc` / `NativeGroupVerEnc` | `d_T` is a placeholder; `s₂` is **not** sealed | DESIGN-f1, SPEC §4.9.4 |
 | beacon — VRF-chained (real) → +VDF/drand | `beacon_T = Poseidon(beacon_{T-1}, T, fold(vrf_output_{T-1}))` — folds in the prior block's *ungrindable* VRF output, so the leader schedule is no longer computable from genesis; residual last-revealer (withhold-to-regrind) bias remains → VDF/drand for full unbiasability | SPEC §4.1 |
 | SMT roots | zero stubs — no suspensions, no non-membership proofs | SPEC §4.9.2 |
