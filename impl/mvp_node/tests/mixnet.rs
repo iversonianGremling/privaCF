@@ -4,6 +4,7 @@
 //! its sender. (The Sphinx crypto itself — fixed size, per-hop bitwise unlinkability, MAC integrity —
 //! is unit-tested in `src/sphinx.rs`; the path/delay entropy in `src/loopix.rs`.)
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,7 +34,21 @@ fn config(dir: &MixDirectory, addr: String) -> MixConfig {
         cover_mean_ms: 0,
         cover_hops: 3,
         cover_delay_ms: 0,
+        drop_cover_mean_ms: 0,
+        drop_cover_hops: 3,
+        drop_cover_delay_ms: 0,
     }
+}
+
+/// Poll `f` every 50ms until it is true or `tries` elapse.
+async fn eventually(tries: u32, mut f: impl FnMut() -> bool) -> bool {
+    for _ in 0..tries {
+        if f() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    f()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -134,15 +149,57 @@ async fn loop_cover_traffic_returns_to_its_sender() {
     }
     tokio::time::sleep(Duration::from_millis(700)).await;
 
-    // A loop cover packet routes through the mixnet and comes back to node 0 as a delivery.
-    let got = tokio::time::timeout(Duration::from_secs(3), handles[0].delivered.recv())
-        .await
-        .expect("a loop cover packet must return to its sender")
-        .expect("delivered channel open");
-    assert_eq!(got, b"\x00cover", "the returned loop carries the cover marker");
+    // Loop cover packets route through the mixnet and come back to node 0, which counts the return
+    // (cover never surfaces as application traffic).
+    let returned = eventually(50, || handles[0].cover_returned.load(Ordering::Relaxed) > 0).await;
+    assert!(returned, "a loop cover packet must return to its sender and be counted");
 
-    // No relay node delivered the cover packet (it is addressed back to node 0).
-    for (i, h) in handles.iter_mut().enumerate().skip(1) {
-        assert!(h.delivered.try_recv().is_err(), "relay {i} must not deliver a loop cover packet");
+    // No node ever saw cover as an application delivery.
+    for (i, h) in handles.iter_mut().enumerate() {
+        assert!(h.delivered.try_recv().is_err(), "node {i} must not deliver cover traffic to the app");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drop_cover_traffic_is_received_and_silently_discarded() {
+    let base = 19500u16;
+    let (ids, dir) = network(5, base);
+
+    // Node 0 emits drop cover (~40ms mean) addressed to random other mixes; they discard it.
+    let mut handles = Vec::new();
+    for (i, id) in ids.iter().enumerate() {
+        let mut cfg = config(&dir, format!("127.0.0.1:{}", base + i as u16));
+        if i == 0 {
+            cfg.drop_cover_mean_ms = 40;
+            cfg.drop_cover_hops = 3;
+            cfg.drop_cover_delay_ms = 5;
+        }
+        handles.push(loopix::spawn(id.clone(), cfg).await.expect("spawn mix"));
+    }
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    // Some other node receives and discards drop cover (counted, never surfaced).
+    let dropped = eventually(50, || {
+        handles.iter().skip(1).map(|h| h.cover_dropped.load(Ordering::Relaxed)).sum::<u64>() > 0
+    })
+    .await;
+    assert!(dropped, "drop cover must reach some other mix and be discarded");
+
+    // Real traffic still flows undisturbed: node 0 sends to node 4, which delivers it.
+    handles[0]
+        .inject
+        .send(Injection {
+            payload: b"real-amid-cover".to_vec(),
+            dest: ids[4].peer_id(),
+            hops: 3,
+            beacon: 7,
+            nonce: 3,
+            mean_delay_ms: 10,
+        })
+        .expect("inject");
+    let got = tokio::time::timeout(Duration::from_secs(3), handles[4].delivered.recv())
+        .await
+        .expect("real message delivers despite cover")
+        .expect("channel open");
+    assert_eq!(got, b"real-amid-cover", "drop cover never contaminates real delivery");
 }

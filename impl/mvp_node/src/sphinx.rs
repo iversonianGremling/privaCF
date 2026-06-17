@@ -19,17 +19,19 @@
 //!     and the next hop's MAC, then shifts the remainder forward — padded by a sender-computed
 //!     **filler** so the blob stays exactly `BETA_LEN` bytes and every hop's MAC verifies. The
 //!     per-hop MAC `gamma = mu(s_i, beta)` gives routing integrity (a tampered header is rejected).
-//!   * **Payload** (fixed `PAYLOAD_LEN`): commutatively stream-layered — the sender XORs every hop's
-//!     `pay(s_i)` keystream, each hop peels its own, so intermediates see only ciphertext and the
-//!     destination recovers the plaintext (verified by an embedded magic + BLAKE3 digest).
+//!   * **Payload** (fixed `PAYLOAD_LEN`): onion-layered with a **LIONESS** wide-block SPRP (one
+//!     keyed layer per hop, keyed by `s_i`). LIONESS is a 4-round unbalanced Feistel over a 32-byte
+//!     left block `L` and the rest `R`, so it behaves as a strong pseudo-random permutation on the
+//!     whole 1024-byte block: any single-bit change to a layer's ciphertext **avalanches across the
+//!     entire block** when the next layer is removed. This closes the payload **tagging channel** —
+//!     an active mix cannot flip a recognisable pattern into the payload and have a colluding
+//!     downstream observer recognise it to link input to output (which plain XOR stream-layering
+//!     would allow). The destination recovers the plaintext (verified by an embedded magic + BLAKE3
+//!     digest); any mid-path mauling turns the whole block to noise, so it is rejected.
 //!
-//! Honest simplification: the payload uses XOR stream-layering (confidential, fixed-size, integrity
-//! checked **at the destination**) rather than a wide-block SPRP (LIONESS). That means an *active*
-//! mid-path attacker could maul payload bytes undetectably until delivery (the destination still
-//! detects it via the digest, but cannot blame the hop). Production Sphinx uses LIONESS so any
-//! payload bit-flip randomises the whole block; the routing header here already has full per-hop MAC
-//! integrity. Keystreams/MACs use BLAKE3 (keyed hash + XOF), reusing the existing `blake3` dep
-//! rather than pulling in a separate stream cipher.
+//! Keystreams/MACs/LIONESS rounds all use BLAKE3 (keyed hash + XOF), reusing the existing `blake3`
+//! dep rather than pulling in a separate stream cipher. The routing header has full per-hop MAC
+//! integrity (`gamma`); the payload now has SPRP non-malleability.
 
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
 use curve25519_dalek::ristretto::CompressedRistretto;
@@ -131,12 +133,71 @@ fn mu(s: &[u8; 32], beta: &[u8]) -> [u8; MAC_LEN] {
     out
 }
 
-/// `pay` keystream for the payload onion layer (one per hop, XORed commutatively).
-fn pay_keystream(s: &[u8; 32]) -> [u8; PAYLOAD_LEN] {
-    let key = subkey(s, b"pay");
-    let mut out = [0u8; PAYLOAD_LEN];
-    blake3::Hasher::new_keyed(&key).finalize_xof().fill(&mut out);
+// --- LIONESS wide-block SPRP for the payload onion ------------------------------------------------
+//
+// One keyed layer per hop. LIONESS (Anderson–Biham) is a 4-round unbalanced Feistel on (L, R) with
+// |L| = 32 bytes and |R| = PAYLOAD_LEN-32, using a stream cipher S (keyed BLAKE3 XOF) and a keyed
+// hash H (BLAKE3). It is a strong PRP on the whole block, so a one-byte ciphertext change avalanches
+// across all 1024 bytes when a layer is removed — defeating payload tagging.
+
+/// LIONESS left-block size (= BLAKE3 key/hash size).
+const LION_L: usize = 32;
+
+/// The four round subkeys for a hop's LIONESS layer, derived from its shared secret.
+fn lion_keys(s: &[u8; 32]) -> [[u8; 32]; 4] {
+    [subkey(s, b"li1"), subkey(s, b"li2"), subkey(s, b"li3"), subkey(s, b"li4")]
+}
+
+/// Keyed stream of `len` bytes (the Feistel's S box).
+fn lion_stream(key: &[u8; 32], len: usize) -> Vec<u8> {
+    let mut out = vec![0u8; len];
+    blake3::Hasher::new_keyed(key).finalize_xof().fill(&mut out);
     out
+}
+
+/// Keyed 32-byte hash of `data` (the Feistel's H box).
+fn lion_hash(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
+    *blake3::keyed_hash(key, data).as_bytes()
+}
+
+fn xor32(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+    let mut o = [0u8; 32];
+    for i in 0..32 {
+        o[i] = a[i] ^ b[i];
+    }
+    o
+}
+
+fn xor_into(dst: &mut [u8], ks: &[u8]) {
+    for (b, k) in dst.iter_mut().zip(ks.iter()) {
+        *b ^= *k;
+    }
+}
+
+/// Encrypt one LIONESS layer in place (sender side; applied per hop).
+fn lioness_encrypt(block: &mut [u8; PAYLOAD_LEN], s: &[u8; 32]) {
+    let [k1, k2, k3, k4] = lion_keys(s);
+    let (l, r) = block.split_at_mut(LION_L);
+    let mut big_l = [0u8; 32];
+    big_l.copy_from_slice(l);
+    xor_into(r, &lion_stream(&xor32(&big_l, &k1), r.len())); // R ^= S(L^k1)
+    big_l = xor32(&big_l, &lion_hash(&k2, r)); // L ^= H(k2, R)
+    xor_into(r, &lion_stream(&xor32(&big_l, &k3), r.len())); // R ^= S(L^k3)
+    big_l = xor32(&big_l, &lion_hash(&k4, r)); // L ^= H(k4, R)
+    l.copy_from_slice(&big_l);
+}
+
+/// Decrypt one LIONESS layer in place (mix side; the exact inverse of `lioness_encrypt`).
+fn lioness_decrypt(block: &mut [u8; PAYLOAD_LEN], s: &[u8; 32]) {
+    let [k1, k2, k3, k4] = lion_keys(s);
+    let (l, r) = block.split_at_mut(LION_L);
+    let mut big_l = [0u8; 32];
+    big_l.copy_from_slice(l);
+    big_l = xor32(&big_l, &lion_hash(&k4, r)); // L ^= H(k4, R)
+    xor_into(r, &lion_stream(&xor32(&big_l, &k3), r.len())); // R ^= S(L^k3)
+    big_l = xor32(&big_l, &lion_hash(&k2, r)); // L ^= H(k2, R)
+    xor_into(r, &lion_stream(&xor32(&big_l, &k1), r.len())); // R ^= S(L^k1)
+    l.copy_from_slice(&big_l);
 }
 
 /// Blinding factor `b_i = H(alpha_i ‖ s_i)` as a Ristretto scalar.
@@ -281,11 +342,10 @@ pub fn create_with_rng(
     let mut onion = [0u8; PAYLOAD_LEN];
     onion[..BODY_LEN].copy_from_slice(&body);
     onion[BODY_LEN..].copy_from_slice(digest.as_bytes());
-    for s in &secrets {
-        let ks = pay_keystream(s);
-        for (b, k) in onion.iter_mut().zip(ks.iter()) {
-            *b ^= *k;
-        }
+    // Onion-wrap with one LIONESS layer per hop, innermost (last hop) first so hop 0's layer is
+    // outermost and peeled first. LIONESS is not commutative, so this order is load-bearing.
+    for s in secrets.iter().rev() {
+        lioness_encrypt(&mut onion, s);
     }
 
     let mut beta_arr = [0u8; BETA_LEN];
@@ -323,12 +383,9 @@ pub fn process(mix_sk: &[u8; 32], pkt: &SphinxPacket) -> Result<Processed, Sphin
     gamma_next.copy_from_slice(&stripped[HOP_DATA..BLOCK]);
     let beta_next = &stripped[BLOCK..BLOCK + BETA_LEN];
 
-    // Peel one payload layer.
+    // Peel one payload layer (the exact inverse of one of the sender's LIONESS layers).
     let mut payload = pkt.payload;
-    let ks = pay_keystream(&s);
-    for (b, kk) in payload.iter_mut().zip(ks.iter()) {
-        *b ^= *kk;
-    }
+    lioness_decrypt(&mut payload, &s);
 
     if flag == FLAG_DELIVER {
         return Ok(Processed::Deliver { data: open_payload(&payload)? });
@@ -467,6 +524,50 @@ mod tests {
             _ => panic!(),
         };
         assert!(open_payload(&mid.payload).is_err(), "a half-peeled payload must not open");
+    }
+
+    #[test]
+    fn lioness_round_trips_and_avalanches() {
+        // The payload SPRP must invert exactly, and a one-byte ciphertext change must scramble the
+        // whole block on decryption — the anti-tagging property.
+        let s = [3u8; 32];
+        let mut block = [0u8; PAYLOAD_LEN];
+        for (i, b) in block.iter_mut().enumerate() {
+            *b = (i * 7) as u8;
+        }
+        let orig = block;
+        lioness_encrypt(&mut block, &s);
+        assert_ne!(block, orig, "encryption must change the block");
+        let mut dec = block;
+        lioness_decrypt(&mut dec, &s);
+        assert_eq!(dec, orig, "LIONESS must invert exactly");
+
+        // Flip one ciphertext byte; the decrypted block must differ from the original almost
+        // everywhere (a strong PRP avalanches), so a tag cannot survive as a localized mark.
+        let mut tampered = block;
+        tampered[500] ^= 0x01;
+        let mut dec2 = tampered;
+        lioness_decrypt(&mut dec2, &s);
+        let diff = dec2.iter().zip(orig.iter()).filter(|(a, b)| a != b).count();
+        assert!(diff > PAYLOAD_LEN / 4, "a 1-byte change must avalanche (only {diff} bytes differ)");
+    }
+
+    #[test]
+    fn a_mid_path_payload_tamper_is_caught_at_the_destination() {
+        // An active attacker between hops flips a payload byte. Under the LIONESS SPRP this turns the
+        // whole delivered block to noise, so the destination's magic/digest check rejects it.
+        let (hops, sks) = make_mixes(3);
+        let pkt = create(&hops, &[1, 1, 1], b"cargo").unwrap();
+        let mut p1 = match process(&sks[0], &pkt).unwrap() {
+            Processed::Forward { packet, .. } => packet,
+            _ => panic!("hop 0 forwards"),
+        };
+        p1.payload[100] ^= 0xff; // tamper in flight
+        let p2 = match process(&sks[1], &p1).unwrap() {
+            Processed::Forward { packet, .. } => packet,
+            _ => panic!("hop 1 forwards"),
+        };
+        assert!(matches!(process(&sks[2], &p2), Err(SphinxError::BadPayload)), "tamper must be rejected");
     }
 
     #[test]

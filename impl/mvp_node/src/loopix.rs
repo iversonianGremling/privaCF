@@ -27,6 +27,7 @@
 //! as its own transport.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -297,6 +298,32 @@ impl Reassembler {
 
 type Peers = Arc<Mutex<HashMap<[u8; 32], mpsc::UnboundedSender<Message>>>>;
 
+/// Cover-traffic payload markers. Loopix sends two kinds of indistinguishable cover so an observer
+/// cannot tell when a node genuinely transmits: a **loop** packet (routed back to the sender, which
+/// recognizes its return — a liveness/active-attack monitor) and a **drop** packet (routed to a
+/// random other mix, which silently discards it — pure padding). Real app payloads carry neither
+/// marker. The markers live in the (decrypted, reassembled) payload, so they are invisible on the
+/// wire — every Sphinx packet looks identical.
+const LOOP_MARKER: &[u8] = b"\x00cover";
+const DROP_MARKER: &[u8] = b"\x00drop";
+
+/// What a delivered payload is, by its marker.
+enum Delivery {
+    Real,
+    Loop,
+    Drop,
+}
+
+fn classify(payload: &[u8]) -> Delivery {
+    if payload.starts_with(LOOP_MARKER) {
+        Delivery::Loop
+    } else if payload.starts_with(DROP_MARKER) {
+        Delivery::Drop
+    } else {
+        Delivery::Real
+    }
+}
+
 /// A request to send `payload` to `dest` through a chain-selected `hops`-hop path, using `beacon`
 /// (+`nonce`) as the entropy source and `mean_delay_ms` as the per-hop Poisson delay mean. Set
 /// `dest = self` for a loop cover packet.
@@ -314,20 +341,30 @@ pub struct Injection {
 pub struct MixConfig {
     pub listen_addr: String,
     pub directory: MixDirectory,
-    /// If > 0, emit a loop cover packet on an exponential timer with this mean (ms) — indistinguishable
-    /// from real traffic, so an observer cannot tell when the node is genuinely sending.
+    /// If > 0, emit a **loop** cover packet on an exponential timer with this mean (ms) — routed back
+    /// to self, indistinguishable on the wire from real traffic.
     pub cover_mean_ms: u64,
-    /// Hop count for cover packets.
+    /// Hop count for loop cover packets.
     pub cover_hops: usize,
-    /// Per-hop delay mean (ms) for cover packets.
+    /// Per-hop delay mean (ms) for loop cover packets.
     pub cover_delay_ms: u64,
+    /// If > 0, emit a **drop** cover packet on an exponential timer with this mean (ms) — routed to a
+    /// random other mix, which silently discards it (pure padding traffic).
+    pub drop_cover_mean_ms: u64,
+    /// Hop count for drop cover packets.
+    pub drop_cover_hops: usize,
+    /// Per-hop delay mean (ms) for drop cover packets.
+    pub drop_cover_delay_ms: u64,
 }
 
-/// Handle to a spawned mix node: a stream of payloads delivered *to this node*, and an injector to
-/// send payloads *from this node* through the mixnet.
+/// Handle to a spawned mix node: a stream of *real* payloads delivered to this node, an injector to
+/// send from this node, and counters for observed cover traffic (loop packets that returned to us,
+/// drop packets we received and discarded) — cover never appears on the `delivered` stream.
 pub struct MixHandle {
     pub delivered: mpsc::UnboundedReceiver<Vec<u8>>,
     pub inject: mpsc::UnboundedSender<Injection>,
+    pub cover_returned: Arc<AtomicU64>,
+    pub cover_dropped: Arc<AtomicU64>,
 }
 
 /// Spawn a mix node: bind a listener, dial the larger-id directory peers (one Noise channel per
@@ -340,6 +377,8 @@ pub async fn spawn(identity: Arc<NodeIdentity>, config: MixConfig) -> std::io::R
     let my_id = identity.peer_id();
     let mix_sk = identity.mix_sk();
     let directory = Arc::new(config.directory);
+    let cover_returned = Arc::new(AtomicU64::new(0));
+    let cover_dropped = Arc::new(AtomicU64::new(0));
 
     let listener = TcpListener::bind(&config.listen_addr).await?;
     // Accept loop (Noise responder).
@@ -384,6 +423,7 @@ pub async fn spawn(identity: Arc<NodeIdentity>, config: MixConfig) -> std::io::R
     // reassemble-and-deliver. The reassembler is owned by this single task (no lock needed).
     {
         let (peers, mix_sk) = (peers.clone(), mix_sk);
+        let (cover_returned, cover_dropped) = (cover_returned.clone(), cover_dropped.clone());
         tokio::spawn(async move {
             let mut reasm = Reassembler::new(256);
             while let Some((_from, msg)) = inbox_rx.recv().await {
@@ -391,7 +431,19 @@ pub async fn spawn(identity: Arc<NodeIdentity>, config: MixConfig) -> std::io::R
                     match sphinx::process(&mix_sk, &pkt) {
                         Ok(Processed::Deliver { data }) => {
                             if let Some(full) = reasm.accept(&data) {
-                                let _ = delivered_tx.send(full);
+                                // Cover never reaches the app: a returned loop / a discarded drop is
+                                // only counted; real payloads flow on.
+                                match classify(&full) {
+                                    Delivery::Real => {
+                                        let _ = delivered_tx.send(full);
+                                    }
+                                    Delivery::Loop => {
+                                        cover_returned.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    Delivery::Drop => {
+                                        cover_dropped.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
                             }
                         }
                         Ok(Processed::Forward { next, delay_ms, packet }) => {
@@ -428,7 +480,8 @@ pub async fn spawn(identity: Arc<NodeIdentity>, config: MixConfig) -> std::io::R
         });
     }
 
-    // Cover traffic: loop packets on an exponential timer, indistinguishable from real sends.
+    // Loop cover: packets routed back to self on an exponential timer, indistinguishable on the wire
+    // from real sends — an observer cannot tell when this node genuinely transmits.
     if config.cover_mean_ms > 0 {
         let inject = inject_tx.clone();
         let (mean, hops, delay) = (config.cover_mean_ms, config.cover_hops, config.cover_delay_ms);
@@ -440,7 +493,7 @@ pub async fn spawn(identity: Arc<NodeIdentity>, config: MixConfig) -> std::io::R
                 tokio::time::sleep(Duration::from_millis(wait)).await;
                 nonce = nonce.wrapping_add(1);
                 let inj = Injection {
-                    payload: b"\x00cover".to_vec(),
+                    payload: LOOP_MARKER.to_vec(),
                     dest: my_id, // a loop back to self
                     hops,
                     beacon: 0,
@@ -454,7 +507,38 @@ pub async fn spawn(identity: Arc<NodeIdentity>, config: MixConfig) -> std::io::R
         });
     }
 
-    Ok(MixHandle { delivered: delivered_rx, inject: inject_tx })
+    // Drop cover: packets routed to a random *other* mix (which discards them) on an exponential
+    // timer — pure padding that thickens the anonymity set without ever reaching an application.
+    if config.drop_cover_mean_ms > 0 && directory.len() > 1 {
+        let inject = inject_tx.clone();
+        let dir = directory.clone();
+        let (mean, hops, delay) =
+            (config.drop_cover_mean_ms, config.drop_cover_hops, config.drop_cover_delay_ms);
+        tokio::spawn(async move {
+            let others: Vec<[u8; 32]> = dir.ids().into_iter().filter(|p| *p != my_id).collect();
+            let mut nonce = 0u64;
+            loop {
+                let wait = sample_delays(1, mean, 1, nonce).first().copied().unwrap_or(mean).max(1);
+                tokio::time::sleep(Duration::from_millis(wait)).await;
+                nonce = nonce.wrapping_add(1);
+                // Pick a random other mix as the (discarding) destination, from the cover nonce.
+                let pick = others[(nonce as usize).wrapping_mul(2654435761) % others.len()];
+                let inj = Injection {
+                    payload: DROP_MARKER.to_vec(),
+                    dest: pick,
+                    hops,
+                    beacon: 0,
+                    nonce: nonce.wrapping_add(0xD0_0D),
+                    mean_delay_ms: delay,
+                };
+                if inject.send(inj).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    Ok(MixHandle { delivered: delivered_rx, inject: inject_tx, cover_returned, cover_dropped })
 }
 
 /// Fragment an injection's payload and build one chain-routed Sphinx packet per fragment, returning
@@ -626,6 +710,15 @@ mod tests {
             }
         }
         assert_eq!(done.as_deref(), Some(payload.as_slice()), "reassembled bytes match the original");
+    }
+
+    #[test]
+    fn cover_markers_classify_distinctly_from_real_traffic() {
+        assert!(matches!(classify(LOOP_MARKER), Delivery::Loop));
+        assert!(matches!(classify(DROP_MARKER), Delivery::Drop));
+        assert!(matches!(classify(b"a real application payload"), Delivery::Real));
+        // A real payload that merely starts with a NUL but not a marker is still real.
+        assert!(matches!(classify(b"\x00ordinary"), Delivery::Real));
     }
 
     #[test]
