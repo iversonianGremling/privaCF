@@ -20,7 +20,9 @@ Companion to `SPEC.md` §4.1 (chain/epochs), §4.2/§4.9.1 (identity derivation)
 - **Per-epoch node loop**: derive `epoch_id`, build + sign an `epoch_transaction`, gossip it, and
   participate in consensus on the next block.
 - **Consensus — simplified single-round BFT with view-change**: each height the validators
-  broadcast a VRF claim (`vrf.rs`), deterministically elect the lowest-output leader, vote on its
+  broadcast a real **EC-VRF** claim (`vrf.rs`; sr25519/Ristretto, the VRF Polkadot's BABE uses —
+  the lottery value is *unique* per key+input, so a validator cannot grind its own output),
+  deterministically elect the lowest-output leader, vote on its
   block with a **BLS12-381 signature** (`bls.rs`), and **finalize once a quorum certificate forms —
   an aggregate BLS signature of ≥ ⌊2N/3⌋+1 distinct validator votes over the block id** (one 96-byte
   signature, verified against the aggregated signer public keys; the spec's `validator_sigs`
@@ -70,7 +72,7 @@ distinctness and the publish-`s₁` split.
 |---|---|---|
 | `Transport` → `TcpTransport` / `LoopixTransport` | **clearnet, plaintext** — no Noise, no mixing; fully linkable to a network observer | SPEC §5.1 |
 | consensus — VRF election + aggregate-BLS quorum cert + view-change + proposer-equivocation + double-vote slashing (real) → +more | **safety + leader-failure liveness + aggregate-BLS finality + proposer-equivocation + validator-double-vote slashing done**; remaining: the QC is an aggregatable MULTISIG (signer set recorded) not a DKG threshold key (`VA_pub` is the separate DKG construct), and the validator set is static (no admission/eviction beyond slashing) | SPEC §4.1 |
-| `vrf` → ed25519-sig stand-in / EC-VRF | leader lottery works + is verifiable, but it is an ed25519-deterministic-sig stand-in, not a true VRF; and the beacon it binds to is grindable | SPEC EC-VRF |
+| `vrf` — real EC-VRF (sr25519, `schnorrkel`) → +unbiased beacon | **real VRF done** (unique, ungrindable lottery value per key+input); remaining gap: the *beacon* it binds to is still a grindable hash chain (`Poseidon(prev,height)`), so election is only as unpredictable as the beacon — a drand/VDF beacon is the real source | SPEC EC-VRF, §4.1 |
 | `Admission` → `AcceptAll` / `VdfAdmission` | declared seam; membership is the static genesis set (Sybil-trivial) | SPEC §4.3 |
 | `Discovery` → `ConnectKnown` / `PsiDiscovery` | declared seam; peers come from the static genesis validator set | SPEC §5.3/§5.4 |
 | `VerEnc` → `StubVerEnc` / `NativeGroupVerEnc` | `d_T` is a placeholder; `s₂` is **not** sealed | DESIGN-f1, SPEC §4.9.4 |
@@ -85,13 +87,14 @@ rotation exists for (plaintext transport), Sybil cost, or any sealing/verdict/ZK
 
 ## What to make real next
 
-Both equivocation faults (proposer + voter) are now caught, so inside the consensus seam the next
-items are a true **EC-VRF** in place of the ed25519-sig stand-in (the current leader lottery binds
-to a *grindable* beacon) and **dynamic validator-set membership** (admission/eviction beyond
-slashing-from-leadership; the QC is still an aggregatable multisig, not a DKG threshold key). Then
-the **`Transport` seam** (Noise → Loopix) to actually exercise unlinkability. *(Globally, separate
-from this node roadmap, the optimized non-native ZK **bridge gadget** — see `../spike_bridge_cost/`
-and `SPIKE-statement5.md` §10 — remains the standing P-feasibility item.)*
+Consensus now has a real EC-VRF and catches both equivocation faults, so inside the consensus seam
+the remaining items are an **unbiased beacon** (drand/VDF in place of the grindable `Poseidon(prev,
+height)` chain — the one input the VRF still trusts) and **dynamic validator-set membership**
+(admission/eviction beyond slashing-from-leadership; the QC is still an aggregatable multisig, not a
+DKG threshold key). Then the **`Transport` seam** (Noise → Loopix) to actually exercise
+unlinkability. *(Globally, separate from this node roadmap, the optimized non-native ZK **bridge
+gadget** — see `../spike_bridge_cost/` and `SPIKE-statement5.md` §10 — remains the standing
+P-feasibility item.)*
 
 ## Toolchain caveat
 

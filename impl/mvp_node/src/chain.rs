@@ -27,6 +27,7 @@ pub struct BlockHeader {
     pub proposer_id: u64,              // proposer's epoch_id (informational)
     pub proposer_peer: [u8; 32],       // proposer's stable id
     pub vrf_output: [u8; 32],          // proposer's VRF output (leadership lottery)
+    pub vrf_preout: [u8; 32],          // proposer's VRF pre-output (needed to verify the proof)
     pub vrf_proof: Vec<u8>,            // proof of that VRF output (verifiable leadership)
 }
 
@@ -193,6 +194,7 @@ impl BlockHeader {
             proposer_id: proposer_epoch_id,
             proposer_peer: proposer.peer_id(),
             vrf_output: vrf.output,
+            vrf_preout: vrf.preout,
             vrf_proof: vrf.proof.clone(),
         }
     }
@@ -224,6 +226,7 @@ impl Chain {
             proposer_id: 0,
             proposer_peer: [0u8; 32],
             vrf_output: [0u8; 32],
+            vrf_preout: [0u8; 32],
             vrf_proof: Vec::new(),
         };
         Chain {

@@ -31,13 +31,28 @@ use crate::vrf::VrfClaim;
 
 type PeersMap = Arc<Mutex<HashMap<[u8; 32], mpsc::UnboundedSender<Message>>>>;
 
+/// A genesis validator's public record: stable id, where to reach it, and the public keys peers
+/// need to verify its consensus votes (BLS) and leadership claims (VRF).
+#[derive(Clone)]
+pub struct ValidatorInfo {
+    pub peer_id: [u8; 32],
+    pub addr: String,
+    pub bls_pk: [u8; 48],
+    pub vrf_pk: [u8; 32],
+}
+
 /// The genesis validator set for a seed-derived demo/test network: node `i` has identity
-/// `from_seed(i)`, listens on `127.0.0.1:(base_port + i)`, and advertises its BLS public key.
-pub fn genesis_validator_set(nodes: u64, base_port: u16) -> Vec<([u8; 32], String, [u8; 48])> {
+/// `from_seed(i)`, listens on `127.0.0.1:(base_port + i)`, and advertises its BLS + VRF public keys.
+pub fn genesis_validator_set(nodes: u64, base_port: u16) -> Vec<ValidatorInfo> {
     (0..nodes)
         .map(|i| {
             let id = NodeIdentity::from_seed(i);
-            (id.peer_id(), format!("127.0.0.1:{}", base_port + i as u16), id.bls_pk())
+            ValidatorInfo {
+                peer_id: id.peer_id(),
+                addr: format!("127.0.0.1:{}", base_port + i as u16),
+                bls_pk: id.bls_pk(),
+                vrf_pk: id.vrf_pk(),
+            }
         })
         .collect()
 }
@@ -45,8 +60,7 @@ pub fn genesis_validator_set(nodes: u64, base_port: u16) -> Vec<([u8; 32], Strin
 #[derive(Clone)]
 pub struct NodeConfig {
     pub listen_addr: String,
-    /// Genesis validators: (stable peer id, listen addr, BLS public key).
-    pub genesis_validators: Vec<([u8; 32], String, [u8; 48])>,
+    pub genesis_validators: Vec<ValidatorInfo>,
     pub window_ms: u64,
     pub max_height: u64,
     pub grace_ms: u64,
@@ -91,6 +105,7 @@ pub struct Node {
     verenc: StubVerEnc,
     validators: Vec<[u8; 32]>,
     bls_pks: HashMap<[u8; 32], [u8; 48]>,
+    vrf_pks: HashMap<[u8; 32], [u8; 32]>,
     /// Test fault injection: participate in VRF + voting but never propose when elected leader,
     /// forcing the other validators to view-change past us. Honest default is `false`.
     withhold_proposals: bool,
@@ -106,17 +121,20 @@ pub struct Node {
 impl Node {
     pub fn new(identity: NodeIdentity, config: NodeConfig) -> Self {
         let mut validators: Vec<[u8; 32]> =
-            config.genesis_validators.iter().map(|(id, _, _)| *id).collect();
+            config.genesis_validators.iter().map(|v| v.peer_id).collect();
         validators.sort();
         validators.dedup();
         let bls_pks: HashMap<[u8; 32], [u8; 48]> =
-            config.genesis_validators.iter().map(|(id, _, pk)| (*id, *pk)).collect();
+            config.genesis_validators.iter().map(|v| (v.peer_id, v.bls_pk)).collect();
+        let vrf_pks: HashMap<[u8; 32], [u8; 32]> =
+            config.genesis_validators.iter().map(|v| (v.peer_id, v.vrf_pk)).collect();
         Self {
             identity: Arc::new(identity),
             config,
             verenc: StubVerEnc,
             validators,
             bls_pks,
+            vrf_pks,
             withhold_proposals: false,
             equivocate: false,
             double_vote: false,
@@ -271,13 +289,18 @@ impl Node {
         if !self.validators.contains(&b.header.proposer_peer) {
             return false;
         }
+        let vrf_pk = match self.vrf_pks.get(&b.header.proposer_peer) {
+            Some(pk) => pk,
+            None => return false,
+        };
         let claim = VrfClaim {
             height: b.header.height,
             peer: b.header.proposer_peer,
             output: b.header.vrf_output,
+            preout: b.header.vrf_preout,
             proof: b.header.vrf_proof.clone(),
         };
-        claim.verify(b.header.beacon_t) && b.verify_proposer_sig()
+        claim.verify(b.header.beacon_t, vrf_pk) && b.verify_proposer_sig()
     }
 
     /// Live-proposal validity (deciding whether to VOTE): structural + VRF + proposer signature +
@@ -412,7 +435,9 @@ impl Node {
             }
             Message::Vrf(c) => {
                 if let Some(r) = round {
-                    if c.height == r.height && c.verify(r.beacon_t) {
+                    let ok = c.height == r.height
+                        && self.vrf_pks.get(&c.peer).is_some_and(|pk| c.verify(r.beacon_t, pk));
+                    if ok {
                         r.claims.insert(c.peer, c.output);
                     }
                 }
@@ -548,9 +573,9 @@ impl Node {
                 }
             });
         }
-        for (pid, addr, _bls) in self.config.genesis_validators.iter() {
-            if *pid > my_id {
-                let addr = addr.clone();
+        for v in self.config.genesis_validators.iter() {
+            if v.peer_id > my_id {
+                let addr = v.addr.clone();
                 let peers = peers.clone();
                 let inbox = inbox_tx.clone();
                 let hello = my_hello.clone();

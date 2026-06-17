@@ -8,6 +8,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use crate::bls::{keypair_from_ikm, sign as bls_sign_bytes};
 use crate::field::{from_u64, random_field, Fp};
 use crate::hash::{poseidon_scalar, DOM_EPOCH, DOM_NULL};
+use crate::vrf::{vrf_pk_from_seed, vrf_prove};
 
 /// A node's long-term identity. The signing key, `sk`, and BLS secret key never leave the device.
 pub struct NodeIdentity {
@@ -21,6 +22,10 @@ pub struct NodeIdentity {
     bls_sk: [u8; 32],
     /// BLS12-381 compressed public key (advertised in the validator set).
     bls_pk: [u8; 48],
+    /// sr25519 VRF mini-secret seed (for leader-election VRF proofs); never leaves the device.
+    vrf_seed: [u8; 32],
+    /// sr25519 VRF compressed public key (advertised in the validator set).
+    vrf_pk: [u8; 32],
 }
 
 impl NodeIdentity {
@@ -33,7 +38,20 @@ impl NodeIdentity {
         let mut ikm = [0u8; 32];
         rng.fill_bytes(&mut ikm);
         let (bls_sk, bls_pk) = keypair_from_ikm(&ikm);
-        Self { signing, verifying, sk, null_v, bls_sk, bls_pk }
+        let mut vrf_seed = [0u8; 32];
+        rng.fill_bytes(&mut vrf_seed);
+        let vrf_pk = vrf_pk_from_seed(&vrf_seed);
+        Self { signing, verifying, sk, null_v, bls_sk, bls_pk, vrf_seed, vrf_pk }
+    }
+
+    /// The sr25519 VRF public key (advertised to peers in the validator set).
+    pub fn vrf_pk(&self) -> [u8; 32] {
+        self.vrf_pk
+    }
+
+    /// Produce a VRF proof at `input`: returns `(pre-output, proof, lottery value)` (see `vrf.rs`).
+    pub fn vrf_prove(&self, input: &[u8]) -> ([u8; 32], [u8; 64], [u8; 32]) {
+        vrf_prove(&self.vrf_seed, input)
     }
 
     /// Compressed BLS public key (advertised to peers in the validator set).

@@ -33,6 +33,8 @@ bincode = "1.3"
 blake3 = "1"
 # BLS12-381 aggregate multisignatures for quorum certificates (isolated in bls.rs)
 blst = "0.3"
+# real EC-VRF (sr25519/Ristretto — the VRF Polkadot's BABE uses) for leader election (isolated in vrf.rs)
+schnorrkel = "0.11"
 # errors / cli / logging / config
 anyhow = "1.0"
 thiserror = "1"
