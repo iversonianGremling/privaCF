@@ -8,8 +8,10 @@ use crate::vrf::VrfClaim;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Message {
-    /// Peer handshake (first frame on every connection). No Noise/encryption in the MVP.
-    Hello { peer_id: [u8; 32], listen_addr: String },
+    /// Peer handshake — the first *encrypted* frame after the Noise XX handshake. `binding` is an
+    /// ed25519 signature by `peer_id` over the Noise handshake hash (domain-separated), binding the
+    /// long-term identity to this specific channel (see `transport.rs` and `run_conn`).
+    Hello { peer_id: [u8; 32], listen_addr: String, binding: Vec<u8> },
     /// Gossip a pending per-epoch transaction.
     Tx(EpochTransaction),
     /// A validator's VRF leadership claim for a height.

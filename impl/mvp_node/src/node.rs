@@ -24,9 +24,9 @@ use crate::commit::{CommitT, StubVerEnc, VerEnc};
 use crate::consensus::{leader_for, quorum};
 use crate::epoch::EpochTransaction;
 use crate::field::{add_mod, from_u64, random_field, sub_mod, to_u64};
-use crate::identity::NodeIdentity;
+use crate::identity::{verify as verify_ed25519, NodeIdentity};
 use crate::message::Message;
-use crate::transport::{read_frame, write_frame};
+use crate::transport::{noise_handshake, read_frame, write_frame};
 use crate::vrf::VrfClaim;
 
 type PeersMap = Arc<Mutex<HashMap<[u8; 32], mpsc::UnboundedSender<Message>>>>;
@@ -563,17 +563,21 @@ impl Node {
         let (inbox_tx, mut inbox_rx) = mpsc::unbounded_channel::<Message>();
         let _keepalive = inbox_tx.clone();
         let my_id = self.me();
-        let my_hello = Message::Hello { peer_id: my_id, listen_addr: self.config.listen_addr.clone() };
+        let listen_addr = self.config.listen_addr.clone();
 
         let listener = TcpListener::bind(&self.config.listen_addr).await.expect("bind");
         {
             let peers = peers.clone();
             let inbox = inbox_tx.clone();
-            let hello = my_hello.clone();
+            let identity = self.identity.clone();
+            let listen_addr = listen_addr.clone();
             tokio::spawn(async move {
                 loop {
                     if let Ok((stream, _)) = listener.accept().await {
-                        tokio::spawn(run_conn(stream, hello.clone(), inbox.clone(), peers.clone()));
+                        // Inbound dial: we are the Noise responder.
+                        tokio::spawn(run_conn(
+                            stream, identity.clone(), listen_addr.clone(), false, inbox.clone(), peers.clone(),
+                        ));
                     }
                 }
             });
@@ -583,11 +587,16 @@ impl Node {
                 let addr = v.addr.clone();
                 let peers = peers.clone();
                 let inbox = inbox_tx.clone();
-                let hello = my_hello.clone();
+                let identity = self.identity.clone();
+                let listen_addr = listen_addr.clone();
                 tokio::spawn(async move {
                     loop {
                         if let Ok(stream) = TcpStream::connect(&addr).await {
-                            run_conn(stream, hello.clone(), inbox.clone(), peers.clone()).await;
+                            // Outbound dial: we are the Noise initiator.
+                            run_conn(
+                                stream, identity.clone(), listen_addr.clone(), true, inbox.clone(), peers.clone(),
+                            )
+                            .await;
                         }
                         tokio::time::sleep(Duration::from_millis(150)).await;
                     }
@@ -659,28 +668,73 @@ impl Node {
     }
 }
 
-/// Drive one peer connection: handshake (exchange Hello), register a writer, forward reads to inbox.
-async fn run_conn(stream: TcpStream, my_hello: Message, inbox: mpsc::UnboundedSender<Message>, peers: PeersMap) {
+/// Domain-separated channel-binding message: the ed25519 signature in `Hello` covers this, binding
+/// the long-term identity to the specific Noise handshake (see `transport.rs`).
+const NOISE_BINDING_DOMAIN: &[u8] = b"privacf-noise-binding-v1";
+fn binding_msg(hs_hash: &[u8; 32]) -> Vec<u8> {
+    let mut m = Vec::with_capacity(NOISE_BINDING_DOMAIN.len() + 32);
+    m.extend_from_slice(NOISE_BINDING_DOMAIN);
+    m.extend_from_slice(hs_hash);
+    m
+}
+
+/// Drive one peer connection: run the Noise XX handshake, then exchange a `Hello` whose ed25519
+/// `binding` authenticates the remote's identity against the handshake hash (defeating a MITM on
+/// the anonymous-static XX exchange), register a writer, and forward decrypted reads to the inbox.
+async fn run_conn(
+    stream: TcpStream,
+    identity: Arc<NodeIdentity>,
+    listen_addr: String,
+    initiator: bool,
+    inbox: mpsc::UnboundedSender<Message>,
+    peers: PeersMap,
+) {
     let _ = stream.set_nodelay(true);
+    let mut stream = stream;
+    let (chan, hs_hash) = match noise_handshake(&mut stream, initiator).await {
+        Ok(x) => x,
+        Err(_) => return,
+    };
+    let chan = Arc::new(chan);
     let (mut rd, mut wr) = stream.into_split();
-    if write_frame(&mut wr, &my_hello).await.is_err() {
+
+    // Bind our long-term ed25519 identity to THIS Noise channel by signing its handshake hash.
+    let binding = identity.sign(&binding_msg(&hs_hash)).to_bytes().to_vec();
+    let my_hello =
+        Message::Hello { peer_id: identity.peer_id(), listen_addr, binding };
+
+    let mut send_nonce: u64 = 0;
+    let mut recv_nonce: u64 = 0;
+    if write_frame(&mut wr, &chan, &mut send_nonce, &my_hello).await.is_err() {
         return;
     }
-    let remote = match read_frame(&mut rd).await {
-        Ok(Message::Hello { peer_id, .. }) => peer_id,
+    let remote = match read_frame(&mut rd, &chan, &mut recv_nonce).await {
+        Ok(Message::Hello { peer_id, binding, .. }) => {
+            // The remote must prove it controls `peer_id` AND that this is the same channel — a
+            // valid ed25519 signature over our shared handshake hash establishes both.
+            let sig = match ed25519_dalek::Signature::from_slice(&binding) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            if !verify_ed25519(&peer_id, &binding_msg(&hs_hash), &sig) {
+                return;
+            }
+            peer_id
+        }
         _ => return,
     };
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
     peers.lock().unwrap().insert(remote, tx);
+    let chan_w = chan.clone();
     let writer = tokio::spawn(async move {
         while let Some(m) = rx.recv().await {
-            if write_frame(&mut wr, &m).await.is_err() {
+            if write_frame(&mut wr, &chan_w, &mut send_nonce, &m).await.is_err() {
                 break;
             }
         }
     });
     loop {
-        match read_frame(&mut rd).await {
+        match read_frame(&mut rd, &chan, &mut recv_nonce).await {
             Ok(m) => {
                 if inbox.send(m).is_err() {
                     break;
