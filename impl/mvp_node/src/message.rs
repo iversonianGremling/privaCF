@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::chain::{Block, EquivocationProof, Vote, VoteEquivocationProof};
 use crate::epoch::EpochTransaction;
 use crate::membership::MembershipOp;
+use crate::sphinx::SphinxPacket;
 use crate::vrf::VrfClaim;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -29,6 +30,8 @@ pub enum Message {
     SlashVote(VoteEquivocationProof),
     /// A self-signed validator-set change (join/leave) awaiting inclusion by the next leader.
     Membership(MembershipOp),
+    /// A fixed-size Sphinx mix packet to peel and forward/deliver (the Loopix layer, `loopix.rs`).
+    Sphinx(SphinxPacket),
     /// Request all finalized blocks at height ≥ `from_height`.
     GetChain { from_height: u64 },
     /// Response to `GetChain`.

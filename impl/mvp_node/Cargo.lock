@@ -729,6 +729,7 @@ dependencies = [
  "blake3",
  "blst",
  "clap",
+ "curve25519-dalek",
  "ed25519-dalek",
  "hex",
  "plonky2",

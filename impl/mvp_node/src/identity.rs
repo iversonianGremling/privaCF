@@ -8,6 +8,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use crate::bls::{keypair_from_ikm, sign as bls_sign_bytes};
 use crate::field::{from_u64, random_field, Fp};
 use crate::hash::{poseidon_scalar, DOM_EPOCH, DOM_NULL};
+use crate::sphinx::derive_mix_keypair;
 use crate::vrf::{vrf_pk_from_seed, vrf_prove};
 
 /// A node's long-term identity. The signing key, `sk`, and BLS secret key never leave the device.
@@ -26,6 +27,10 @@ pub struct NodeIdentity {
     vrf_seed: [u8; 32],
     /// sr25519 VRF compressed public key (advertised in the validator set).
     vrf_pk: [u8; 32],
+    /// Ristretto Sphinx mix secret-key bytes (for peeling mix packets); never leaves the device.
+    mix_sk: [u8; 32],
+    /// Ristretto Sphinx mix public key (advertised in the mix directory, `loopix.rs`).
+    mix_pk: [u8; 32],
 }
 
 impl NodeIdentity {
@@ -41,7 +46,20 @@ impl NodeIdentity {
         let mut vrf_seed = [0u8; 32];
         rng.fill_bytes(&mut vrf_seed);
         let vrf_pk = vrf_pk_from_seed(&vrf_seed);
-        Self { signing, verifying, sk, null_v, bls_sk, bls_pk, vrf_seed, vrf_pk }
+        let mut mix_ikm = [0u8; 32];
+        rng.fill_bytes(&mut mix_ikm);
+        let (mix_sk, mix_pk) = derive_mix_keypair(&mix_ikm);
+        Self { signing, verifying, sk, null_v, bls_sk, bls_pk, vrf_seed, vrf_pk, mix_sk, mix_pk }
+    }
+
+    /// The Ristretto Sphinx mix public key (advertised in the genesis mix directory).
+    pub fn mix_pk(&self) -> [u8; 32] {
+        self.mix_pk
+    }
+
+    /// The Ristretto Sphinx mix secret-key bytes (used to peel inbound mix packets).
+    pub fn mix_sk(&self) -> [u8; 32] {
+        self.mix_sk
     }
 
     /// The sr25519 VRF public key (advertised to peers in the validator set).

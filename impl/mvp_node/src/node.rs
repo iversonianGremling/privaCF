@@ -653,6 +653,8 @@ impl Node {
                 }
             }
             Message::Hello { .. } => {}
+            // Mix packets are handled by the Loopix layer (`loopix.rs`), not the consensus engine.
+            Message::Sphinx(_) => {}
         }
     }
 

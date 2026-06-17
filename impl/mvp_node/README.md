@@ -70,6 +70,23 @@ Companion to `SPEC.md` §4.1 (chain/epochs), §4.2/§4.9.1 (identity derivation)
   see two *different* handshake hashes — cannot relay the signature. Frames are AEAD-encrypted and
   chunked under Noise's 64 KiB message cap (so large sync responses still fit), over tokio TCP with
   full-mesh gossip (one connection per pair) and sync-on-timeout.
+- **Loopix mixnet — real Sphinx packets + chain-seeded mixing** (`sphinx.rs`, `loopix.rs`): the
+  *unlinkability* layer the `epoch_id` rotation exists for. A **Sphinx** packet (Ristretto
+  key-blinding, fixed `285`-byte MAC'd routing header + fixed `1024`-byte onion payload) is a
+  fixed-size onion each mix peels by one layer, learning *only* the next hop and a per-hop delay —
+  never the origin, destination, payload, or its own position. Entering and leaving a mix the packet
+  is **bitwise unlinkable** (every field changes), so a passive observer cannot correlate it. Per the
+  project directive the mixnet **presupposes a trusted genesis** (the `MixDirectory` of mix keys is
+  published at genesis) and **draws all its entropy from the blockchain**: the mix **path**, the
+  per-hop **Poisson delays**, and the **cover-traffic** schedule are seeded from the VRF-chained
+  `beacon_T` (`beacon.rs`) — unpredictable before the prior block finalizes, yet recomputable from
+  public chain data — rather than an external VDF/drand. A `MixNode` engine runs the
+  peel→delay→forward / deliver loop over the existing Noise channels and emits **loop cover traffic**
+  indistinguishable from real sends. (Honest scope: payload integrity is checked at the destination
+  via a digest, not a wide-block SPRP/LIONESS, so an active mid-path mauler is caught only at
+  delivery; drop cover, SURB replies, and statistical anonymity-set guarantees are deployment-scale
+  and out of scope. The mixnet is exercised end-to-end as its own transport — routing the *consensus
+  gossip itself* through it is the next integration step.)
 
 ## Run
 
@@ -95,7 +112,7 @@ distinctness and the publish-`s₁` split.
 
 | Seam (trait → stub / real future impl) | MVP behavior | Deferred to |
 |---|---|---|
-| `Transport` — Noise XX + ed25519 channel binding (real) → `LoopixTransport` | **confidential, authenticated, forward-secret** channels done (no plaintext wire); still **linkable** — a network observer sees who-talks-to-whom (no mixing/cover traffic) | SPEC §5.1 |
+| `Transport` — Noise XX + ed25519 channel binding **and** a real Loopix/Sphinx mixnet (real) → mix-routed consensus gossip | **confidential, authenticated, forward-secret** Noise channels **plus** a working chain-seeded Sphinx mixnet (per-hop bitwise unlinkability, Poisson delays, loop cover) exercised as its own transport; remaining: routing the **consensus gossip itself** through the mixnet, drop cover, SURB replies, LIONESS payload | SPEC §5.1 |
 | consensus — VRF election + aggregate-BLS quorum cert + view-change + proposer-equivocation + double-vote slashing + dynamic membership (real) → +DKG threshold key | **safety + leader-failure liveness + aggregate-BLS finality + both equivocation-slashing paths + dynamic validator-set membership with chain-derived quorum reconfiguration done**; remaining: the QC is an aggregatable MULTISIG (signer set recorded) not a DKG threshold key (`VA_pub` is the separate DKG construct); join admission is AcceptAll (the Sybil gate is the `Admission` seam) | SPEC §4.1, §4.3 |
 | `vrf` — real EC-VRF (sr25519, `schnorrkel`) | **real VRF done** (unique, ungrindable lottery value per key+input); the beacon it binds to is now VRF-chained too (see the beacon row), leaving only the residual last-revealer bias → VDF/drand | SPEC EC-VRF, §4.1 |
 | `Admission` — AcceptAll (real) → `VdfAdmission` | membership is now **dynamic** (join/leave, §4.1 row), but admission is **AcceptAll**: proving key-control suffices to join (Sybil-trivial). The real gate — a VDF proof-of-work cost per admission — is deferred | SPEC §4.3 |
@@ -109,24 +126,26 @@ So the MVP demonstrates node creation, network formation over **Noise-encrypted 
 channels**, epoch cycling, `epoch_id` **rotation**, and **BFT-style consensus** (VRF leader election
 + aggregate-BLS ≥2/3 quorum-certificate finality + view-change past failed leaders +
 proposer-equivocation + validator-double-vote slashing + dynamic membership with chain-derived quorum
-reconfiguration) — but NOT the *unlinkability* rotation exists
-for (Noise authenticates and conceals *content*, but a network observer still sees the
-who-talks-to-whom traffic pattern — that needs Loopix mixing), Sybil cost, or any sealing/verdict/ZK
-property.
+reconfiguration) — **and** a working Loopix/Sphinx mixnet giving per-hop **unlinkability** with
+chain-seeded paths/delays and cover traffic (the who-talks-to-whom hiding the rotation exists for),
+though that mixnet is so far exercised as its own transport rather than carrying the consensus gossip
+itself. It still does NOT demonstrate Sybil cost, or any sealing/verdict/ZK property.
 
 ## What to make real next
 
 Consensus now has a real EC-VRF, a VRF-chained beacon, catches both equivocation faults, and supports
-**dynamic membership** with chain-derived quorum reconfiguration — a coherent BFT-ish core — and the
-wire is a real **Noise XX** channel (confidential, authenticated, forward-secret). The remaining steps
-each open a larger, decision-laden subsystem: **Loopix mixing** on the `Transport` seam (the actual
-*unlinkability* the epoch_id rotation exists to provide — Noise hides content but not the
-who-talks-to-whom pattern; research-grade: Sphinx packets, Poisson per-hop delay, cover traffic,
-SURBs), a **VDF/drand beacon** (to remove the residual last-revealer bias — needs a VDF artifact or an
-external drand network), a **VDF `Admission` gate** (the real Sybil cost replacing AcceptAll joins),
-and a **DKG threshold key** (`VA_pub`) in place of the aggregatable multisig. *(Globally, separate
-from this node roadmap, the optimized non-native ZK **bridge gadget** — see `../spike_bridge_cost/`
-and `SPIKE-statement5.md` §10 — remains the standing P-feasibility item.)*
+**dynamic membership** with chain-derived quorum reconfiguration — a coherent BFT-ish core; the wire
+is a real **Noise XX** channel (confidential, authenticated, forward-secret); and there is now a real
+**Loopix/Sphinx mixnet** (`sphinx.rs`/`loopix.rs`) with chain-seeded paths/delays and cover traffic.
+The remaining steps each open a larger, decision-laden subsystem: **route the consensus gossip through
+the mixnet** (so the BFT messages themselves are unlinkable — needs re-tuning the consensus timeouts
+to absorb Poisson per-hop delay) and harden the mixnet (drop cover, SURB anonymous replies, a
+wide-block SPRP/LIONESS payload for active-attacker integrity); a **VDF/drand beacon** (to remove the
+residual last-revealer bias — needs a VDF artifact or an external drand network); a **VDF `Admission`
+gate** (the real Sybil cost replacing AcceptAll joins); and a **DKG threshold key** (`VA_pub`) in place
+of the aggregatable multisig. *(Globally, separate from this node roadmap, the optimized non-native ZK
+**bridge gadget** — see `../spike_bridge_cost/` and `SPIKE-statement5.md` §10 — remains the standing
+P-feasibility item.)*
 
 ## Toolchain caveat
 
