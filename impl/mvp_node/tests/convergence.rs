@@ -4,7 +4,7 @@
 
 use std::collections::HashSet;
 
-use mvp_node::beacon::{next_beacon, GENESIS_BEACON};
+use mvp_node::beacon::{next_beacon, GENESIS_BEACON, GENESIS_VRF_OUTPUT};
 use mvp_node::identity::NodeIdentity;
 use mvp_node::node::{genesis_validator_set, Node, NodeConfig};
 use mvp_node::vrf::VrfClaim;
@@ -76,7 +76,7 @@ async fn view_change_recovers_from_a_withholding_leader() {
 
     // Deterministically pick the height-1 view-0 leader (lowest VRF output) as the faulty node,
     // guaranteeing at least one view-change.
-    let beacon1 = next_beacon(GENESIS_BEACON, 1);
+    let beacon1 = next_beacon(GENESIS_BEACON, &GENESIS_VRF_OUTPUT, 1);
     let faulty = (0..nodes)
         .min_by_key(|&i| VrfClaim::create(&NodeIdentity::from_seed(i), 1, beacon1).output)
         .unwrap();
@@ -125,7 +125,7 @@ async fn slashing_detects_and_punishes_an_equivocating_leader() {
     let window_ms = 200u64;
 
     let validators = genesis_validator_set(nodes, base_port);
-    let beacon1 = next_beacon(GENESIS_BEACON, 1);
+    let beacon1 = next_beacon(GENESIS_BEACON, &GENESIS_VRF_OUTPUT, 1);
     let faulty = (0..nodes)
         .min_by_key(|&i| VrfClaim::create(&NodeIdentity::from_seed(i), 1, beacon1).output)
         .unwrap();
@@ -179,7 +179,7 @@ async fn slashing_detects_and_punishes_a_double_voting_validator() {
     let window_ms = 200u64;
 
     let validators = genesis_validator_set(nodes, base_port);
-    let beacon1 = next_beacon(GENESIS_BEACON, 1);
+    let beacon1 = next_beacon(GENESIS_BEACON, &GENESIS_VRF_OUTPUT, 1);
     // Pick the HIGHEST-VRF node at height 1 as the offender, so it is not the view-0 leader — the
     // double-vote is exercised on the vote path, independent of proposing.
     let faulty = (0..nodes)
@@ -221,4 +221,56 @@ async fn slashing_detects_and_punishes_a_double_voting_validator() {
             hex::encode(&o.peer_id[..4])
         );
     }
+}
+
+/// The randomness beacon is VRF-chained: every node derives the identical beacon sequence from the
+/// finalized chain (so consensus still converges), yet that sequence is NOT predictable from the
+/// genesis seed alone — from height 2 on it folds in the real, ungrindable VRF output of the prior
+/// block, so it diverges from the genesis-time-computable "zero-VRF" projection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn beacon_is_vrf_chained_and_unpredictable_from_genesis() {
+    let nodes = 4u64;
+    let epochs = 5u64;
+    let base_port = 9700u16;
+    let window_ms = 200u64;
+
+    let validators = genesis_validator_set(nodes, base_port);
+    let mut handles = Vec::new();
+    for i in 0..nodes {
+        let cfg = NodeConfig {
+            listen_addr: format!("127.0.0.1:{}", base_port + i as u16),
+            genesis_validators: validators.clone(),
+            window_ms,
+            max_height: epochs,
+            grace_ms: window_ms * 10,
+        };
+        handles.push(tokio::spawn(Node::new(NodeIdentity::from_seed(i), cfg).run()));
+    }
+    let mut outs = Vec::new();
+    for h in handles {
+        outs.push(h.await.expect("node task panicked"));
+    }
+
+    // 1. Every node derived the identical beacon sequence (randomness convergence).
+    let beacons0 = &outs[0].beacons;
+    for o in &outs {
+        assert_eq!(&o.beacons, beacons0, "node {} beacon chain diverged", hex::encode(&o.peer_id[..4]));
+    }
+    assert_eq!(beacons0.len() as u64, epochs, "one beacon per height");
+
+    // 2. The genesis-time projection (every block assumed a zero VRF output) diverges from the
+    //    realized beacon by height 2 — proving real VRF entropy entered the chain, i.e. an attacker
+    //    cannot compute the height-2+ leader schedule from the genesis seed.
+    let mut projected = Vec::new();
+    let mut prev = GENESIS_BEACON;
+    for h in 1..=epochs {
+        let b = next_beacon(prev, &GENESIS_VRF_OUTPUT, h);
+        projected.push((h, b));
+        prev = b;
+    }
+    assert_eq!(beacons0[0], projected[0], "height-1 beacon depends only on genesis, must match");
+    assert_ne!(
+        beacons0[1], projected[1],
+        "height-2 beacon must fold in block-1's real VRF output (not predictable from genesis)"
+    );
 }

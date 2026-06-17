@@ -72,11 +72,11 @@ distinctness and the publish-`s₁` split.
 |---|---|---|
 | `Transport` → `TcpTransport` / `LoopixTransport` | **clearnet, plaintext** — no Noise, no mixing; fully linkable to a network observer | SPEC §5.1 |
 | consensus — VRF election + aggregate-BLS quorum cert + view-change + proposer-equivocation + double-vote slashing (real) → +more | **safety + leader-failure liveness + aggregate-BLS finality + proposer-equivocation + validator-double-vote slashing done**; remaining: the QC is an aggregatable MULTISIG (signer set recorded) not a DKG threshold key (`VA_pub` is the separate DKG construct), and the validator set is static (no admission/eviction beyond slashing) | SPEC §4.1 |
-| `vrf` — real EC-VRF (sr25519, `schnorrkel`) → +unbiased beacon | **real VRF done** (unique, ungrindable lottery value per key+input); remaining gap: the *beacon* it binds to is still a grindable hash chain (`Poseidon(prev,height)`), so election is only as unpredictable as the beacon — a drand/VDF beacon is the real source | SPEC EC-VRF, §4.1 |
+| `vrf` — real EC-VRF (sr25519, `schnorrkel`) | **real VRF done** (unique, ungrindable lottery value per key+input); the beacon it binds to is now VRF-chained too (see the beacon row), leaving only the residual last-revealer bias → VDF/drand | SPEC EC-VRF, §4.1 |
 | `Admission` → `AcceptAll` / `VdfAdmission` | declared seam; membership is the static genesis set (Sybil-trivial) | SPEC §4.3 |
 | `Discovery` → `ConnectKnown` / `PsiDiscovery` | declared seam; peers come from the static genesis validator set | SPEC §5.3/§5.4 |
 | `VerEnc` → `StubVerEnc` / `NativeGroupVerEnc` | `d_T` is a placeholder; `s₂` is **not** sealed | DESIGN-f1, SPEC §4.9.4 |
-| beacon | `Poseidon(prev, height)` — no drand/VDF, grindable | SPEC §4.1 |
+| beacon — VRF-chained (real) → +VDF/drand | `beacon_T = Poseidon(beacon_{T-1}, T, fold(vrf_output_{T-1}))` — folds in the prior block's *ungrindable* VRF output, so the leader schedule is no longer computable from genesis; residual last-revealer (withhold-to-regrind) bias remains → VDF/drand for full unbiasability | SPEC §4.1 |
 | SMT roots | zero stubs — no suspensions, no non-membership proofs | SPEC §4.9.2 |
 | ZK proof in the loop | omitted entirely | SPEC §4.9.5 |
 
@@ -87,13 +87,14 @@ rotation exists for (plaintext transport), Sybil cost, or any sealing/verdict/ZK
 
 ## What to make real next
 
-Consensus now has a real EC-VRF and catches both equivocation faults, so inside the consensus seam
-the remaining items are an **unbiased beacon** (drand/VDF in place of the grindable `Poseidon(prev,
-height)` chain — the one input the VRF still trusts) and **dynamic validator-set membership**
-(admission/eviction beyond slashing-from-leadership; the QC is still an aggregatable multisig, not a
-DKG threshold key). Then the **`Transport` seam** (Noise → Loopix) to actually exercise
-unlinkability. *(Globally, separate from this node roadmap, the optimized non-native ZK **bridge
-gadget** — see `../spike_bridge_cost/` and `SPIKE-statement5.md` §10 — remains the standing
+Consensus now has a real EC-VRF, a VRF-chained beacon, and catches both equivocation faults — a
+coherent BFT-ish core. The remaining steps each open a larger, decision-laden subsystem rather than
+extending this core: a **VDF/drand beacon** (to remove the residual last-revealer bias — needs a VDF
+artifact or an external drand network), **dynamic validator-set membership** (admission/eviction +
+a DKG threshold key in place of the aggregatable multisig), and the **`Transport` seam** (Noise for
+confidential authenticated channels, then Loopix mixing for the actual *unlinkability* the epoch_id
+rotation exists to provide). *(Globally, separate from this node roadmap, the optimized non-native ZK
+**bridge gadget** — see `../spike_bridge_cost/` and `SPIKE-statement5.md` §10 — remains the standing
 P-feasibility item.)*
 
 ## Toolchain caveat

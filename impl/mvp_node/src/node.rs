@@ -72,6 +72,8 @@ pub struct NodeOutcome {
     pub head_hash: [u8; 32],
     pub blocks_len: usize,
     pub epoch_ids: Vec<(u64, u64)>,
+    /// The realized `(height, beacon)` chain — VRF-chained, so not predictable from genesis alone.
+    pub beacons: Vec<(u64, u64)>,
     /// True iff `s₁ + s₂ = null_v` held for every epoch.
     pub split_ok: bool,
     /// True iff every non-genesis block carries a valid quorum certificate.
@@ -182,10 +184,13 @@ impl Node {
         peers: &PeersMap,
         pending: &mut HashMap<(u64, u64), EpochTransaction>,
         epoch_ids: &mut Vec<(u64, u64)>,
+        beacons: &mut Vec<(u64, u64)>,
         split_ok: &mut bool,
         rng: &mut impl rand::RngCore,
     ) -> Round {
-        let beacon_t = next_beacon(chain.head().header.beacon_t, height);
+        let head = &chain.head().header;
+        let beacon_t = next_beacon(head.beacon_t, &head.vrf_output, height);
+        beacons.push((height, beacon_t));
         // per-epoch commitment (publish-s1)
         let epoch_id_fp = self.identity.epoch_id(from_u64(beacon_t));
         let epoch_id = to_u64(epoch_id_fp);
@@ -283,7 +288,7 @@ impl Node {
         if b.header.height != head.height + 1 || b.header.prev_block_hash != chain.head_hash() {
             return false;
         }
-        if b.header.beacon_t != next_beacon(head.beacon_t, b.header.height) {
+        if b.header.beacon_t != next_beacon(head.beacon_t, &head.vrf_output, b.header.height) {
             return false;
         }
         if !self.validators.contains(&b.header.proposer_peer) {
@@ -596,6 +601,7 @@ impl Node {
         let mut chain = Chain::genesis();
         let mut pending: HashMap<(u64, u64), EpochTransaction> = HashMap::new();
         let mut epoch_ids: Vec<(u64, u64)> = Vec::new();
+        let mut beacons: Vec<(u64, u64)> = Vec::new();
         let mut split_ok = true;
         let mut round: Option<Round> = None;
         let mut slashed: HashSet<[u8; 32]> = HashSet::new();
@@ -614,7 +620,8 @@ impl Node {
                 let need = head_h + 1;
                 if round.as_ref().map(|r| r.height) != Some(need) {
                     round = Some(self.start_round(
-                        need, &chain, &peers, &mut pending, &mut epoch_ids, &mut split_ok, &mut rng,
+                        need, &chain, &peers, &mut pending, &mut epoch_ids, &mut beacons,
+                        &mut split_ok, &mut rng,
                     ));
                     pending.retain(|(h, _), _| *h > head_h); // prune finalized heights
                 }
@@ -643,6 +650,7 @@ impl Node {
             head_hash: chain.head_hash(),
             blocks_len: chain.blocks.len(),
             epoch_ids,
+            beacons,
             split_ok,
             all_qc_valid,
             max_view,
