@@ -152,6 +152,8 @@ impl Mixer {
                     Node::send_to(&peers, &next, Message::Sphinx(packet));
                 });
             }
+            // Consensus does not use SURB replies; ignore if one is ever routed here.
+            Ok(Processed::SurbReply { .. }) => debug!("ignoring unexpected SURB reply at consensus mixer"),
             Err(e) => debug!(?e, "dropping un-processable mix packet"),
         }
     }

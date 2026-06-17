@@ -94,6 +94,31 @@ pub enum Processed {
     Forward { next: [u8; 32], delay_ms: u64, packet: SphinxPacket },
     /// This mix is the destination; `data` is the recovered plaintext.
     Deliver { data: Vec<u8> },
+    /// This mix is the destination of a **SURB reply**: the payload is still onion-scrambled and must
+    /// be passed to `recover_reply` with the `ReplyKeys` stored under `surb_id` to yield the plaintext.
+    SurbReply { surb_id: [u8; 16], payload: [u8; PAYLOAD_LEN] },
+}
+
+/// A **single-use reply block**: what an anonymous sender A hands a recipient B so B can reply without
+/// ever learning A's identity or location. A builds it (`create_surb`) over a return path that ends
+/// at A and keeps the matching `ReplyKeys`; B fills it with a payload (`use_surb`) and sends it; the
+/// mixes forward it like any packet (each peeling the pre-built header and LIONESS-decrypting the
+/// payload); A receives a `Processed::SurbReply` and recovers the plaintext (`recover_reply`). The
+/// `surb_key` lets B hide its reply from the first mix; only A (which also holds it) can finally open.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Surb {
+    pub first: [u8; 32],
+    pub alpha: [u8; 32],
+    #[serde(with = "BigArray")]
+    pub beta: [u8; BETA_LEN],
+    pub gamma: [u8; MAC_LEN],
+    pub surb_key: [u8; 32],
+}
+
+/// The secrets A retains to recover a reply made with the matching `Surb` (never shared with B).
+pub struct ReplyKeys {
+    pub secrets: Vec<[u8; 32]>,
+    pub surb_key: [u8; 32],
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -256,27 +281,36 @@ fn routing_block(flag: u8, next_id: &[u8; 32], delay_ms: u64) -> [u8; HOP_DATA] 
     r
 }
 
-/// Build a Sphinx packet routing `payload` along `path` with per-hop `delays` (ms). `delays[i]` is
-/// the delay mix `i` applies before forwarding. The final hop is the destination.
-pub fn create(path: &[Hop], delays: &[u64], payload: &[u8]) -> Result<SphinxPacket, SphinxError> {
-    create_with_rng(path, delays, payload, &mut rand::thread_rng())
+/// Encode a fixed-size body block `MAGIC ‖ len ‖ payload ‖ pad ‖ digest`.
+fn encode_body(payload: &[u8]) -> [u8; PAYLOAD_LEN] {
+    let mut body = [0u8; BODY_LEN];
+    body[..MAGIC.len()].copy_from_slice(&MAGIC);
+    body[MAGIC.len()..MAGIC.len() + 2].copy_from_slice(&(payload.len() as u16).to_le_bytes());
+    body[MAGIC.len() + 2..MAGIC.len() + 2 + payload.len()].copy_from_slice(payload);
+    let digest = blake3::hash(&body);
+    let mut onion = [0u8; PAYLOAD_LEN];
+    onion[..BODY_LEN].copy_from_slice(&body);
+    onion[BODY_LEN..].copy_from_slice(digest.as_bytes());
+    onion
 }
 
-pub fn create_with_rng(
+/// Build the Sphinx routing header for `path` with per-hop `delays`. The final (destination) hop's
+/// routing block carries `surb_id` (zero for an ordinary forward packet; a real id marks the header
+/// as a SURB so the destination returns `Processed::SurbReply`). Returns `(alpha_0, beta, gamma)` and
+/// the per-hop shared secrets (the sender's to keep). This is the unlinkability-critical core shared
+/// by `create` and `create_surb`.
+fn build_header(
     path: &[Hop],
     delays: &[u64],
-    payload: &[u8],
+    surb_id: &[u8; 16],
     rng: &mut impl RngCore,
-) -> Result<SphinxPacket, SphinxError> {
+) -> Result<([u8; 32], [u8; BETA_LEN], [u8; MAC_LEN], Vec<[u8; 32]>), SphinxError> {
     let v = path.len();
     if v == 0 {
         return Err(SphinxError::EmptyPath);
     }
     if v > MAX_HOPS {
         return Err(SphinxError::PathTooLong);
-    }
-    if payload.len() > MAX_BODY {
-        return Err(SphinxError::PayloadTooLarge);
     }
 
     // 1. Ephemeral scalar x; walk the blinding chain to get every alpha_i and shared secret s_i.
@@ -302,12 +336,14 @@ pub fn create_with_rng(
     let phi = filler(&secrets);
     debug_assert_eq!(phi.len(), (v - 1) * BLOCK);
 
-    // 3. Innermost beta (for the destination hop v-1): routing region (encrypted) ‖ filler.
+    // 3. Innermost beta (for the destination hop v-1): routing region (encrypted) ‖ filler. The
+    //    destination's "next id" field is unused for routing, so it carries the SURB id.
+    let mut final_id = [0u8; 32];
+    final_id[..16].copy_from_slice(surb_id);
     let region_len = BETA_LEN - phi.len();
     let mut region = vec![0u8; region_len];
-    // The destination only reads HOP_DATA; the rest is random padding (incl. the unused MAC slot).
     rng.fill_bytes(&mut region);
-    region[..HOP_DATA].copy_from_slice(&routing_block(FLAG_DELIVER, &[0u8; 32], delays[v - 1]));
+    region[..HOP_DATA].copy_from_slice(&routing_block(FLAG_DELIVER, &final_id, delays[v - 1]));
     let k_last = rho(&secrets[v - 1], region_len);
     for (j, b) in region.iter_mut().enumerate() {
         *b ^= k_last[j];
@@ -333,24 +369,92 @@ pub fn create_with_rng(
         gamma = mu(&secrets[i], &beta);
     }
 
-    // 5. Payload: inner body (magic ‖ len ‖ data ‖ pad) ‖ digest, then XOR every hop's layer.
-    let mut body = [0u8; BODY_LEN];
-    body[..MAGIC.len()].copy_from_slice(&MAGIC);
-    body[MAGIC.len()..MAGIC.len() + 2].copy_from_slice(&(payload.len() as u16).to_le_bytes());
-    body[MAGIC.len() + 2..MAGIC.len() + 2 + payload.len()].copy_from_slice(payload);
-    let digest = blake3::hash(&body);
-    let mut onion = [0u8; PAYLOAD_LEN];
-    onion[..BODY_LEN].copy_from_slice(&body);
-    onion[BODY_LEN..].copy_from_slice(digest.as_bytes());
-    // Onion-wrap with one LIONESS layer per hop, innermost (last hop) first so hop 0's layer is
-    // outermost and peeled first. LIONESS is not commutative, so this order is load-bearing.
+    let mut beta_arr = [0u8; BETA_LEN];
+    beta_arr.copy_from_slice(&beta);
+    Ok((alpha0, beta_arr, gamma, secrets))
+}
+
+/// Build a Sphinx packet routing `payload` along `path` with per-hop `delays` (ms). `delays[i]` is
+/// the delay mix `i` applies before forwarding. The final hop is the destination.
+pub fn create(path: &[Hop], delays: &[u64], payload: &[u8]) -> Result<SphinxPacket, SphinxError> {
+    create_with_rng(path, delays, payload, &mut rand::thread_rng())
+}
+
+pub fn create_with_rng(
+    path: &[Hop],
+    delays: &[u64],
+    payload: &[u8],
+    rng: &mut impl RngCore,
+) -> Result<SphinxPacket, SphinxError> {
+    if payload.len() > MAX_BODY {
+        return Err(SphinxError::PayloadTooLarge);
+    }
+    let (alpha, beta, gamma, secrets) = build_header(path, delays, &[0u8; 16], rng)?;
+    // Onion-wrap the body with one LIONESS layer per hop, innermost (last hop) first so hop 0's layer
+    // is outermost and peeled first. LIONESS is not commutative, so this order is load-bearing.
+    let mut onion = encode_body(payload);
     for s in secrets.iter().rev() {
         lioness_encrypt(&mut onion, s);
     }
+    Ok(SphinxPacket { alpha, beta, gamma, payload: onion })
+}
 
-    let mut beta_arr = [0u8; BETA_LEN];
-    beta_arr.copy_from_slice(&beta);
-    Ok(SphinxPacket { alpha: alpha0, beta: beta_arr, gamma, payload: onion })
+// --- SURBs (single-use reply blocks) --------------------------------------------------------------
+
+/// Create a single-use reply block over `return_path` (which must end at the creator A) with per-hop
+/// `delays`, tagged `surb_id`. Returns the `Surb` to hand to a recipient and the `ReplyKeys` A keeps
+/// (indexed by `surb_id`) to recover the eventual reply.
+pub fn create_surb(
+    return_path: &[Hop],
+    delays: &[u64],
+    surb_id: [u8; 16],
+) -> Result<(Surb, ReplyKeys), SphinxError> {
+    create_surb_with_rng(return_path, delays, surb_id, &mut rand::thread_rng())
+}
+
+pub fn create_surb_with_rng(
+    return_path: &[Hop],
+    delays: &[u64],
+    surb_id: [u8; 16],
+    rng: &mut impl RngCore,
+) -> Result<(Surb, ReplyKeys), SphinxError> {
+    if surb_id == [0u8; 16] {
+        return Err(SphinxError::BadPayload); // zero is reserved for ordinary (non-SURB) delivery
+    }
+    let (alpha, beta, gamma, secrets) = build_header(return_path, delays, &surb_id, rng)?;
+    let mut surb_key = [0u8; 32];
+    rng.fill_bytes(&mut surb_key);
+    let first = return_path[0].id;
+    let surb = Surb { first, alpha, beta, gamma, surb_key };
+    let keys = ReplyKeys { secrets, surb_key };
+    Ok((surb, keys))
+}
+
+/// Fill a SURB with `payload` (the recipient B's side). Returns the first-hop id to send to and the
+/// packet. B encrypts the body under the SURB key so the first mix cannot read it; the mixes then
+/// LIONESS-decrypt as usual, scrambling it further — only A can undo the chain.
+pub fn use_surb(surb: &Surb, payload: &[u8]) -> Result<([u8; 32], SphinxPacket), SphinxError> {
+    if payload.len() > MAX_BODY {
+        return Err(SphinxError::PayloadTooLarge);
+    }
+    let mut block = encode_body(payload);
+    lioness_encrypt(&mut block, &surb.surb_key);
+    let packet = SphinxPacket { alpha: surb.alpha, beta: surb.beta, gamma: surb.gamma, payload: block };
+    Ok((surb.first, packet))
+}
+
+/// Recover the plaintext of a SURB reply (the creator A's side), given the `ReplyKeys` for the
+/// matching `surb_id` and the scrambled payload A received in `Processed::SurbReply`. A inverts the
+/// mixes' LIONESS-decrypt chain (re-encrypting per hop, last-hop-first) then removes B's SURB-key
+/// layer.
+pub fn recover_reply(keys: &ReplyKeys, payload: &[u8; PAYLOAD_LEN]) -> Result<Vec<u8>, SphinxError> {
+    let mut block = *payload;
+    // The mixes applied D_0, D_1, …, D_{n-1} (decrypt). Invert: apply E_{n-1}, …, E_0 (encrypt).
+    for s in keys.secrets.iter().rev() {
+        lioness_encrypt(&mut block, s);
+    }
+    lioness_decrypt(&mut block, &keys.surb_key); // remove B's layer
+    open_payload(&block)
 }
 
 // --- mix ------------------------------------------------------------------------------------------
@@ -388,6 +492,13 @@ pub fn process(mix_sk: &[u8; 32], pkt: &SphinxPacket) -> Result<Processed, Sphin
     lioness_decrypt(&mut payload, &s);
 
     if flag == FLAG_DELIVER {
+        // The destination's routing block reuses `next_id[..16]` as a SURB id: zero means an ordinary
+        // forward packet (open here); non-zero means this is a SURB reply to recover with ReplyKeys.
+        let mut surb_id = [0u8; 16];
+        surb_id.copy_from_slice(&next_id[..16]);
+        if surb_id != [0u8; 16] {
+            return Ok(Processed::SurbReply { surb_id, payload });
+        }
         return Ok(Processed::Deliver { data: open_payload(&payload)? });
     }
 
@@ -457,6 +568,7 @@ mod tests {
                     assert_eq!(i, v - 1, "only the final hop delivers");
                     assert_eq!(data, msg, "destination must recover the plaintext");
                 }
+                Processed::SurbReply { .. } => panic!("a forward packet must not be a SURB reply"),
             }
         }
     }
@@ -568,6 +680,65 @@ mod tests {
             _ => panic!("hop 1 forwards"),
         };
         assert!(matches!(process(&sks[2], &p2), Err(SphinxError::BadPayload)), "tamper must be rejected");
+    }
+
+    #[test]
+    fn surb_lets_a_recipient_reply_anonymously() {
+        // A builds a SURB over the return path m0 -> m1 -> A and keeps the reply keys; B fills it
+        // with a reply (learning nothing about A) and the mixnet routes it back to A.
+        let (hops, sks) = make_mixes(3); // hops[2] = A, the SURB creator/destination
+        let surb_id = [9u8; 16];
+        let (surb, keys) = create_surb(&hops, &[5, 5, 5], surb_id).unwrap();
+
+        let (first, mut pkt) = use_surb(&surb, b"anonymous reply").unwrap();
+        assert_eq!(first, hops[0].id, "B sends to the SURB's first hop");
+
+        for i in 0..2 {
+            pkt = match process(&sks[i], &pkt).unwrap() {
+                Processed::Forward { next, packet, .. } => {
+                    assert_eq!(next, hops[i + 1].id, "hop {i} forwards along the return path");
+                    packet
+                }
+                _ => panic!("hop {i} should forward"),
+            };
+        }
+        match process(&sks[2], &pkt).unwrap() {
+            Processed::SurbReply { surb_id: got, payload } => {
+                assert_eq!(got, surb_id, "A learns which SURB this reply answers");
+                let msg = recover_reply(&keys, &payload).unwrap();
+                assert_eq!(msg, b"anonymous reply", "A recovers B's reply plaintext");
+            }
+            _ => panic!("A must receive a SurbReply, not a plain delivery"),
+        }
+    }
+
+    #[test]
+    fn a_surb_reply_is_opaque_to_relays_and_to_the_wrong_keys() {
+        let (hops, sks) = make_mixes(3);
+        let (surb, _keys) = create_surb(&hops, &[1, 1, 1], [1u8; 16]).unwrap();
+        let (_first, pkt) = use_surb(&surb, b"secret-reply").unwrap();
+
+        // The first relay cannot open the reply (it only sees onion-scrambled bytes).
+        let fwd = match process(&sks[0], &pkt).unwrap() {
+            Processed::Forward { packet, .. } => packet,
+            _ => panic!("relay forwards"),
+        };
+        assert!(open_payload(&fwd.payload).is_err(), "a relay cannot open a SURB reply");
+
+        // Even at A, the wrong reply keys cannot recover the plaintext.
+        let mut p = pkt;
+        for sk in sks.iter().take(2) {
+            p = match process(sk, &p).unwrap() {
+                Processed::Forward { packet, .. } => packet,
+                _ => panic!(),
+            };
+        }
+        let payload = match process(&sks[2], &p).unwrap() {
+            Processed::SurbReply { payload, .. } => payload,
+            _ => panic!("A receives a SurbReply"),
+        };
+        let (_other_surb, wrong_keys) = create_surb(&hops, &[1, 1, 1], [2u8; 16]).unwrap();
+        assert!(recover_reply(&wrong_keys, &payload).is_err(), "wrong keys must not recover the reply");
     }
 
     #[test]

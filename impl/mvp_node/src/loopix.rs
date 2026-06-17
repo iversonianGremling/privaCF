@@ -455,6 +455,8 @@ pub async fn spawn(identity: Arc<NodeIdentity>, config: MixConfig) -> std::io::R
                                 send_to(&peers, &next, Message::Sphinx(packet));
                             });
                         }
+                        // SURB replies are not used by this transport-level engine yet.
+                        Ok(Processed::SurbReply { .. }) => debug!("dropping unexpected SURB reply"),
                         Err(e) => debug!(?e, "dropping un-processable mix packet"),
                     }
                 }
