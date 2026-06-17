@@ -7,7 +7,8 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 use mvp_node::identity::NodeIdentity;
-use mvp_node::node::{genesis_validator_set, Node, NodeConfig};
+use mvp_node::loopix::{MixDirectory, MixEntry};
+use mvp_node::node::{genesis_validator_set, MixSettings, Node, NodeConfig};
 
 #[derive(Parser)]
 #[command(about = "PrivaCF thin-skeleton node-network demo")]
@@ -20,6 +21,10 @@ struct Args {
     base_port: u16,
     #[arg(long, default_value_t = 300)]
     window_ms: u64,
+    /// Route consensus control messages (VRF claims, votes, txs) through the Loopix mixnet rather
+    /// than broadcasting them in the clear — exercises the unlinkability layer under live consensus.
+    #[arg(long, default_value_t = false)]
+    mix: bool,
 }
 
 #[tokio::main]
@@ -32,22 +37,49 @@ async fn main() {
     let args = Args::parse();
     let validators = genesis_validator_set(args.nodes, args.base_port);
 
+    // When --mix is set, build the genesis mix directory (each validator is also a mix) so consensus
+    // control messages route through the mixnet. A grace bump absorbs the per-hop mixing latency.
+    let mix = args.mix.then(|| {
+        let directory = MixDirectory::new(
+            (0..args.nodes)
+                .map(|i| {
+                    let id = NodeIdentity::from_seed(i);
+                    MixEntry {
+                        peer_id: id.peer_id(),
+                        addr: format!("127.0.0.1:{}", args.base_port + i as u16),
+                        mix_pk: id.mix_pk(),
+                    }
+                })
+                .collect(),
+        );
+        MixSettings { directory, hops: if args.nodes >= 4 { 3 } else { 2 }, mean_delay_ms: 8 }
+    });
+
     println!(
-        "Spawning {} nodes over loopback TCP, {} epochs, {}ms window...\n",
-        args.nodes, args.epochs, args.window_ms
+        "Spawning {} nodes over loopback TCP, {} epochs, {}ms window{}...\n",
+        args.nodes,
+        args.epochs,
+        args.window_ms,
+        if args.mix { " (consensus routed through the Loopix mixnet)" } else { "" }
     );
 
     let mut handles = Vec::new();
     for i in 0..args.nodes {
+        let grace_mult = if args.mix { 14 } else { 8 };
         let cfg = NodeConfig {
             listen_addr: format!("127.0.0.1:{}", args.base_port + i as u16),
             genesis_validators: validators.clone(),
             window_ms: args.window_ms,
             max_height: args.epochs,
-            grace_ms: args.window_ms * 8,
+            grace_ms: args.window_ms * grace_mult,
         };
         let id = NodeIdentity::from_seed(i);
-        handles.push(tokio::spawn(Node::new(id, cfg).run()));
+        let node = Node::new(id, cfg);
+        let node = match &mix {
+            Some(s) => node.with_mixnet(s.clone()),
+            None => node,
+        };
+        handles.push(tokio::spawn(node.run()));
     }
 
     let mut outcomes = Vec::new();

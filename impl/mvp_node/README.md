@@ -85,8 +85,17 @@ Companion to `SPEC.md` §4.1 (chain/epochs), §4.2/§4.9.1 (identity derivation)
   indistinguishable from real sends. (Honest scope: payload integrity is checked at the destination
   via a digest, not a wide-block SPRP/LIONESS, so an active mid-path mauler is caught only at
   delivery; drop cover, SURB replies, and statistical anonymity-set guarantees are deployment-scale
-  and out of scope. The mixnet is exercised end-to-end as its own transport — routing the *consensus
-  gossip itself* through it is the next integration step.)
+  and out of scope.)
+- **Consensus routed through the mixnet** (`Node::with_mixnet`, `--mix`): the BFT control plane no
+  longer broadcasts in the clear. With mixing on, every **VRF claim, vote, tx, and membership/slash
+  message** is wrapped in a Sphinx packet and unicast to each validator along a chain-beacon-selected
+  mix path (the validators *are* the mixes), so a network observer no longer sees who-claims /
+  who-votes / who-changes-set. The BFT round timers absorb the per-hop Poisson delay — the network
+  still converges with valid quorum certificates (integration-tested at N=4, and the demo's `--mix`
+  flag shows it live). Block-bearing/sync messages (proposals, finalized blocks, chain sync) still go
+  direct, since a block exceeds one fixed-size Sphinx payload — **fragmenting** those across packets
+  is the remaining step. Mixing is **off by default** (the original direct-gossip path is preserved
+  byte-for-byte), opt-in per node.
 
 ## Run
 
@@ -96,6 +105,9 @@ cargo +nightly build --release
 
 # live demo — N nodes in-process over loopback TCP, prints a convergence summary
 cargo +nightly run  --release --bin demo -- --nodes 4 --epochs 6 --window-ms 250
+
+# same demo, but route the consensus control plane through the Loopix mixnet (unlinkable gossip)
+cargo +nightly run  --release --bin demo -- --nodes 4 --epochs 5 --window-ms 350 --mix
 
 # the convergence integration test (4 nodes, 5 epochs)
 cargo +nightly test --release --test convergence -- --nocapture
@@ -112,7 +124,7 @@ distinctness and the publish-`s₁` split.
 
 | Seam (trait → stub / real future impl) | MVP behavior | Deferred to |
 |---|---|---|
-| `Transport` — Noise XX + ed25519 channel binding **and** a real Loopix/Sphinx mixnet (real) → mix-routed consensus gossip | **confidential, authenticated, forward-secret** Noise channels **plus** a working chain-seeded Sphinx mixnet (per-hop bitwise unlinkability, Poisson delays, loop cover) exercised as its own transport; remaining: routing the **consensus gossip itself** through the mixnet, drop cover, SURB replies, LIONESS payload | SPEC §5.1 |
+| `Transport` — Noise XX + ed25519 channel binding **and** a real Loopix/Sphinx mixnet now carrying the **consensus control plane** (real) → fragmented block routing | **confidential, authenticated, forward-secret** Noise channels **plus** a chain-seeded Sphinx mixnet (per-hop bitwise unlinkability, Poisson delays, loop cover) that **routes the BFT control messages** (VRF/vote/tx/membership/slash) — consensus converges over it; remaining: **fragment** block-bearing/sync messages (too large for one packet, still direct), drop cover, SURB replies, LIONESS payload | SPEC §5.1 |
 | consensus — VRF election + aggregate-BLS quorum cert + view-change + proposer-equivocation + double-vote slashing + dynamic membership (real) → +DKG threshold key | **safety + leader-failure liveness + aggregate-BLS finality + both equivocation-slashing paths + dynamic validator-set membership with chain-derived quorum reconfiguration done**; remaining: the QC is an aggregatable MULTISIG (signer set recorded) not a DKG threshold key (`VA_pub` is the separate DKG construct); join admission is AcceptAll (the Sybil gate is the `Admission` seam) | SPEC §4.1, §4.3 |
 | `vrf` — real EC-VRF (sr25519, `schnorrkel`) | **real VRF done** (unique, ungrindable lottery value per key+input); the beacon it binds to is now VRF-chained too (see the beacon row), leaving only the residual last-revealer bias → VDF/drand | SPEC EC-VRF, §4.1 |
 | `Admission` — AcceptAll (real) → `VdfAdmission` | membership is now **dynamic** (join/leave, §4.1 row), but admission is **AcceptAll**: proving key-control suffices to join (Sybil-trivial). The real gate — a VDF proof-of-work cost per admission — is deferred | SPEC §4.3 |
@@ -128,19 +140,21 @@ channels**, epoch cycling, `epoch_id` **rotation**, and **BFT-style consensus** 
 proposer-equivocation + validator-double-vote slashing + dynamic membership with chain-derived quorum
 reconfiguration) — **and** a working Loopix/Sphinx mixnet giving per-hop **unlinkability** with
 chain-seeded paths/delays and cover traffic (the who-talks-to-whom hiding the rotation exists for),
-though that mixnet is so far exercised as its own transport rather than carrying the consensus gossip
-itself. It still does NOT demonstrate Sybil cost, or any sealing/verdict/ZK property.
+**now carrying the consensus control plane itself** (VRF claims, votes, txs, membership/slash route
+through the mixnet and the network still converges). It still does NOT demonstrate Sybil cost, or any
+sealing/verdict/ZK property, and block bodies still travel direct (pending fragmentation).
 
 ## What to make real next
 
 Consensus now has a real EC-VRF, a VRF-chained beacon, catches both equivocation faults, and supports
 **dynamic membership** with chain-derived quorum reconfiguration — a coherent BFT-ish core; the wire
 is a real **Noise XX** channel (confidential, authenticated, forward-secret); and there is now a real
-**Loopix/Sphinx mixnet** (`sphinx.rs`/`loopix.rs`) with chain-seeded paths/delays and cover traffic.
-The remaining steps each open a larger, decision-laden subsystem: **route the consensus gossip through
-the mixnet** (so the BFT messages themselves are unlinkable — needs re-tuning the consensus timeouts
-to absorb Poisson per-hop delay) and harden the mixnet (drop cover, SURB anonymous replies, a
-wide-block SPRP/LIONESS payload for active-attacker integrity); a **VDF/drand beacon** (to remove the
+**Loopix/Sphinx mixnet** (`sphinx.rs`/`loopix.rs`) with chain-seeded paths/delays and cover traffic
+that **already carries the BFT control plane** (consensus converges over mix-routed VRF/vote/tx/slash
+messages). The remaining steps each open a larger, decision-laden subsystem: **fragment block-bearing
+messages** so proposals/finalized blocks/chain-sync also route through the mixnet (a block exceeds one
+fixed Sphinx payload), and harden the mixnet (drop cover, SURB anonymous replies, a wide-block
+SPRP/LIONESS payload for active-attacker integrity); a **VDF/drand beacon** (to remove the
 residual last-revealer bias — needs a VDF artifact or an external drand network); a **VDF `Admission`
 gate** (the real Sybil cost replacing AcceptAll joins); and a **DKG threshold key** (`VA_pub`) in place
 of the aggregatable multisig. *(Globally, separate from this node roadmap, the optimized non-native ZK

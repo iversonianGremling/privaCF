@@ -6,7 +6,8 @@ use std::collections::HashSet;
 
 use mvp_node::beacon::{next_beacon, GENESIS_BEACON, GENESIS_VRF_OUTPUT};
 use mvp_node::identity::NodeIdentity;
-use mvp_node::node::{genesis_validator_set, Node, NodeConfig};
+use mvp_node::loopix::{MixDirectory, MixEntry};
+use mvp_node::node::{genesis_validator_set, MixSettings, Node, NodeConfig};
 use mvp_node::vrf::VrfClaim;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -401,5 +402,62 @@ async fn dynamic_membership_lets_a_new_validator_join() {
         );
         assert!(o.final_active.contains(&joiner_peer), "newcomer must have joined the active set");
         assert_eq!(o.final_active.len() as u64, genesis_n + 1, "active set grew by the newcomer");
+    }
+}
+
+/// Consensus over the **mixnet**: the same N-node convergence, but every control-plane message
+/// (VRF claims, votes, txs) is routed as a Sphinx packet through chain-selected mix paths instead of
+/// being broadcast in the clear. The network must still converge on one head with valid quorum
+/// certificates — proving the BFT round timers absorb the per-hop Poisson mixing delay. (View-change
+/// is permitted: mixing adds latency, so a leader may occasionally be skipped; convergence + QC
+/// validity are the invariants.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nodes_converge_with_consensus_routed_through_the_mixnet() {
+    let nodes = 4u64;
+    let epochs = 4u64;
+    let base_port = 10100u16;
+    let window_ms = 350u64;
+
+    let validators = genesis_validator_set(nodes, base_port);
+    // The genesis mix directory: every validator is also a mix, with its published mix key.
+    let directory = MixDirectory::new(
+        (0..nodes)
+            .map(|i| {
+                let id = NodeIdentity::from_seed(i);
+                MixEntry {
+                    peer_id: id.peer_id(),
+                    addr: format!("127.0.0.1:{}", base_port + i as u16),
+                    mix_pk: id.mix_pk(),
+                }
+            })
+            .collect(),
+    );
+    let mix = MixSettings { directory, hops: 2, mean_delay_ms: 5 };
+
+    let mut handles = Vec::new();
+    for i in 0..nodes {
+        let cfg = NodeConfig {
+            listen_addr: format!("127.0.0.1:{}", base_port + i as u16),
+            genesis_validators: validators.clone(),
+            window_ms,
+            max_height: epochs,
+            grace_ms: window_ms * 12,
+        };
+        let node = Node::new(NodeIdentity::from_seed(i), cfg).with_mixnet(mix.clone());
+        handles.push(tokio::spawn(node.run()));
+    }
+
+    let mut outs = Vec::new();
+    for h in handles {
+        outs.push(h.await.expect("node task panicked"));
+    }
+
+    // Convergence over the mixnet: one shared head, full chain, valid QCs, split held every epoch.
+    let head0 = outs[0].head_hash;
+    for o in &outs {
+        assert_eq!(o.head_hash, head0, "node {} head diverged over the mixnet", hex::encode(&o.peer_id[..4]));
+        assert_eq!(o.blocks_len as u64, epochs + 1, "every node finalized genesis + {epochs} blocks");
+        assert!(o.all_qc_valid, "every mixnet-finalized block must carry a valid quorum certificate");
+        assert!(o.split_ok, "publish-s1 split must still hold under mix routing");
     }
 }

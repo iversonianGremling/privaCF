@@ -5,6 +5,7 @@
 //! votes) forms.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -25,12 +26,115 @@ use crate::consensus::{leader_for, quorum};
 use crate::epoch::EpochTransaction;
 use crate::field::{add_mod, from_u64, random_field, sub_mod, to_u64};
 use crate::identity::{verify as verify_ed25519, NodeIdentity};
+use crate::loopix::{sample_delays, select_full_path, MixDirectory};
 use crate::membership::{MembershipOp, ValidatorRecord, ValidatorSet};
 use crate::message::Message;
+use crate::sphinx::{self, Processed, SphinxPacket, MAX_BODY};
 use crate::transport::{noise_handshake, read_frame, write_frame};
 use crate::vrf::VrfClaim;
 
 type PeersMap = Arc<Mutex<HashMap<[u8; 32], mpsc::UnboundedSender<Message>>>>;
+
+/// Settings for routing consensus gossip through the Loopix mixnet (`loopix.rs`/`sphinx.rs`) instead
+/// of broadcasting it in the clear over the Noise mesh. Supplied via `Node::with_mixnet`.
+#[derive(Clone)]
+pub struct MixSettings {
+    /// The genesis mix directory (peer_id → mix public key) — presupposed trusted, the relay set.
+    pub directory: MixDirectory,
+    /// Hops per Sphinx path (including the destination); needs ≥ `hops-1` other mixes available.
+    pub hops: usize,
+    /// Mean per-hop Poisson delay (ms). Kept small so the BFT round timers still close on time.
+    pub mean_delay_ms: u64,
+}
+
+/// Routes outbound consensus messages either by mixnet (small control-plane messages, when enabled)
+/// or by direct Noise broadcast (block-bearing messages, and everything when mixing is off), and
+/// peels inbound Sphinx packets — forwarding relays and re-injecting delivered messages into the
+/// consensus inbox. The mixnet rides the *existing* validator Noise mesh (a Sphinx packet is just a
+/// `Message::Sphinx` frame), so no second network is stood up.
+struct Mixer {
+    enabled: bool,
+    me: [u8; 32],
+    mix_sk: [u8; 32],
+    settings: MixSettings,
+    /// Per-message nonce diversifying chain-seeded paths (a message to N peers takes N paths).
+    nonce: AtomicU64,
+    /// Re-injects mixnet-delivered consensus messages so they flow through the normal inbox path.
+    inbox_tx: mpsc::UnboundedSender<Message>,
+}
+
+impl Mixer {
+    /// Small control-plane messages that fit one Sphinx payload and whose *pattern* (who-claims,
+    /// who-votes, who-changes-set) is what mixing hides. Block-bearing/sync messages are too large
+    /// for one fixed packet and stay on the direct mesh (fragmenting them is the next hardening step).
+    fn is_routable(msg: &Message) -> bool {
+        matches!(
+            msg,
+            Message::Tx(_)
+                | Message::Vrf(_)
+                | Message::Vote(_)
+                | Message::Membership(_)
+                | Message::Slash(_)
+                | Message::SlashVote(_)
+        )
+    }
+
+    /// Publish a consensus message. When mixing is enabled and the message is routable, send it as a
+    /// chain-routed Sphinx packet to every other mix-directory member; otherwise broadcast directly.
+    fn publish(&self, peers: &PeersMap, beacon: u64, msg: Message) {
+        if !self.enabled || !Self::is_routable(&msg) {
+            Node::gossip(peers, msg);
+            return;
+        }
+        let bytes = match bincode::serialize(&msg) {
+            Ok(b) if b.len() <= MAX_BODY => b,
+            _ => {
+                Node::gossip(peers, msg); // oversize: fall back to direct (keeps liveness)
+                return;
+            }
+        };
+        for dest in self.settings.directory.ids() {
+            if dest == self.me {
+                continue;
+            }
+            let nonce = self.nonce.fetch_add(1, Ordering::Relaxed);
+            let path = match select_full_path(
+                &self.settings.directory, &self.me, &dest, self.settings.hops, beacon, nonce,
+            ) {
+                Some(p) => p,
+                None => continue,
+            };
+            let delays = sample_delays(path.len(), self.settings.mean_delay_ms, beacon, nonce ^ 0x5d);
+            if let Ok(pkt) = sphinx::create(&path, &delays, &bytes) {
+                if let Some(first) = path.first() {
+                    Node::send_to(peers, &first.id, Message::Sphinx(pkt));
+                }
+            }
+        }
+    }
+
+    /// Peel an inbound Sphinx packet: deliver (re-inject the inner consensus message) or forward to
+    /// the next hop after honoring its per-hop delay.
+    fn handle_sphinx(&self, pkt: SphinxPacket, peers: &PeersMap) {
+        match sphinx::process(&self.mix_sk, &pkt) {
+            Ok(Processed::Deliver { data }) => {
+                if let Ok(inner) = bincode::deserialize::<Message>(&data) {
+                    let _ = self.inbox_tx.send(inner);
+                }
+            }
+            Ok(Processed::Forward { next, delay_ms, packet }) => {
+                let peers = peers.clone();
+                tokio::spawn(async move {
+                    if delay_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    }
+                    Node::send_to(&peers, &next, Message::Sphinx(packet));
+                });
+            }
+            Err(e) => debug!(?e, "dropping un-processable mix packet"),
+        }
+    }
+}
 
 /// A membership change recorded in block `H` activates for consensus at height `H + ACTIVATION_DELAY`.
 /// With a delay of 1, the change is live as soon as the block carrying it is finalized — at which
@@ -123,6 +227,9 @@ pub struct Node {
     /// If true, this node is NOT in the genesis set and seeks to join: each height until admitted it
     /// gossips a self-signed join op (`config.genesis_validators` is its bootstrap peer list).
     joining: bool,
+    /// If set, consensus control messages are routed through the Loopix mixnet rather than
+    /// broadcast in the clear (see `Mixer`); `None` keeps the original direct-gossip behavior.
+    mix_settings: Option<MixSettings>,
 }
 
 impl Node {
@@ -140,7 +247,16 @@ impl Node {
             double_vote: false,
             leave_at: None,
             joining: false,
+            mix_settings: None,
         }
+    }
+
+    /// Builder: route consensus control messages (VRF claims, votes, txs, membership/slash) through
+    /// the Loopix mixnet instead of broadcasting them in the clear, hiding the who-talks-to-whom
+    /// pattern. Block-bearing/sync messages still go direct (too large for one fixed Sphinx packet).
+    pub fn with_mixnet(mut self, settings: MixSettings) -> Self {
+        self.mix_settings = Some(settings);
+        self
     }
 
     /// The active validator set in effect AT `height`: genesis folded forward by every membership op
@@ -206,6 +322,13 @@ impl Node {
         }
     }
 
+    /// Send a message to a single connected peer (used for unicast mixnet hops).
+    fn send_to(peers: &PeersMap, peer: &[u8; 32], msg: Message) {
+        if let Some(tx) = peers.lock().unwrap().get(peer) {
+            let _ = tx.send(msg);
+        }
+    }
+
     /// Begin a new height: submit our `commit_T` transaction and broadcast our VRF claim.
     #[allow(clippy::too_many_arguments)]
     fn start_round(
@@ -213,6 +336,7 @@ impl Node {
         height: u64,
         chain: &Chain,
         peers: &PeersMap,
+        mixer: &Mixer,
         pending: &mut HashMap<(u64, u64), EpochTransaction>,
         epoch_ids: &mut Vec<(u64, u64)>,
         beacons: &mut Vec<(u64, u64)>,
@@ -228,14 +352,14 @@ impl Node {
         // self-signed leave op for the current leader to record; it activates at the next height.
         if self.leave_at == Some(height) && vset.contains(&self.me()) {
             debug!(height, "broadcasting self-signed LEAVE op");
-            Self::gossip(peers, Message::Membership(MembershipOp::remove(&self.identity)));
+            mixer.publish(peers, beacon_t, Message::Membership(MembershipOp::remove(&self.identity)));
         }
         // A newcomer keeps gossiping its self-signed join op until it is admitted (self-healing: it
         // stops once it appears in the active set).
         if self.joining && !vset.contains(&self.me()) {
             debug!(height, "broadcasting self-signed JOIN op");
             let op = MembershipOp::add(&self.identity, self.config.listen_addr.clone());
-            Self::gossip(peers, Message::Membership(op));
+            mixer.publish(peers, beacon_t, Message::Membership(op));
         }
         // per-epoch commitment (publish-s1)
         let epoch_id_fp = self.identity.epoch_id(from_u64(beacon_t));
@@ -247,10 +371,10 @@ impl Node {
         let tx = EpochTransaction::create(&self.identity, height, epoch_id, commit);
         pending.insert((height, epoch_id), tx.clone());
         epoch_ids.push((height, epoch_id));
-        Self::gossip(peers, Message::Tx(tx));
+        mixer.publish(peers, beacon_t, Message::Tx(tx));
         // VRF leadership claim
         let my_vrf = VrfClaim::create(&self.identity, height, beacon_t);
-        Self::gossip(peers, Message::Vrf(my_vrf.clone()));
+        mixer.publish(peers, beacon_t, Message::Vrf(my_vrf.clone()));
         let mut claims = HashMap::new();
         claims.insert(self.me(), my_vrf.output);
         let now = Instant::now();
@@ -335,21 +459,22 @@ impl Node {
         Block { header, txs, proposer_sig, qc: QuorumCert::default() }
     }
 
-    fn cast_vote(&self, r: &mut Round, bid: [u8; 32], peers: &PeersMap) {
+    fn cast_vote(&self, r: &mut Round, bid: [u8; 32], peers: &PeersMap, mixer: &Mixer) {
         if r.voted.is_some() || !r.vset.contains(&self.me()) {
             return; // only active validators vote (a departed validator no longer does)
         }
         let vote = Vote::create(&self.identity, r.height, r.view, bid);
         r.votes.entry(bid).or_default().insert(self.me(), vote.clone());
         r.voted = Some(bid);
-        Self::gossip(peers, Message::Vote(vote));
+        mixer.publish(peers, r.beacon_t, Message::Vote(vote));
         if self.double_vote {
             // Byzantine: sign a second, different block id at this same (height, view). The id need
             // not correspond to a real block — signing two ids in one slot is itself the offense.
             let mut alt = bid;
             alt[0] ^= 0xff;
             debug!(height = r.height, view = r.view, "DOUBLE-VOTING (signing a second block id)");
-            Self::gossip(peers, Message::Vote(Vote::create(&self.identity, r.height, r.view, alt)));
+            let alt_vote = Vote::create(&self.identity, r.height, r.view, alt);
+            mixer.publish(peers, r.beacon_t, Message::Vote(alt_vote));
         }
     }
 
@@ -418,6 +543,7 @@ impl Node {
         pending: &HashMap<(u64, u64), EpochTransaction>,
         pending_membership: &[MembershipOp],
         peers: &PeersMap,
+        mixer: &Mixer,
         slashed: &HashSet<[u8; 32]>,
     ) {
         let now = Instant::now();
@@ -447,7 +573,7 @@ impl Node {
                     debug!(height = r.height, view = r.view, txs = block.txs.len(), "proposing as VRF leader");
                     r.blocks.insert(bid, block.clone());
                     Self::gossip(peers, Message::Proposal(block));
-                    self.cast_vote(r, bid, peers);
+                    self.cast_vote(r, bid, peers, mixer);
                 }
             }
             if r.voted.is_none() {
@@ -457,7 +583,7 @@ impl Node {
                     .find(|(_, b)| b.header.view == r.view && b.header.proposer_peer == ldr)
                     .map(|(k, v)| (*k, v.clone()))
                 {
-                    self.cast_vote(r, bid, peers);
+                    self.cast_vote(r, bid, peers, mixer);
                 }
             }
         }
@@ -514,8 +640,12 @@ impl Node {
         pending: &mut HashMap<(u64, u64), EpochTransaction>,
         pending_membership: &mut Vec<MembershipOp>,
         peers: &PeersMap,
+        mixer: &Mixer,
         slashed: &mut HashSet<[u8; 32]>,
     ) {
+        // Best-available beacon to seed any mixnet path entropy for messages we re-gossip here.
+        let beacon_hint =
+            round.as_deref().map(|r| r.beacon_t).unwrap_or_else(|| chain.head().header.beacon_t);
         match msg {
             Message::Tx(tx) => {
                 if tx.verify_sig() {
@@ -528,7 +658,7 @@ impl Node {
                 // originator is only partially connected (bounded: dedup by subject stops the flood).
                 if op.verify() && !pending_membership.iter().any(|o| o.subject() == op.subject()) {
                     pending_membership.push(op.clone());
-                    Self::gossip(peers, Message::Membership(op));
+                    mixer.publish(peers, beacon_hint, Message::Membership(op));
                 }
             }
             Message::Vrf(c) => {
@@ -564,7 +694,7 @@ impl Node {
                                 };
                                 if proof.verify() && slashed.insert(proposer) {
                                     info!(slashed = %hex::encode(&proposer[..4]), height = r.height, view = bview, "slashed equivocating proposer");
-                                    Self::gossip(peers, Message::Slash(proof));
+                                    mixer.publish(peers, r.beacon_t, Message::Slash(proof));
                                 }
                                 return; // never store or vote for an equivocator's block
                             }
@@ -575,7 +705,7 @@ impl Node {
                         // valid_proposal already confirmed the proposer is the leader for `bview`,
                         // so vote iff it matches our current view and we haven't voted in it yet.
                         if Instant::now() >= r.vrf_deadline && r.voted.is_none() && bview == r.view {
-                            self.cast_vote(r, bid, peers);
+                            self.cast_vote(r, bid, peers, mixer);
                         }
                         self.try_finalize(r, chain, peers);
                     }
@@ -607,7 +737,7 @@ impl Node {
                                     r.vset.bls.get(&v.voter).is_some_and(|pk| proof.verify(pk));
                                 if verified && slashed.insert(v.voter) {
                                     info!(slashed = %hex::encode(&v.voter[..4]), height = r.height, view = v.view, "slashed double-voting validator");
-                                    Self::gossip(peers, Message::SlashVote(proof));
+                                    mixer.publish(peers, r.beacon_t, Message::SlashVote(proof));
                                 }
                                 return; // never count an equivocator's vote
                             }
@@ -653,8 +783,9 @@ impl Node {
                 }
             }
             Message::Hello { .. } => {}
-            // Mix packets are handled by the Loopix layer (`loopix.rs`), not the consensus engine.
-            Message::Sphinx(_) => {}
+            // A mix packet: peel one layer and forward to the next hop, or — if we are the
+            // destination — re-inject the recovered consensus message into our inbox.
+            Message::Sphinx(pkt) => mixer.handle_sphinx(pkt, peers),
         }
     }
 
@@ -745,6 +876,30 @@ impl Node {
         let mut done_at: Option<Instant> = None;
         let mut ticker = interval(Duration::from_millis(10));
 
+        // The mixnet router: enabled when `with_mixnet` supplied settings, else a transparent
+        // pass-through that broadcasts directly (preserving the original behavior exactly).
+        let mixer = match &self.mix_settings {
+            Some(s) => {
+                info!(hops = s.hops, mean_delay_ms = s.mean_delay_ms, mixes = s.directory.len(), "consensus gossip routed through the Loopix mixnet");
+                Mixer {
+                    enabled: true,
+                    me: my_id,
+                    mix_sk: self.identity.mix_sk(),
+                    settings: s.clone(),
+                    nonce: AtomicU64::new(0),
+                    inbox_tx: inbox_tx.clone(),
+                }
+            }
+            None => Mixer {
+                enabled: false,
+                me: my_id,
+                mix_sk: self.identity.mix_sk(),
+                settings: MixSettings { directory: MixDirectory::default(), hops: 0, mean_delay_ms: 0 },
+                nonce: AtomicU64::new(0),
+                inbox_tx: inbox_tx.clone(),
+            },
+        };
+
         loop {
             let head_h = chain.head().header.height;
             if head_h >= self.config.max_height {
@@ -757,7 +912,7 @@ impl Node {
                 let need = head_h + 1;
                 if round.as_ref().map(|r| r.height) != Some(need) {
                     round = Some(self.start_round(
-                        need, &chain, &peers, &mut pending, &mut epoch_ids, &mut beacons,
+                        need, &chain, &peers, &mixer, &mut pending, &mut epoch_ids, &mut beacons,
                         &mut split_ok, &mut rng,
                     ));
                     pending.retain(|(h, _), _| *h > head_h); // prune finalized heights
@@ -782,11 +937,11 @@ impl Node {
             tokio::select! {
                 _ = ticker.tick() => {
                     if let Some(r) = round.as_mut() {
-                        self.on_tick(r, &mut chain, &pending, &pending_membership, &peers, &slashed);
+                        self.on_tick(r, &mut chain, &pending, &pending_membership, &peers, &mixer, &slashed);
                     }
                 }
                 Some(msg) = inbox_rx.recv() => {
-                    self.on_msg(msg, round.as_mut(), &mut chain, &mut pending, &mut pending_membership, &peers, &mut slashed);
+                    self.on_msg(msg, round.as_mut(), &mut chain, &mut pending, &mut pending_membership, &peers, &mixer, &mut slashed);
                 }
             }
         }

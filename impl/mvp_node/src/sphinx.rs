@@ -57,7 +57,8 @@ const DIGEST_LEN: usize = 32;
 const BODY_LEN: usize = PAYLOAD_LEN - DIGEST_LEN; // 992
 /// Body layout: `MAGIC(4) ‖ len(u16 LE) ‖ data ‖ zero-pad`.
 const MAGIC: [u8; 4] = *b"PCFx";
-const MAX_BODY: usize = BODY_LEN - MAGIC.len() - 2;
+/// The largest plaintext one packet can carry (callers fragment or fall back above this).
+pub const MAX_BODY: usize = BODY_LEN - MAGIC.len() - 2;
 
 const FLAG_FORWARD: u8 = 0;
 const FLAG_DELIVER: u8 = 1;
