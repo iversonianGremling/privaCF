@@ -18,7 +18,7 @@ use crate::beacon::next_beacon;
 use crate::bls;
 use crate::chain::{
     block_id, proposal_sig_bytes, qc_valid, Block, BlockHeader, Chain, EquivocationProof,
-    QuorumCert, Vote,
+    QuorumCert, Vote, VoteEquivocationProof,
 };
 use crate::commit::{CommitT, StubVerEnc, VerEnc};
 use crate::consensus::{leader_for, quorum};
@@ -80,6 +80,7 @@ struct Round {
     proposed_views: HashSet<u64>,                      // views I have already proposed in
     voted: Option<[u8; 32]>,                           // block_id voted for in the CURRENT view
     seen_proposals: HashMap<([u8; 32], u64), ([u8; 32], Vec<u8>)>, // (proposer,view) -> (id, sig)
+    seen_votes: HashMap<([u8; 32], u64), ([u8; 32], Vec<u8>)>, // (voter,view) -> (block_id, bls_sig)
     vrf_deadline: Instant,                             // when claim collection ends
     view_deadline: Instant,                            // when to advance to the next view
 }
@@ -96,6 +97,10 @@ pub struct Node {
     /// Test fault injection: when elected leader, propose TWO conflicting blocks for the slot
     /// (double-sign), to exercise equivocation detection + slashing. Honest default is `false`.
     equivocate: bool,
+    /// Test fault injection: whenever this node votes, also emit a second vote for a different
+    /// block id in the same slot (double-vote), to exercise vote-equivocation slashing. Honest
+    /// default is `false`.
+    double_vote: bool,
 }
 
 impl Node {
@@ -114,6 +119,7 @@ impl Node {
             bls_pks,
             withhold_proposals: false,
             equivocate: false,
+            double_vote: false,
         }
     }
 
@@ -128,6 +134,13 @@ impl Node {
     /// exercising equivocation detection + slashing.
     pub fn byzantine_equivocate(mut self) -> Self {
         self.equivocate = true;
+        self
+    }
+
+    /// Fault-injection builder: this node double-votes (signs two different block ids per slot),
+    /// exercising validator vote-equivocation detection + slashing.
+    pub fn byzantine_double_vote(mut self) -> Self {
+        self.double_vote = true;
         self
     }
 
@@ -186,6 +199,7 @@ impl Node {
             proposed_views: HashSet::new(),
             voted: None,
             seen_proposals: HashMap::new(),
+            seen_votes: HashMap::new(),
             vrf_deadline,
             view_deadline,
         }
@@ -231,10 +245,18 @@ impl Node {
         if r.voted.is_some() {
             return;
         }
-        let vote = Vote::create(&self.identity, r.height, bid);
+        let vote = Vote::create(&self.identity, r.height, r.view, bid);
         r.votes.entry(bid).or_default().insert(self.me(), vote.clone());
         r.voted = Some(bid);
         Self::gossip(peers, Message::Vote(vote));
+        if self.double_vote {
+            // Byzantine: sign a second, different block id at this same (height, view). The id need
+            // not correspond to a real block — signing two ids in one slot is itself the offense.
+            let mut alt = bid;
+            alt[0] ^= 0xff;
+            debug!(height = r.height, view = r.view, "DOUBLE-VOTING (signing a second block id)");
+            Self::gossip(peers, Message::Vote(Vote::create(&self.identity, r.height, r.view, alt)));
+        }
     }
 
     /// Structural validity + a verifiable VRF leadership proof (does not check WHICH view's leader).
@@ -335,15 +357,25 @@ impl Node {
     /// Once a block has a quorum of votes, aggregate them into a quorum certificate, append, broadcast.
     fn try_finalize(&self, r: &mut Round, chain: &mut Chain, peers: &PeersMap) {
         let q = quorum(self.validators.len());
-        let ready = r
-            .votes
-            .iter()
-            .find(|(bid, vs)| vs.len() >= q && r.blocks.contains_key(*bid))
-            .map(|(bid, _)| *bid);
+        // A block finalizes on a quorum of votes whose view matches the block's own view (a vote
+        // claiming a different view signed different bytes and cannot count toward this block).
+        let ready = r.blocks.iter().find_map(|(bid, b)| {
+            let bview = b.header.view;
+            let n = r
+                .votes
+                .get(bid)
+                .map(|vs| vs.values().filter(|v| v.view == bview).count())
+                .unwrap_or(0);
+            (n >= q).then_some(*bid)
+        });
         if let Some(bid) = ready {
+            let bview = r.blocks[&bid].header.view;
             let mut signers = Vec::new();
             let mut sigs: Vec<[u8; 96]> = Vec::new();
             for (peer, vote) in &r.votes[&bid] {
+                if vote.view != bview {
+                    continue;
+                }
                 if let Ok(sig) = <[u8; 96]>::try_from(vote.bls_sig.as_slice()) {
                     signers.push(*peer);
                     sigs.push(sig);
@@ -425,10 +457,37 @@ impl Node {
             }
             Message::Vote(v) => {
                 if let Some(r) = round {
+                    if slashed.contains(&v.voter) {
+                        return; // ignore votes from an already-slashed validator
+                    }
                     let ok = v.height == r.height
                         && self.validators.contains(&v.voter)
                         && self.bls_pks.get(&v.voter).is_some_and(|pk| v.verify(pk));
                     if ok {
+                        let key = (v.voter, v.view);
+                        // double-vote: this voter already signed a DIFFERENT block id at this slot.
+                        if let Some((prev_id, prev_sig)) = r.seen_votes.get(&key).cloned() {
+                            if prev_id != v.block_id {
+                                let proof = VoteEquivocationProof {
+                                    voter: v.voter,
+                                    height: r.height,
+                                    view: v.view,
+                                    id_a: prev_id,
+                                    sig_a: prev_sig,
+                                    id_b: v.block_id,
+                                    sig_b: v.bls_sig.clone(),
+                                };
+                                let verified =
+                                    self.bls_pks.get(&v.voter).is_some_and(|pk| proof.verify(pk));
+                                if verified && slashed.insert(v.voter) {
+                                    info!(slashed = %hex::encode(&v.voter[..4]), height = r.height, view = v.view, "slashed double-voting validator");
+                                    Self::gossip(peers, Message::SlashVote(proof));
+                                }
+                                return; // never count an equivocator's vote
+                            }
+                        } else {
+                            r.seen_votes.insert(key, (v.block_id, v.bls_sig.clone()));
+                        }
                         r.votes.entry(v.block_id).or_default().insert(v.voter, v);
                         self.try_finalize(r, chain, peers);
                     }
@@ -442,6 +501,14 @@ impl Node {
             Message::Slash(proof) => {
                 if self.validators.contains(&proof.proposer) && proof.verify() && slashed.insert(proof.proposer) {
                     info!(slashed = %hex::encode(&proof.proposer[..4]), "slashed via gossiped equivocation evidence");
+                }
+            }
+            Message::SlashVote(proof) => {
+                if self.validators.contains(&proof.voter)
+                    && self.bls_pks.get(&proof.voter).is_some_and(|pk| proof.verify(pk))
+                    && slashed.insert(proof.voter)
+                {
+                    info!(slashed = %hex::encode(&proof.voter[..4]), "slashed via gossiped double-vote evidence");
                 }
             }
             Message::GetChain { from_height } => {

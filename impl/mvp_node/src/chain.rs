@@ -30,15 +30,18 @@ pub struct BlockHeader {
     pub vrf_proof: Vec<u8>,            // proof of that VRF output (verifiable leadership)
 }
 
-/// A validator's BLS vote over a block id — the unit aggregated into the quorum certificate. The
-/// signed message is the block id itself, so every voter for a block signs the same bytes (required
-/// for same-message aggregation).
+/// A validator's BLS vote over a slot — the unit aggregated into the quorum certificate. The signed
+/// message is `vote_sig_bytes(height, view, block_id)`, so every voter for the same block in the
+/// same view signs identical bytes (required for same-message aggregation), while binding the vote
+/// to a specific `(height, view)` makes it self-contained evidence: two votes from one voter for
+/// different block ids at the same `(height, view)` are a non-repudiable double-vote.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Vote {
     pub height: u64,
+    pub view: u64,
     pub block_id: [u8; 32],
     pub voter: [u8; 32],
-    pub bls_sig: Vec<u8>, // BLS12-381 signature over block_id (96 B compressed)
+    pub bls_sig: Vec<u8>, // BLS12-381 signature over vote_sig_bytes(height, view, block_id) (96 B)
 }
 
 /// A quorum certificate: the aggregate BLS signature of a quorum of votes plus the signer set.
@@ -70,6 +73,12 @@ pub fn block_id(header: &BlockHeader, txs: &[EpochTransaction]) -> [u8; 32] {
 /// What a proposer signs to bind itself to a block at a given slot: `(height, view, block_id)`.
 pub fn proposal_sig_bytes(height: u64, view: u64, block_id: &[u8; 32]) -> Vec<u8> {
     bincode::serialize(&("proposal", height, view, block_id)).expect("proposal serialize")
+}
+
+/// What a validator signs to bind its vote to a slot: `(height, view, block_id)`. Distinct from the
+/// proposal tag so a proposal signature can never be replayed as a vote (or vice versa).
+pub fn vote_sig_bytes(height: u64, view: u64, block_id: &[u8; 32]) -> Vec<u8> {
+    bincode::serialize(&("vote", height, view, block_id)).expect("vote serialize")
 }
 
 impl Block {
@@ -115,17 +124,51 @@ impl EquivocationProof {
 }
 
 impl Vote {
-    pub fn create(voter: &NodeIdentity, height: u64, block_id: [u8; 32]) -> Self {
-        let bls_sig = voter.bls_sign(&block_id).to_vec();
-        Self { height, block_id, voter: voter.peer_id(), bls_sig }
+    pub fn create(voter: &NodeIdentity, height: u64, view: u64, block_id: [u8; 32]) -> Self {
+        let bls_sig = voter.bls_sign(&vote_sig_bytes(height, view, &block_id)).to_vec();
+        Self { height, view, block_id, voter: voter.peer_id(), bls_sig }
     }
 
-    /// Verify this vote's BLS signature over its block id, given the voter's BLS public key.
+    /// Verify this vote's BLS signature over `(height, view, block_id)`, given the voter's BLS key.
     pub fn verify(&self, bls_pk: &[u8; 48]) -> bool {
+        let msg = vote_sig_bytes(self.height, self.view, &self.block_id);
         match <[u8; 96]>::try_from(self.bls_sig.as_slice()) {
-            Ok(sig) => bls::verify(bls_pk, &self.block_id, &sig),
+            Ok(sig) => bls::verify(bls_pk, &msg, &sig),
             Err(_) => false,
         }
+    }
+}
+
+/// Non-repudiable proof that `voter` cast two votes for different block ids at the same
+/// `(height, view)` — the vote-side analogue of `EquivocationProof`. Unlike proposer equivocation
+/// (ed25519, key embedded in the block), votes are BLS-signed, so verification needs the voter's
+/// BLS public key from the validator registry.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VoteEquivocationProof {
+    pub voter: [u8; 32],
+    pub height: u64,
+    pub view: u64,
+    pub id_a: [u8; 32],
+    pub sig_a: Vec<u8>,
+    pub id_b: [u8; 32],
+    pub sig_b: Vec<u8>,
+}
+
+impl VoteEquivocationProof {
+    /// Valid iff the two ids differ and both signatures are the voter's BLS signatures over their
+    /// own `vote_sig_bytes(height, view, id)` — i.e. the voter provably double-voted the slot.
+    pub fn verify(&self, bls_pk: &[u8; 48]) -> bool {
+        if self.id_a == self.id_b {
+            return false;
+        }
+        let check = |id: &[u8; 32], sig: &[u8]| -> bool {
+            let msg = vote_sig_bytes(self.height, self.view, id);
+            match <[u8; 96]>::try_from(sig) {
+                Ok(s) => bls::verify(bls_pk, &msg, &s),
+                Err(_) => false,
+            }
+        };
+        check(&self.id_a, &self.sig_a) && check(&self.id_b, &self.sig_b)
     }
 }
 
@@ -245,5 +288,8 @@ pub fn qc_valid(block: &Block, validators: &[[u8; 32]], bls_pks: &HashMap<[u8; 3
         Ok(a) => a,
         Err(_) => return false,
     };
-    bls::verify_aggregate(&pks, &bid, &agg)
+    // Votes are over the slot tuple, so the aggregate verifies over the same bytes every quorum
+    // voter signed: vote_sig_bytes(height, view, block_id) at this block's own (height, view).
+    let msg = vote_sig_bytes(block.header.height, block.header.view, &bid);
+    bls::verify_aggregate(&pks, &msg, &agg)
 }

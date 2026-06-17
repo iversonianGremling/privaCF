@@ -34,6 +34,11 @@ Companion to `SPEC.md` §4.1 (chain/epochs), §4.2/§4.9.1 (identity derivation)
   any validator turns the two signatures into a non-repudiable `EquivocationProof`, **slashes** the
   offender (excluding it from future leader election), and gossips the evidence so the whole network
   slashes it. No fork results (an equivocator can get at most one block finalized, never two).
+- **Validator double-vote slashing**: votes are BLS-signed over the slot tuple `(height, view,
+  block_id)`, so a vote is self-contained evidence. If a validator signs two different block ids in
+  the same slot, any node turns the two votes into a `VoteEquivocationProof`, **slashes** the
+  offender, ignores its votes, and gossips the proof network-wide. (Both fault sides — proposer
+  equivocation and voter double-vote — are now caught.)
 - **Minimal chain**: append-only, deterministic genesis, one finalized block per epoch; structural
   validation (height + prev-hash) plus semantic checks (beacon, VRF leadership, quorum certificate).
 - **Networking**: tokio TCP, length-prefixed bincode frames, full-mesh gossip (one connection per
@@ -64,7 +69,7 @@ distinctness and the publish-`s₁` split.
 | Seam (trait → stub / real future impl) | MVP behavior | Deferred to |
 |---|---|---|
 | `Transport` → `TcpTransport` / `LoopixTransport` | **clearnet, plaintext** — no Noise, no mixing; fully linkable to a network observer | SPEC §5.1 |
-| consensus — VRF election + aggregate-BLS quorum cert + view-change + proposer-equivocation slashing (real) → +more | **safety + leader-failure liveness + aggregate-BLS finality + proposer-equivocation slashing done**; remaining: validator *double-vote* slashing (only proposer equivocation is caught), the QC is an aggregatable MULTISIG (signer set recorded) not a DKG threshold key (`VA_pub` is the separate DKG construct), and the validator set is static (no admission/eviction beyond slashing-from-leadership) | SPEC §4.1 |
+| consensus — VRF election + aggregate-BLS quorum cert + view-change + proposer-equivocation + double-vote slashing (real) → +more | **safety + leader-failure liveness + aggregate-BLS finality + proposer-equivocation + validator-double-vote slashing done**; remaining: the QC is an aggregatable MULTISIG (signer set recorded) not a DKG threshold key (`VA_pub` is the separate DKG construct), and the validator set is static (no admission/eviction beyond slashing) | SPEC §4.1 |
 | `vrf` → ed25519-sig stand-in / EC-VRF | leader lottery works + is verifiable, but it is an ed25519-deterministic-sig stand-in, not a true VRF; and the beacon it binds to is grindable | SPEC EC-VRF |
 | `Admission` → `AcceptAll` / `VdfAdmission` | declared seam; membership is the static genesis set (Sybil-trivial) | SPEC §4.3 |
 | `Discovery` → `ConnectKnown` / `PsiDiscovery` | declared seam; peers come from the static genesis validator set | SPEC §5.3/§5.4 |
@@ -75,17 +80,18 @@ distinctness and the publish-`s₁` split.
 
 So the MVP demonstrates node creation, network formation, epoch cycling, `epoch_id` **rotation**,
 and **BFT-style consensus** (VRF leader election + aggregate-BLS ≥2/3 quorum-certificate finality +
-view-change past failed leaders + proposer-equivocation slashing) — but NOT the *unlinkability*
+view-change past failed leaders + proposer-equivocation + validator-double-vote slashing) — but NOT the *unlinkability*
 rotation exists for (plaintext transport), Sybil cost, or any sealing/verdict/ZK property.
 
 ## What to make real next
 
-Inside the consensus seam: **validator double-vote slashing** (a voter signing two blocks in one
-view — the analogue of proposer equivocation, on the vote side) and a true **EC-VRF** in place of
-the ed25519-sig stand-in. Then the **`Transport` seam** (Noise → Loopix) to actually exercise
-unlinkability. *(Globally, separate from this node roadmap, the optimized non-native ZK **bridge
-gadget** — see `../spike_bridge_cost/` and `SPIKE-statement5.md` §10 — remains the standing
-P-feasibility item.)*
+Both equivocation faults (proposer + voter) are now caught, so inside the consensus seam the next
+items are a true **EC-VRF** in place of the ed25519-sig stand-in (the current leader lottery binds
+to a *grindable* beacon) and **dynamic validator-set membership** (admission/eviction beyond
+slashing-from-leadership; the QC is still an aggregatable multisig, not a DKG threshold key). Then
+the **`Transport` seam** (Noise → Loopix) to actually exercise unlinkability. *(Globally, separate
+from this node roadmap, the optimized non-native ZK **bridge gadget** — see `../spike_bridge_cost/`
+and `SPIKE-statement5.md` §10 — remains the standing P-feasibility item.)*
 
 ## Toolchain caveat
 

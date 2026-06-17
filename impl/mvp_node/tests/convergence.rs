@@ -166,3 +166,59 @@ async fn slashing_detects_and_punishes_an_equivocating_leader() {
         );
     }
 }
+
+/// Vote-equivocation slashing: make a (non-leader) validator double-vote — sign two different block
+/// ids in the same slot. Every honest validator must detect the double-vote from the two BLS-signed
+/// votes, slash the offender network-wide, and still finalize every height with a quorum certificate
+/// (the offender's vote is never needed: the remaining honest validators are a quorum on their own).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slashing_detects_and_punishes_a_double_voting_validator() {
+    let nodes = 4u64;
+    let epochs = 6u64;
+    let base_port = 9600u16;
+    let window_ms = 200u64;
+
+    let validators = genesis_validator_set(nodes, base_port);
+    let beacon1 = next_beacon(GENESIS_BEACON, 1);
+    // Pick the HIGHEST-VRF node at height 1 as the offender, so it is not the view-0 leader — the
+    // double-vote is exercised on the vote path, independent of proposing.
+    let faulty = (0..nodes)
+        .max_by_key(|&i| VrfClaim::create(&NodeIdentity::from_seed(i), 1, beacon1).output)
+        .unwrap();
+    let faulty_peer = NodeIdentity::from_seed(faulty).peer_id();
+
+    let mut handles = Vec::new();
+    for i in 0..nodes {
+        let cfg = NodeConfig {
+            listen_addr: format!("127.0.0.1:{}", base_port + i as u16),
+            genesis_validators: validators.clone(),
+            window_ms,
+            max_height: epochs,
+            grace_ms: window_ms * 12,
+        };
+        let node = Node::new(NodeIdentity::from_seed(i), cfg);
+        let node = if i == faulty { node.byzantine_double_vote() } else { node };
+        handles.push(tokio::spawn(node.run()));
+    }
+
+    let mut outs = Vec::new();
+    for h in handles {
+        outs.push(h.await.expect("node task panicked"));
+    }
+
+    // No fork: every node converges to one head and length, each block a valid quorum certificate.
+    let head0 = outs[0].head_hash;
+    for o in &outs {
+        assert_eq!(o.head_hash, head0, "node {} forked", hex::encode(&o.peer_id[..4]));
+        assert_eq!(o.blocks_len as u64, epochs + 1, "chain still progressed every height");
+        assert!(o.all_qc_valid, "every finalized block carries a valid quorum certificate");
+    }
+    // Every honest node detected the double-vote and slashed the offender.
+    for o in outs.iter().filter(|o| o.peer_id != faulty_peer) {
+        assert!(
+            o.slashed.contains(&faulty_peer),
+            "honest node {} did not slash the double-voter",
+            hex::encode(&o.peer_id[..4])
+        );
+    }
+}
