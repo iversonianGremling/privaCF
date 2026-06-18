@@ -23,6 +23,7 @@ pub mod membership;
 pub mod message;
 pub mod node;
 pub mod pedersen;
+pub mod psi;
 pub mod smt;
 pub mod sphinx;
 pub mod transport;
