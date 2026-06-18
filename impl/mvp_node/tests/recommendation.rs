@@ -5,6 +5,7 @@
 //! recommendation surfaces the honest co-liked item, not the Sybil's.
 
 use mvp_node::detection::foolsgold;
+use mvp_node::obfuscate::{laplace, LaplaceMethod};
 use mvp_node::recommend::{top_k, CFConfig, ItemCF, Matrix};
 
 /// 6 peers × 5 items. Peers 0–2 honestly co-like the {0,1} niche; peers 3–5 are a Sybil cohort all
@@ -72,4 +73,30 @@ fn a_suspended_sybil_is_excluded_from_the_aggregation() {
     assert!(cf.effective_trust[4] <= 1e-9, "a suspended cohort's pushed item gathers no trust");
     // The honest niche is untouched.
     assert!(cf.effective_trust[0] > 0.0 && cf.effective_trust[1] > 0.0, "honest items keep their trust");
+}
+
+#[test]
+fn dp_obfuscated_gossip_still_recommends_the_honest_co_like() {
+    // The §4.5 link: peers broadcast Laplace-DP-obfuscated gossip (the protocol never sees the clean
+    // rows), yet the recommendation over that noised substrate still surfaces the honest co-like.
+    // We use a co-like niche broad enough that the per-row noise can't destroy the {0,1} signal.
+    let honest: Matrix = (0..12).map(|_| vec![1.0, 1.0, 0.0, 0.0, 0.0]).collect();
+    let sybil: Matrix = (0..6).map(|_| vec![0.0, 0.0, 0.0, 0.0, 50.0]).collect();
+    let gossip: Matrix = honest.into_iter().chain(sybil).collect();
+
+    // Each peer obfuscates its OWN row before broadcast (clean rows never leave the device).
+    let obf = laplace(&gossip, 5.0, 2026, 2.0, 1.0, true, LaplaceMethod::Clamp);
+
+    let cfg = CFConfig { c: Some(3.0), ..Default::default() };
+    let cf = ItemCF::fit(cfg, &obf, None, None);
+
+    // Even over noised gossip, the DSybil cap still bounds the Sybil-pushed item.
+    assert!(cf.effective_trust[4] <= cf.c + 1e-9, "the cap holds over obfuscated gossip too");
+
+    // A user who liked item 0 is still recommended item 1 (its honest co-like), not the Sybil's item 4.
+    let pref_pos = vec![vec![1.0, 0.0, 0.0, 0.0, 0.0]];
+    let pref_neg = vec![vec![0.0; 5]];
+    let seen = vec![vec![true, false, false, false, false]];
+    let rec = top_k(&cf.score_all(&pref_pos, &pref_neg, &seen), 1);
+    assert_eq!(rec[0][0], 1, "obfuscated gossip still yields the honest co-liked recommendation");
 }
