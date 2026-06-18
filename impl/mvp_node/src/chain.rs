@@ -43,6 +43,10 @@ pub struct BlockHeader {
     /// `membership_ops` they are header-covered and fold into the SUSP_SMT / DECRYPTION_SMT at the
     /// next height (see `verdict.rs`, `node.rs::smt_roots_at`).
     pub suspensions: Vec<SuspendRecord>,
+    /// The verdict threshold signature `σ_VERDICT` (96-byte BLS, as `Vec<u8>`) authorizing each
+    /// `suspensions[i]` (same length). Carried in the header so any validator independently re-verifies
+    /// the suspension against the target's on-chain `(s₁, d_T)` — the proposer cannot fabricate one.
+    pub verdict_sigs: Vec<Vec<u8>>,
 }
 
 /// A validator's BLS vote over a slot — the unit aggregated into the quorum certificate. The signed
@@ -214,6 +218,7 @@ impl BlockHeader {
             vrf_proof: vrf.proof.clone(),
             membership_ops: Vec::new(), // set by the proposer (assemble_block) before block_id is fixed
             suspensions: Vec::new(),
+            verdict_sigs: Vec::new(),
         }
     }
 }
@@ -248,6 +253,7 @@ impl Chain {
             vrf_proof: Vec::new(),
             membership_ops: Vec::new(),
             suspensions: Vec::new(),
+            verdict_sigs: Vec::new(),
         };
         Chain {
             blocks: vec![Block {

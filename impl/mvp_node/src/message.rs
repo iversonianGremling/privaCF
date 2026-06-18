@@ -30,6 +30,10 @@ pub enum Message {
     SlashVote(VoteEquivocationProof),
     /// A self-signed validator-set change (join/leave) awaiting inclusion by the next leader.
     Membership(MembershipOp),
+    /// A verdict-backed dark-node suspension awaiting inclusion: `sigma` is the `σ_VERDICT` (96-byte
+    /// BLS) that authorizes extracting `null_v` from the target's on-chain `(s₁, d_T)` at
+    /// `target_epoch_id`. Any node re-validates it from public chain data before pooling (see `node.rs`).
+    Suspension { target_epoch_id: u64, sigma: Vec<u8> },
     /// A fixed-size Sphinx mix packet to peel and forward/deliver (the Loopix layer, `loopix.rs`).
     Sphinx(SphinxPacket),
     /// Request all finalized blocks at height ≥ `from_height`.
