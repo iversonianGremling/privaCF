@@ -34,6 +34,12 @@ pub enum Message {
     /// BLS) that authorizes extracting `null_v` from the target's on-chain `(s₁, d_T)` at
     /// `target_epoch_id`. Any node re-validates it from public chain data before pooling (see `node.rs`).
     Suspension { target_epoch_id: u64, sigma: Vec<u8> },
+    /// A validator's threshold partial on `verdict_id(target_epoch_id)` — its SUSPEND vote in the
+    /// *objective* verdict branch (`verdict_policy.rs`). `index` is the signer's 1-based DKG party
+    /// index; `partial` is the 96-byte BLS partial. `⌊K/2⌋+1` of these combine
+    /// (`dkg::combine_signatures`) into `σ_VERDICT`. A node only emits / pools one for a target whose
+    /// on-chain transaction is objectively malformed, so the flood is bounded (see `node.rs`).
+    VerdictPartial { target_epoch_id: u64, index: u64, partial: Vec<u8> },
     /// A fixed-size Sphinx mix packet to peel and forward/deliver (the Loopix layer, `loopix.rs`).
     Sphinx(SphinxPacket),
     /// Request all finalized blocks at height ≥ `from_height`.
