@@ -249,8 +249,10 @@ fn bits_for(bound: u64) -> usize {
 fn prove_bounded(g: RistrettoPoint, h: RistrettoPoint, v: u64, r: Scalar, bound: u64, stream: &mut ScalarStream) -> BoundedProof {
     let n = bits_for(bound) + 1; // headroom so 2ⁿ > bound
     let lo = prove_range_pow2(g, h, v, r, n, stream);
-    // (B − v) under blinding −r; its commitment is B·g − vcom.
-    let hi = prove_range_pow2(g, h, bound - v, -r, n, stream);
+    // (B − v) under blinding −r; its commitment is B·g − vcom. A dishonest prover may pass v > bound
+    // (the honest shift keeps v ∈ [0, bound]); saturate rather than underflow — the resulting proof
+    // simply fails verification because the committed value won't match the verifier's hi_com.
+    let hi = prove_range_pow2(g, h, bound.saturating_sub(v), -r, n, stream);
     BoundedProof { lo, hi, n: n as u32, bound }
 }
 
