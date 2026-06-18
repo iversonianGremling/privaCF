@@ -289,6 +289,11 @@ pub struct Node {
     /// If set `(modulus, delay)`, the per-height beacon folds in a VDF output over the previous
     /// beacon (genesis-consistent network-wide), removing the residual last-revealer grinding bias.
     beacon_vdf: Option<(BigUint, u64)>,
+    /// If set, this node has a clean Layer-5 preference vector: each epoch it attaches a
+    /// `PreferencePayload` (obfuscated gossip + `C_p` + `M_v`) to its tx, putting real recommendation
+    /// substrate on-chain (§4.4–§4.6). `dp_epsilon` is the Laplace-DP budget for the gossip (§4.5).
+    preferences: Option<Vec<i64>>,
+    dp_epsilon: f64,
 }
 
 impl Node {
@@ -311,6 +316,8 @@ impl Node {
             admission: None,
             join_vdf: std::sync::OnceLock::new(),
             beacon_vdf: None,
+            preferences: None,
+            dp_epsilon: 5.0,
         }
     }
 
@@ -330,6 +337,25 @@ impl Node {
         let tk = self.threshold_key.as_ref()?;
         let id = crate::verenc::verdict_id(epoch_id);
         Some((tk.index, crate::bls::sign_dst(&tk.share, &id, crate::verenc::VERENC_DST)))
+    }
+
+    /// Builder: give this node a clean Layer-5 preference vector (per-item integer weights). Each
+    /// epoch it attaches a `PreferencePayload` to its tx — Laplace-DP-obfuscated gossip (budget
+    /// `epsilon`) plus the `C_p`/`M_v` commitments — so the finalized chain carries real
+    /// recommendation substrate (§4.4–§4.6).
+    pub fn with_preferences(mut self, prefs: Vec<i64>, epsilon: f64) -> Self {
+        self.preferences = Some(prefs);
+        self.dp_epsilon = epsilon;
+        self
+    }
+
+    /// Deterministic 32-byte secret handle for per-epoch preference derivations (obfuscation seed,
+    /// Pedersen blinding, leaf salt) — bound to `sk` but never exposing it.
+    fn pref_sk_handle(&self) -> [u8; 32] {
+        let mut h = blake3::Hasher::new();
+        h.update(b"privacf-pref-sk-handle-v1");
+        h.update(&to_u64(self.identity.sk).to_le_bytes());
+        *h.finalize().as_bytes()
     }
 
     /// Builder: gate joins behind an admission VDF proof-of-work (`VdfAdmission`). The parameters must
@@ -518,7 +544,12 @@ impl Node {
         let s1 = sub_mod(self.identity.null_v, s2);
         *split_ok &= add_mod(s1, s2) == self.identity.null_v;
         let commit = CommitT { s1: to_u64(s1), d_t: self.verenc.encrypt(s2, epoch_id_fp) };
-        let tx = EpochTransaction::create(&self.identity, height, epoch_id, commit);
+        // Layer-5: when this node has preferences, attach the obfuscated gossip + C_p + M_v payload,
+        // putting real recommendation substrate on-chain (§4.4–§4.6).
+        let pref = self.preferences.as_ref().map(|prefs| {
+            crate::epoch::PreferencePayload::build(prefs, &self.pref_sk_handle(), epoch_id, self.dp_epsilon)
+        });
+        let tx = EpochTransaction::create_with_pref(&self.identity, height, epoch_id, commit, pref);
         pending.insert((height, epoch_id), tx.clone());
         epoch_ids.push((height, epoch_id));
         mixer.publish(peers, beacon_t, Message::Tx(tx));

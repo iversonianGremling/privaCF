@@ -169,6 +169,25 @@ impl ItemCF {
     }
 }
 
+/// Assemble the on-chain gossip matrix from a set of epoch transactions: each tx carrying a
+/// [`PreferencePayload`](crate::epoch::PreferencePayload) contributes one row (its obfuscated
+/// gossip), zero-padded to the widest row; txs without a payload are skipped. This is the bridge from
+/// the substrate's finalized epoch transactions to the CF engine — recommendation over real on-chain
+/// gossip rather than a hand-built matrix.
+pub fn gossip_matrix(txs: &[crate::epoch::EpochTransaction]) -> Matrix {
+    let width = txs.iter().filter_map(|t| t.pref.as_ref()).map(|p| p.gossip.len()).max().unwrap_or(0);
+    txs.iter()
+        .filter_map(|t| t.pref.as_ref())
+        .map(|p| {
+            let mut row = vec![0.0; width];
+            for (j, &v) in p.gossip.iter().enumerate() {
+                row[j] = v as f64;
+            }
+            row
+        })
+        .collect()
+}
+
 /// Top-`k` item indices per user, ranked by score descending.
 pub fn top_k(scores: &Matrix, k: usize) -> Vec<Vec<usize>> {
     scores

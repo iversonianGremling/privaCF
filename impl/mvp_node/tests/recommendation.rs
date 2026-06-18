@@ -5,8 +5,10 @@
 //! recommendation surfaces the honest co-liked item, not the Sybil's.
 
 use mvp_node::detection::foolsgold;
+use mvp_node::epoch::{EpochTransaction, PreferencePayload};
+use mvp_node::identity::NodeIdentity;
 use mvp_node::obfuscate::{laplace, LaplaceMethod};
-use mvp_node::recommend::{top_k, CFConfig, ItemCF, Matrix};
+use mvp_node::recommend::{gossip_matrix, top_k, CFConfig, ItemCF, Matrix};
 
 /// 6 peers × 5 items. Peers 0–2 honestly co-like the {0,1} niche; peers 3–5 are a Sybil cohort all
 /// hammering item 4 (and nothing else).
@@ -99,4 +101,46 @@ fn dp_obfuscated_gossip_still_recommends_the_honest_co_like() {
     let seen = vec![vec![true, false, false, false, false]];
     let rec = top_k(&cf.score_all(&pref_pos, &pref_neg, &seen), 1);
     assert_eq!(rec[0][0], 1, "obfuscated gossip still yields the honest co-liked recommendation");
+}
+
+/// Build a signed epoch transaction carrying the live `PreferencePayload` (the on-chain path), for a
+/// node with the given clean preference vector.
+fn tx_with_prefs(seed: u64, prefs: &[i64], epoch_id: u64, epsilon: f64) -> EpochTransaction {
+    let id = NodeIdentity::from_seed(seed);
+    let commit = mvp_node::commit::CommitT { s1: 0, d_t: Vec::new() }; // identity split not under test here
+    let payload = PreferencePayload::build(prefs, &id.peer_id(), epoch_id, epsilon);
+    EpochTransaction::create_with_pref(&id, 1, epoch_id, commit, Some(payload))
+}
+
+#[test]
+fn recommendation_runs_over_on_chain_epoch_transactions() {
+    // The full substrate path: peers publish epoch transactions carrying obfuscated gossip + C_p +
+    // M_v; a reader assembles the gossip matrix from those finalized txs and recommends — no
+    // hand-built matrix anywhere. Honest peers co-like the {0,1} niche; a Sybil cohort hammers item 4.
+    let epoch = 7u64;
+    let mut txs = Vec::new();
+    for s in 0..12 {
+        txs.push(tx_with_prefs(100 + s, &[3, 3, 0, 0, 0], epoch, 6.0)); // honest niche {0,1}
+    }
+    for s in 0..6 {
+        txs.push(tx_with_prefs(900 + s, &[0, 0, 0, 0, 50], epoch, 6.0)); // Sybil pushing item 4
+    }
+
+    // Every tx authenticates and carries a payload.
+    assert!(txs.iter().all(|t| t.verify_sig() && t.pref.is_some()), "txs are signed and carry payloads");
+
+    // Assemble the on-chain gossip and recommend over it.
+    let gossip = gossip_matrix(&txs);
+    assert_eq!(gossip.len(), 18, "one gossip row per payload-bearing tx");
+    let cf = ItemCF::fit(CFConfig { c: Some(3.0), ..Default::default() }, &gossip, None, None);
+
+    // The DSybil cap bounds the Sybil item even over the on-chain obfuscated gossip.
+    assert!(cf.effective_trust[4] <= cf.c + 1e-9, "cap holds over on-chain gossip");
+
+    // A user who liked item 0 is recommended item 1 (the honest co-like), not the Sybil's item 4.
+    let pref_pos = vec![vec![1.0, 0.0, 0.0, 0.0, 0.0]];
+    let pref_neg = vec![vec![0.0; 5]];
+    let seen = vec![vec![true, false, false, false, false]];
+    let rec = top_k(&cf.score_all(&pref_pos, &pref_neg, &seen), 1);
+    assert_eq!(rec[0][0], 1, "recommendation over on-chain epoch txs surfaces the honest co-like");
 }
