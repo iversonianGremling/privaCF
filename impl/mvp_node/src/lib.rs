@@ -36,6 +36,7 @@ pub mod sphinx;
 pub mod transport;
 pub mod vdf;
 pub mod verdict;
+pub mod verdict_policy;
 pub mod verenc;
 pub mod vrf;
 pub mod watchdog;

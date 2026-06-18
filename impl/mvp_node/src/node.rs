@@ -204,6 +204,10 @@ pub struct NodeOutcome {
     /// The active validator set in effect at the height AFTER the final block (sorted) — reflects
     /// every finalized membership change, so all honest nodes agree on it.
     pub final_active: Vec<[u8; 32]>,
+    /// The `target_epoch_id`s suspended by a finalized dark-node verdict on this node's chain (sorted).
+    /// With autonomous verdicts (`with_verdict_authority`) this is non-empty when a malformed tx was
+    /// objectively suspended; all honest nodes converge on the same set.
+    pub suspended_targets: Vec<u64>,
 }
 
 /// Per-height consensus state.
@@ -294,6 +298,15 @@ pub struct Node {
     /// substrate on-chain (§4.4–§4.6). `dp_epsilon` is the Laplace-DP budget for the gossip (§4.5).
     preferences: Option<Vec<i64>>,
     dp_epsilon: f64,
+    /// If true and this node holds a threshold-key share, it autonomously drives *objective* verdicts
+    /// in-loop: each tick it scans finalized epoch txs, and for any whose published gossip row is
+    /// objectively malformed (`verdict_policy`) it emits its `σ_VERDICT` partial; `⌊K/2⌋+1` partials
+    /// combine into a dark-node suspension with no off-chain coordination. Honest default `false`.
+    verdict_authority: bool,
+    /// Test fault injection: when attaching a `PreferencePayload`, overwrite the obfuscated gossip row
+    /// with an out-of-bound vector (the cheap CF-amplification attack), making the tx objectively
+    /// malformed so the autonomous verdict path can suspend it. Honest default `false`.
+    malform_pref: bool,
 }
 
 impl Node {
@@ -318,7 +331,24 @@ impl Node {
             beacon_vdf: None,
             preferences: None,
             dp_epsilon: 5.0,
+            verdict_authority: false,
+            malform_pref: false,
         }
+    }
+
+    /// Builder: let this node autonomously drive *objective* dark-node verdicts inside the consensus
+    /// loop (`verdict_policy` + `drive_verdicts`). Requires a threshold-key share to emit partials;
+    /// without one the flag is inert. See `with_threshold_key`.
+    pub fn with_verdict_authority(mut self) -> Self {
+        self.verdict_authority = true;
+        self
+    }
+
+    /// Fault-injection builder: publish an objectively-malformed gossip row each epoch (over the public
+    /// `[0, B]` clamp), so a verdict-authority validator suspends this node via the autonomous path.
+    pub fn byzantine_malformed_pref(mut self) -> Self {
+        self.malform_pref = true;
+        self
     }
 
     /// Builder: provision this validator with its genesis DKG threshold-key share. Switches sealing to
@@ -478,6 +508,124 @@ impl Node {
             && self.make_suspension(blocks, record.target_epoch_id, sigma).is_some_and(|r| r.null_v == record.null_v)
     }
 
+    /// The set of `target_epoch_id`s already suspended by a finalized `SuspendRecord` — the dedup the
+    /// autonomous verdict driver uses to stop re-opening a verdict on an already-suspended target.
+    fn suspended_targets(&self, blocks: &[Block]) -> HashSet<u64> {
+        blocks.iter().flat_map(|b| b.header.suspensions.iter().map(|s| s.target_epoch_id)).collect()
+    }
+
+    /// Is the pseudonym `target_epoch_id` published on-chain with an *objectively malformed* preference
+    /// row (`verdict_policy`)? The publicly-checkable predicate every honest validator agrees on, and
+    /// the gate for both emitting and pooling verdict partials (so the partial flood is bounded to
+    /// genuine targets).
+    fn target_is_malformed(&self, blocks: &[Block], target_epoch_id: u64) -> bool {
+        blocks
+            .iter()
+            .flat_map(|b| b.txs.iter())
+            .any(|tx| tx.epoch_id == target_epoch_id && crate::verdict_policy::objective_suspend(&tx.pref))
+    }
+
+    /// Autonomous *objective* verdict driver (SPEC §4.9.6, objective branch). Each tick, a
+    /// verdict-authority validator scans finalized epoch txs; for every target whose published gossip
+    /// is objectively malformed and not already suspended, it emits its `σ_VERDICT` partial **once**
+    /// (`emitted`), pools its own partial, and tries to combine. The partial *is* the SUSPEND vote —
+    /// only emitted because the local deterministic policy flagged the on-chain tx — so `⌊K/2⌋+1`
+    /// partials reconstruct exactly the verdict signature the commit-reveal path would produce, with no
+    /// off-chain coordination.
+    #[allow(clippy::too_many_arguments)]
+    fn drive_verdicts(
+        &self,
+        chain: &Chain,
+        peers: &PeersMap,
+        mixer: &Mixer,
+        beacon: u64,
+        emitted: &mut HashSet<u64>,
+        partials: &mut HashMap<u64, HashMap<u64, [u8; 96]>>,
+        pending_suspensions: &mut Vec<(crate::verdict::SuspendRecord, [u8; 96])>,
+    ) {
+        if !self.verdict_authority || self.threshold_key.is_none() {
+            return;
+        }
+        let suspended = self.suspended_targets(&chain.blocks);
+        // Distinct malformed targets currently on-chain.
+        let targets: Vec<u64> = {
+            let mut seen = HashSet::new();
+            chain
+                .blocks
+                .iter()
+                .flat_map(|b| b.txs.iter())
+                .filter(|tx| crate::verdict_policy::objective_suspend(&tx.pref))
+                .map(|tx| tx.epoch_id)
+                .filter(|t| seen.insert(*t))
+                .collect()
+        };
+        for target in targets {
+            if suspended.contains(&target) || emitted.contains(&target) {
+                continue;
+            }
+            if let Some((index, partial)) = self.verdict_partial(target) {
+                emitted.insert(target);
+                partials.entry(target).or_default().insert(index, partial);
+                mixer.publish(
+                    peers,
+                    beacon,
+                    Message::VerdictPartial { target_epoch_id: target, index, partial: partial.to_vec() },
+                );
+                self.try_combine_verdict(chain, target, partials, pending_suspensions, peers, mixer, beacon);
+            }
+        }
+    }
+
+    /// Once `threshold` distinct-index partials are pooled for `target`, Lagrange-combine them
+    /// (`dkg::combine_signatures`) and gate the result through `make_suspension`/`validate_suspension`:
+    /// only a real quorum's `σ_VERDICT` decrypts the target's on-chain `d_T`, so a malformed partial
+    /// can at worst delay (liveness), never forge (safety). On success the suspension joins the pending
+    /// pool and is broadcast so the existing `Message::Suspension` path carries it network-wide.
+    #[allow(clippy::too_many_arguments)]
+    fn try_combine_verdict(
+        &self,
+        chain: &Chain,
+        target: u64,
+        partials: &HashMap<u64, HashMap<u64, [u8; 96]>>,
+        pending_suspensions: &mut Vec<(crate::verdict::SuspendRecord, [u8; 96])>,
+        peers: &PeersMap,
+        mixer: &Mixer,
+        beacon: u64,
+    ) {
+        let threshold = match &self.threshold_key {
+            Some(tk) => tk.threshold,
+            None => return,
+        };
+        let Some(parts) = partials.get(&target) else { return };
+        if parts.len() < threshold {
+            return;
+        }
+        if self.already_suspended(&chain.blocks).contains(&target)
+            || pending_suspensions.iter().any(|(r, _)| r.target_epoch_id == target)
+        {
+            return; // already finalized or pooled
+        }
+        // Combine the lowest-index `threshold` partials (any valid subset interpolates identically).
+        let mut collected: Vec<(u64, [u8; 96])> = parts.iter().map(|(i, p)| (*i, *p)).collect();
+        collected.sort_by_key(|(i, _)| *i);
+        let subset = &collected[..threshold];
+        let Some(sigma) = crate::dkg::combine_signatures(subset) else { return };
+        if let Some(record) = self.make_suspension(&chain.blocks, target, &sigma) {
+            if self.validate_suspension(&chain.blocks, &record, &sigma)
+                && !self.already_suspended(&chain.blocks).contains(&record.null_v)
+                && !pending_suspensions.iter().any(|(r, _)| r.null_v == record.null_v)
+            {
+                debug!(target, null_v = record.null_v, "objective verdict reached σ_VERDICT — suspending");
+                pending_suspensions.push((record, sigma));
+                mixer.publish(
+                    peers,
+                    beacon,
+                    Message::Suspension { target_epoch_id: target, sigma: sigma.to_vec() },
+                );
+            }
+        }
+    }
+
     /// Fault-injection builder: this node will never propose (Byzantine leader that withholds its
     /// block), exercising the other validators' view-change path.
     pub fn byzantine_withhold(mut self) -> Self {
@@ -582,7 +730,13 @@ impl Node {
         // Layer-5: when this node has preferences, attach the obfuscated gossip + C_p + M_v payload,
         // putting real recommendation substrate on-chain (§4.4–§4.6).
         let pref = self.preferences.as_ref().map(|prefs| {
-            crate::epoch::PreferencePayload::build(prefs, &self.pref_sk_handle(), epoch_id, self.dp_epsilon)
+            let mut p = crate::epoch::PreferencePayload::build(prefs, &self.pref_sk_handle(), epoch_id, self.dp_epsilon);
+            if self.malform_pref {
+                // Byzantine: bypass the honest obfuscation pipeline and publish an over-bound row to
+                // amplify CF weight — objectively malformed, so verdict authorities suspend us.
+                p.gossip = vec![crate::verdict_policy::GOSSIP_BOUND * 8.0; prefs.len().max(1)];
+            }
+            p
         });
         let tx = EpochTransaction::create_with_pref(&self.identity, height, epoch_id, commit, pref);
         pending.insert((height, epoch_id), tx.clone());
@@ -906,6 +1060,7 @@ impl Node {
         pending: &mut HashMap<(u64, u64), EpochTransaction>,
         pending_membership: &mut Vec<MembershipOp>,
         pending_suspensions: &mut Vec<(crate::verdict::SuspendRecord, [u8; 96])>,
+        verdict_partials: &mut HashMap<u64, HashMap<u64, [u8; 96]>>,
         peers: &PeersMap,
         mixer: &Mixer,
         slashed: &mut HashSet<[u8; 32]>,
@@ -932,6 +1087,29 @@ impl Node {
                         pending_suspensions.push((record, sig));
                         mixer.publish(peers, beacon_hint, Message::Suspension { target_epoch_id, sigma });
                     }
+                }
+            }
+            Message::VerdictPartial { target_epoch_id, index, partial } => {
+                // A peer's SUSPEND vote in the objective branch. Pool it only for a target whose
+                // on-chain tx is genuinely malformed and not yet suspended (bounding the flood to real
+                // targets); dedup by signer index; re-gossip the first sighting; then try to combine.
+                if !self.verdict_authority {
+                    return;
+                }
+                let Ok(p) = <[u8; 96]>::try_from(partial.as_slice()) else { return };
+                if self.suspended_targets(&chain.blocks).contains(&target_epoch_id)
+                    || !self.target_is_malformed(&chain.blocks, target_epoch_id)
+                {
+                    return;
+                }
+                let newly = verdict_partials
+                    .entry(target_epoch_id)
+                    .or_default()
+                    .insert(index, p)
+                    .is_none();
+                if newly {
+                    mixer.publish(peers, beacon_hint, Message::VerdictPartial { target_epoch_id, index, partial });
+                    self.try_combine_verdict(chain, target_epoch_id, verdict_partials, pending_suspensions, peers, mixer, beacon_hint);
                 }
             }
             Message::Membership(op) => {
@@ -1154,6 +1332,10 @@ impl Node {
         let mut pending: HashMap<(u64, u64), EpochTransaction> = HashMap::new();
         let mut pending_membership: Vec<MembershipOp> = Vec::new();
         let mut pending_suspensions: Vec<(crate::verdict::SuspendRecord, [u8; 96])> = Vec::new();
+        // Autonomous-verdict state: targets we have already emitted our own partial for (emit-once), and
+        // the pool of received partials per target (signer-index -> partial) awaiting a threshold.
+        let mut emitted_partials: HashSet<u64> = HashSet::new();
+        let mut verdict_partials: HashMap<u64, HashMap<u64, [u8; 96]>> = HashMap::new();
         let mut epoch_ids: Vec<(u64, u64)> = Vec::new();
         let mut beacons: Vec<(u64, u64)> = Vec::new();
         let mut split_ok = true;
@@ -1216,6 +1398,9 @@ impl Node {
                     // Drop suspensions already recorded by a finalized block.
                     let suspended_now = self.already_suspended(&chain.blocks);
                     pending_suspensions.retain(|(r, _)| !suspended_now.contains(&r.null_v));
+                    // Drop the partial pool for any target a finalized block has now suspended.
+                    let suspended_targets_now = self.suspended_targets(&chain.blocks);
+                    verdict_partials.retain(|t, _| !suspended_targets_now.contains(t));
                     // Learn the dial addresses of all current members so the dial task can reach a
                     // newly-admitted validator.
                     {
@@ -1229,12 +1414,16 @@ impl Node {
 
             tokio::select! {
                 _ = ticker.tick() => {
+                    // Autonomous objective-verdict driver: scan finalized txs and emit/combine partials
+                    // (no-op unless this node is a verdict authority with a threshold key).
+                    let beacon_hint = round.as_ref().map(|r| r.beacon_t).unwrap_or_else(|| chain.head().header.beacon_t);
+                    self.drive_verdicts(&chain, &peers, &mixer, beacon_hint, &mut emitted_partials, &mut verdict_partials, &mut pending_suspensions);
                     if let Some(r) = round.as_mut() {
                         self.on_tick(r, &mut chain, &pending, &pending_membership, &pending_suspensions, &peers, &mixer, &slashed);
                     }
                 }
                 Some(msg) = inbox_rx.recv() => {
-                    self.on_msg(msg, round.as_mut(), &mut chain, &mut pending, &mut pending_membership, &mut pending_suspensions, &peers, &mixer, &mut slashed);
+                    self.on_msg(msg, round.as_mut(), &mut chain, &mut pending, &mut pending_membership, &mut pending_suspensions, &mut verdict_partials, &peers, &mixer, &mut slashed);
                 }
             }
         }
@@ -1247,7 +1436,9 @@ impl Node {
         let mut slashed_vec: Vec<[u8; 32]> = slashed.iter().copied().collect();
         slashed_vec.sort();
         let final_active = self.active_set_at(&chain.blocks, chain.head().header.height + 1).peers;
-        info!(peer = %hex::encode(&my_id[..4]), blocks = chain.blocks.len(), head = %hex::encode(&chain.head_hash()[..4]), all_qc_valid, max_view, slashed = slashed_vec.len(), active = final_active.len(), "node done");
+        let mut suspended_targets: Vec<u64> = self.suspended_targets(&chain.blocks).into_iter().collect();
+        suspended_targets.sort();
+        info!(peer = %hex::encode(&my_id[..4]), blocks = chain.blocks.len(), head = %hex::encode(&chain.head_hash()[..4]), all_qc_valid, max_view, slashed = slashed_vec.len(), active = final_active.len(), suspended = suspended_targets.len(), "node done");
         NodeOutcome {
             peer_id: my_id,
             head_hash: chain.head_hash(),
@@ -1259,6 +1450,7 @@ impl Node {
             max_view,
             slashed: slashed_vec,
             final_active,
+            suspended_targets,
         }
     }
 }
@@ -1364,6 +1556,7 @@ mod tests {
         // handshake and the mix packet itself stay direct.
         assert!(Mixer::is_routable(&Message::GetChain { from_height: 0 }));
         assert!(Mixer::is_routable(&Message::Suspension { target_epoch_id: 0, sigma: Vec::new() }));
+        assert!(Mixer::is_routable(&Message::VerdictPartial { target_epoch_id: 0, index: 1, partial: Vec::new() }));
         assert!(!Mixer::is_routable(&Message::Hello {
             peer_id: [0u8; 32],
             listen_addr: String::new(),
