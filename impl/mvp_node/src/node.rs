@@ -345,6 +345,18 @@ impl Node {
         vs
     }
 
+    /// The SUSP_SMT and DECRYPTION_SMT roots in effect AT `height` — a pure function of the finalized
+    /// chain below it (like `active_set_at`), so every node derives identical roots. The suspended
+    /// `null_v`s and `dec_nullifier`s come from finalized SUSPEND verdicts / `null_v` extractions;
+    /// none exist yet (the verdict machinery is increment P1.5), so both trees are currently empty —
+    /// but the roots are real empty-tree Poseidon roots, not zero stubs.
+    fn smt_roots_at(&self, blocks: &[Block], height: u64) -> ([u8; 32], [u8; 32]) {
+        let _ = (blocks, height);
+        let suspended: Vec<u64> = Vec::new(); // P1.5: fold SUSPEND verdicts' null_v
+        let decrypted: Vec<u64> = Vec::new(); // P1.5: fold null_v_decryption dec_nullifiers
+        (crate::smt::Smt::from_keys(&suspended).root(), crate::smt::Smt::from_keys(&decrypted).root())
+    }
+
     /// Fault-injection builder: this node will never propose (Byzantine leader that withholds its
     /// block), exercising the other validators' view-change path.
     pub fn byzantine_withhold(mut self) -> Self {
@@ -531,6 +543,9 @@ impl Node {
             &self.identity, r.height, r.view, r.beacon_t, prev, my_epoch_id, &r.my_vrf,
         );
         header.membership_ops = ops;
+        let (susp_root, decr_root) = self.smt_roots_at(&chain.blocks, r.height);
+        header.susp_smt_root = susp_root;
+        header.decryption_smt_root = decr_root;
         let bid = block_id(&header, &txs);
         let proposer_sig =
             self.identity.sign(&proposal_sig_bytes(r.height, r.view, &bid)).to_bytes().to_vec();
@@ -564,6 +579,11 @@ impl Node {
             return false;
         }
         if b.header.beacon_t != self.beacon_for(head, b.header.height) {
+            return false;
+        }
+        // The SMT roots must be the chain-derived roots for this height (no forged suspension state).
+        let (susp_root, decr_root) = self.smt_roots_at(&chain.blocks, b.header.height);
+        if b.header.susp_smt_root != susp_root || b.header.decryption_smt_root != decr_root {
             return false;
         }
         // Every membership op the block carries must be self-authorized AND admissible (VDF gate).

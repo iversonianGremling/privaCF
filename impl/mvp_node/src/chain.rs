@@ -15,6 +15,7 @@ use crate::consensus::quorum;
 use crate::epoch::EpochTransaction;
 use crate::identity::{verify, NodeIdentity};
 use crate::membership::MembershipOp;
+use crate::smt;
 use crate::vrf::VrfClaim;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -23,8 +24,11 @@ pub struct BlockHeader {
     pub view: u64,                     // view-change counter (0 = first leader; +1 per timeout)
     pub beacon_t: u64,
     pub prev_block_hash: [u8; 32],
-    pub susp_smt_root: [u8; 32],       // zero stub — no suspensions in the MVP
-    pub decryption_smt_root: [u8; 32], // zero stub
+    /// SUSP_SMT root (suspended `null_v`s) and DECRYPTION_SMT root (`dec_nullifier` dedup), each a
+    /// real Poseidon SMT root derived from the finalized chain (`smt.rs`). Empty until the first
+    /// verdict, but a real empty-tree root, not a zero stub.
+    pub susp_smt_root: [u8; 32],
+    pub decryption_smt_root: [u8; 32],
     pub proposer_id: u64,              // proposer's epoch_id (informational)
     pub proposer_peer: [u8; 32],       // proposer's stable id
     pub vrf_output: [u8; 32],          // proposer's VRF output (leadership lottery)
@@ -194,8 +198,10 @@ impl BlockHeader {
             view,
             beacon_t,
             prev_block_hash,
-            susp_smt_root: [0u8; 32],
-            decryption_smt_root: [0u8; 32],
+            // Default to the empty-tree roots; the proposer overrides with chain-derived roots in
+            // `assemble_block` (as it does for `membership_ops`) once suspensions/extractions exist.
+            susp_smt_root: smt::empty_root(),
+            decryption_smt_root: smt::empty_root(),
             proposer_id: proposer_epoch_id,
             proposer_peer: proposer.peer_id(),
             vrf_output: vrf.output,
@@ -227,8 +233,8 @@ impl Chain {
             view: 0,
             beacon_t: GENESIS_BEACON,
             prev_block_hash: [0u8; 32],
-            susp_smt_root: [0u8; 32],
-            decryption_smt_root: [0u8; 32],
+            susp_smt_root: smt::empty_root(),
+            decryption_smt_root: smt::empty_root(),
             proposer_id: 0,
             proposer_peer: [0u8; 32],
             vrf_output: [0u8; 32],

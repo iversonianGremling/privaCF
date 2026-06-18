@@ -21,6 +21,7 @@ pub mod loopix;
 pub mod membership;
 pub mod message;
 pub mod node;
+pub mod smt;
 pub mod sphinx;
 pub mod transport;
 pub mod vdf;
