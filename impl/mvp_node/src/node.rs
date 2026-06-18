@@ -68,22 +68,14 @@ struct Mixer {
 }
 
 impl Mixer {
-    /// Messages routed through the mixnet (when enabled): the consensus control plane plus the
-    /// block-bearing broadcasts (`Proposal`/`Finalized`), now that fragmentation lets a message
-    /// exceed one Sphinx payload. Left direct: the catch-up/sync subsystem (`GetChain`/`ChainRange`,
-    /// a point-to-point bulk response) and `Hello`/`Sphinx` (transport-level frames).
+    /// Everything routes through the mixnet (when enabled) EXCEPT the two transport-level frames that
+    /// must precede or carry the mixnet itself: `Hello` (the pre-mixnet peer handshake) and `Sphinx`
+    /// (the mix packet itself). Fragmentation lets even block-bearing/bulk messages route, so the
+    /// whole consensus + chain-sync surface is mixed. (The chain-sync path — `GetChain`/`ChainRange` —
+    /// is currently dormant: laggards catch up via the mixnet-routed `Finalized` broadcast; routing it
+    /// here closes the seam so any future explicit sync is mixed too.)
     fn is_routable(msg: &Message) -> bool {
-        matches!(
-            msg,
-            Message::Tx(_)
-                | Message::Vrf(_)
-                | Message::Vote(_)
-                | Message::Membership(_)
-                | Message::Slash(_)
-                | Message::SlashVote(_)
-                | Message::Proposal(_)
-                | Message::Finalized(_)
-        )
+        !matches!(msg, Message::Hello { .. } | Message::Sphinx(_))
     }
 
     /// Publish a consensus message. When mixing is enabled and the message is routable, fragment it
@@ -795,7 +787,8 @@ impl Node {
             Message::GetChain { from_height } => {
                 let bs = chain.blocks_from(from_height);
                 if !bs.is_empty() {
-                    Self::gossip(peers, Message::ChainRange(bs));
+                    // Routed through the mixnet when enabled (fragmented if large), else direct.
+                    mixer.publish(peers, beacon_hint, Message::ChainRange(bs));
                 }
             }
             Message::ChainRange(bs) => {
@@ -1086,4 +1079,21 @@ async fn run_conn(
     }
     peers.lock().unwrap().remove(&remote);
     writer.abort();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_transport_frames_bypass_the_mixnet() {
+        // Chain-sync and every consensus message route through the mixnet; only the pre-mixnet
+        // handshake and the mix packet itself stay direct.
+        assert!(Mixer::is_routable(&Message::GetChain { from_height: 0 }));
+        assert!(!Mixer::is_routable(&Message::Hello {
+            peer_id: [0u8; 32],
+            listen_addr: String::new(),
+            binding: Vec::new(),
+        }));
+    }
 }
