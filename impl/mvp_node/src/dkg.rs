@@ -304,6 +304,28 @@ pub fn group_public_key(constant_commitments: &[[u8; 48]]) -> Option<[u8; 48]> {
     Some(g1_compress(&acc))
 }
 
+/// **Shamir-split** a 32-byte `secret` into `n` shares (1-based party index), any `threshold` of which
+/// reconstruct it while `threshold − 1` learn nothing. Reuses the Feldman dealing machinery (a
+/// degree-`threshold−1` polynomial whose constant term is the secret). This is the custody primitive
+/// the arbitration committee (`arbitration.rs`) uses to hold a departing node's recovery state.
+pub fn shamir_split(secret: &[u8; 32], threshold: usize, n: usize, ikm: &[u8]) -> Vec<(u64, [u8; 32])> {
+    assert!(threshold >= 1 && threshold <= n, "need 1 <= threshold <= n");
+    let dealing = deal_with_secret(threshold, n, secret, ikm);
+    (1..=n as u64).zip(dealing.shares).collect() // shares[j-1] = f(j)
+}
+
+/// Reconstruct a Shamir secret from `threshold` (index, share) pairs by Lagrange interpolation at 0:
+/// `secret = Σ_j λ_j(0)·share_j`. Fewer than `threshold` distinct shares yield an unrelated value.
+pub fn shamir_recover(shares: &[(u64, [u8; 32])]) -> [u8; 32] {
+    let indices: Vec<u64> = shares.iter().map(|(i, _)| *i).collect();
+    let mut acc = blst_fr::default(); // 0
+    for (i, s) in shares {
+        let lambda = lagrange_at_zero(*i, &indices);
+        acc = fr_add(&acc, &fr_mul(&lambda, &fr_from_be(s)));
+    }
+    fr_to_be(&acc)
+}
+
 /// A partial signature: sign `msg` with a secret-key share (identical to an ordinary BLS vote).
 pub fn sign_share(share: &[u8; 32], msg: &[u8]) -> [u8; 96] {
     bls::sign(share, msg)
@@ -486,5 +508,20 @@ mod tests {
         // The re-shared NEW committee signs under the UNCHANGED VA_pub — two different 3-subsets.
         assert!(bls::verify(&va_pub, msg, &sign_subset(0..3)), "new committee signs under the same VA_pub");
         assert!(bls::verify(&va_pub, msg, &sign_subset(2..5)), "a different new 3-subset also verifies");
+    }
+
+    #[test]
+    fn shamir_custody_reconstructs_from_a_quorum_only() {
+        let secret = [7u8; 32];
+        let shares = shamir_split(&secret, 3, 5, b"custody-ikm");
+        assert_eq!(shares.len(), 5);
+
+        // Any 3 distinct shares reconstruct the secret exactly.
+        assert_eq!(shamir_recover(&shares[0..3]), secret, "a 3-of-5 quorum recovers the secret");
+        let scattered = [shares[0], shares[2], shares[4]];
+        assert_eq!(shamir_recover(&scattered), secret, "a different 3-subset recovers the same secret");
+
+        // Fewer than the threshold cannot: 2 shares interpolate to an unrelated value.
+        assert_ne!(shamir_recover(&shares[0..2]), secret, "below threshold learns nothing");
     }
 }

@@ -6,6 +6,7 @@
 //! stubbed behind named trait seams — see the per-module docs.
 
 pub mod admission;
+pub mod arbitration;
 pub mod audit;
 pub mod beacon;
 pub mod bls;
