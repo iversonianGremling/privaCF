@@ -40,6 +40,12 @@ pub enum Message {
     /// (`dkg::combine_signatures`) into `σ_VERDICT`. A node only emits / pools one for a target whose
     /// on-chain transaction is objectively malformed, so the flood is bounded (see `node.rs`).
     VerdictPartial { target_epoch_id: u64, index: u64, partial: Vec<u8> },
+    /// A Class-2 first-observation audit report (`audit.rs`) awaiting inclusion: a VRF-selected,
+    /// signed attestation that the observer first saw the newly-admitted `subject_epoch_id` at
+    /// `first_seen_epoch`. A node only pools / re-gossips one that validates against the subject's
+    /// on-chain admission (so the flood is bounded to genuine newcomers); the next leader records it in
+    /// `BlockHeader::audit_reports`, feeding the admission-time burst detector network-wide.
+    Audit(crate::audit::FirstObservation),
     /// A fixed-size Sphinx mix packet to peel and forward/deliver (the Loopix layer, `loopix.rs`).
     Sphinx(SphinxPacket),
     /// Request all finalized blocks at height ≥ `from_height`.

@@ -18,6 +18,7 @@ use tracing::{debug, info};
 use num_bigint::BigUint;
 
 use crate::admission::VdfAdmission;
+use crate::audit::FirstObservation;
 use crate::beacon::{next_beacon, next_beacon_vdf};
 use crate::bls;
 use crate::chain::{
@@ -208,6 +209,13 @@ pub struct NodeOutcome {
     /// With autonomous verdicts (`with_verdict_authority`) this is non-empty when a malformed tx was
     /// objectively suspended; all honest nodes converge on the same set.
     pub suspended_targets: Vec<u64>,
+    /// The audit subjects flagged as a likely Sybil cohort by the admission-time burst detector over
+    /// the finalized first-observation reports (sorted). A pure function of the chain, so all honest
+    /// nodes agree (see `flagged_cohort` / `audit.rs`).
+    pub flagged_cohort: Vec<u64>,
+    /// Count of first-observation audit reports recorded across this node's finalized chain — evidence
+    /// the in-loop observers (`with_audit_authority`) actually attested.
+    pub audit_reports_recorded: usize,
 }
 
 /// Per-height consensus state.
@@ -307,6 +315,12 @@ pub struct Node {
     /// with an out-of-bound vector (the cheap CF-amplification attack), making the tx objectively
     /// malformed so the autonomous verdict path can suspend it. Honest default `false`.
     malform_pref: bool,
+    /// If true, this node acts as a Class-2 audit observer in-loop: each tick it scans the finalized
+    /// chain for newly-admitted subjects, and for any it is VRF-selected to observe (`audit.rs`) it
+    /// emits a signed `FirstObservation` report for the next leader to record in
+    /// `BlockHeader::audit_reports`. Every node then derives the admission-time burst (Sybil-cohort)
+    /// flag from the on-chain reports. Honest default `false`.
+    audit_authority: bool,
 }
 
 impl Node {
@@ -333,7 +347,16 @@ impl Node {
             dp_epsilon: 5.0,
             verdict_authority: false,
             malform_pref: false,
+            audit_authority: false,
         }
+    }
+
+    /// Builder: let this node act as an in-loop Class-2 first-observation audit observer
+    /// (`drive_audit`) — VRF-selecting itself per newly-admitted subject and emitting signed reports
+    /// the next leader records on-chain, driving the admission-time burst detector.
+    pub fn with_audit_authority(mut self) -> Self {
+        self.audit_authority = true;
+        self
     }
 
     /// Builder: let this node autonomously drive *objective* dark-node verdicts inside the consensus
@@ -626,6 +649,121 @@ impl Node {
         }
     }
 
+    /// Post-genesis admission events on-chain: `subject_id` → (peer_id, admission height, admission
+    /// beacon). A subject is a peer first added by a finalized `MembershipOp::Add`; genesis members are
+    /// the presupposed-good bootstrap and are NOT audit subjects. A pure function of the finalized
+    /// chain, so every node derives identical admissions — the ground truth the audit reports attest to.
+    fn admissions(&self, blocks: &[Block]) -> HashMap<u64, ([u8; 32], u64, u64)> {
+        let genesis: HashSet<[u8; 32]> = self.genesis.iter().map(|r| r.peer_id).collect();
+        let mut out: HashMap<u64, ([u8; 32], u64, u64)> = HashMap::new();
+        for b in blocks {
+            for op in &b.header.membership_ops {
+                if let MembershipOp::Add { record, .. } = op {
+                    if genesis.contains(&record.peer_id) {
+                        continue;
+                    }
+                    out.entry(crate::audit::subject_id(&record.peer_id))
+                        .or_insert((record.peer_id, b.header.height, b.header.beacon_t));
+                }
+            }
+        }
+        out
+    }
+
+    /// The `(observer, subject)` keys of every audit report already finalized on `blocks` — the dedup
+    /// the proposer and validators use so a report is recorded at most once.
+    fn recorded_audit_keys(&self, blocks: &[Block]) -> HashSet<([u8; 32], u64)> {
+        blocks
+            .iter()
+            .flat_map(|b| b.header.audit_reports.iter())
+            .map(|r| (r.observer, r.subject_epoch_id))
+            .collect()
+    }
+
+    /// Independently validate a first-observation report against public chain data: the subject must be
+    /// a genuinely post-genesis-admitted peer, the claimed `first_seen_epoch` must equal its on-chain
+    /// admission height (pinning the attestation to truth — no fabricated timing), the observer must
+    /// have been a validator at that height with the report's registered `vrf_pk`, and the VRF proof +
+    /// signature must verify under the admission beacon. Self-contained, so every node agrees.
+    fn validate_audit_report(&self, blocks: &[Block], r: &FirstObservation) -> bool {
+        let Some((_, h_admit, beacon_admit)) = self.admissions(blocks).get(&r.subject_epoch_id).copied()
+        else {
+            return false; // not a real newly-admitted subject
+        };
+        if r.first_seen_epoch != h_admit {
+            return false; // the report must attest the true admission epoch
+        }
+        // The observer must have been a registered validator at the admission height, binding its
+        // claimed vrf_pk to its peer id (the registry check `FirstObservation::verify` defers to us).
+        if self.active_set_at(blocks, h_admit).vrf.get(&r.observer) != Some(&r.vrf_pk) {
+            return false;
+        }
+        r.verify(beacon_admit, crate::audit::SELECT_THRESHOLD)
+    }
+
+    /// The admission-time first-seen map derived from the finalized audit reports: subject → median
+    /// observed epoch ([`audit::first_seen_map`](crate::audit::first_seen_map)). Built only from reports
+    /// that re-validate, so a node never folds in unauthenticated timing.
+    fn audit_first_seen(&self, blocks: &[Block]) -> std::collections::BTreeMap<u64, u64> {
+        let valid: Vec<FirstObservation> = blocks
+            .iter()
+            .flat_map(|b| b.header.audit_reports.iter())
+            .filter(|r| self.validate_audit_report(blocks, r))
+            .cloned()
+            .collect();
+        crate::audit::first_seen_map(&valid)
+    }
+
+    /// The Sybil-cohort flag: subjects whose admission-time burst (over the on-chain attestation
+    /// reports) trips [`audit::BURST_THRESHOLD`](crate::audit::BURST_THRESHOLD) within
+    /// [`audit::BURST_WINDOW`](crate::audit::BURST_WINDOW). A pure function of the finalized chain, so
+    /// all honest nodes converge on the same flagged set (exposed in `NodeOutcome`).
+    fn flagged_cohort(&self, blocks: &[Block]) -> Vec<u64> {
+        crate::audit::flagged_cohort(
+            &self.audit_first_seen(blocks),
+            crate::audit::BURST_WINDOW,
+            crate::audit::BURST_THRESHOLD,
+        )
+    }
+
+    /// Autonomous Class-2 audit observer (SPEC §4.9.7/§7). Each tick, an audit-authority validator
+    /// scans the finalized chain for newly-admitted subjects; for each one it has not yet observed and
+    /// is VRF-selected for (`audit.rs`), it emits a signed `FirstObservation` (pinned to the on-chain
+    /// admission epoch), pools it, and gossips it for the next leader to record in
+    /// `BlockHeader::audit_reports`. Recording is idempotent — a report already on-chain is skipped —
+    /// so the report flood is bounded to one per (observer, subject).
+    fn drive_audit(
+        &self,
+        chain: &Chain,
+        peers: &PeersMap,
+        mixer: &Mixer,
+        beacon: u64,
+        observed: &mut HashSet<u64>,
+        audit_pool: &mut Vec<FirstObservation>,
+    ) {
+        if !self.audit_authority {
+            return;
+        }
+        let on_chain = self.recorded_audit_keys(&chain.blocks);
+        for (sid, (_peer, h_admit, beacon_admit)) in self.admissions(&chain.blocks) {
+            if observed.contains(&sid) {
+                continue;
+            }
+            observed.insert(sid);
+            // The report carries its VRF proof + lottery; emit only if this node is a selected observer.
+            let report = FirstObservation::create(&self.identity, sid, h_admit, beacon_admit);
+            if !crate::audit::selected(&report.lottery, crate::audit::SELECT_THRESHOLD) {
+                continue;
+            }
+            let key = (self.me(), sid);
+            if on_chain.contains(&key) || audit_pool.iter().any(|r| (r.observer, r.subject_epoch_id) == key) {
+                continue;
+            }
+            audit_pool.push(report.clone());
+            mixer.publish(peers, beacon, Message::Audit(report));
+        }
+    }
+
     /// Fault-injection builder: this node will never propose (Byzantine leader that withholds its
     /// block), exercising the other validators' view-change path.
     pub fn byzantine_withhold(mut self) -> Self {
@@ -794,6 +932,7 @@ impl Node {
         pending: &HashMap<(u64, u64), EpochTransaction>,
         pending_membership: &[MembershipOp],
         pending_suspensions: &[(crate::verdict::SuspendRecord, [u8; 96])],
+        audit_pool: &[FirstObservation],
         alt: bool,
     ) -> Block {
         let prev = chain.head_hash();
@@ -832,11 +971,26 @@ impl Node {
                 verdict_sigs.push(sigma.to_vec());
             }
         }
+        // Include first-observation audit reports that re-validate against public chain data and
+        // aren't already recorded — one per (observer, subject), so each attestation lands once.
+        let recorded = self.recorded_audit_keys(&chain.blocks);
+        let mut audit_keys: HashSet<([u8; 32], u64)> = HashSet::new();
+        let mut audit_reports: Vec<FirstObservation> = Vec::new();
+        for rep in audit_pool {
+            let key = (rep.observer, rep.subject_epoch_id);
+            if !recorded.contains(&key)
+                && audit_keys.insert(key)
+                && self.validate_audit_report(&chain.blocks, rep)
+            {
+                audit_reports.push(rep.clone());
+            }
+        }
         if alt {
             txs.clear(); // a conflicting variant of the same slot -> a different block id
             ops.clear();
             suspensions.clear();
             verdict_sigs.clear();
+            audit_reports.clear();
         }
         let mut header = BlockHeader::create(
             &self.identity, r.height, r.view, r.beacon_t, prev, my_epoch_id, &r.my_vrf,
@@ -844,6 +998,7 @@ impl Node {
         header.membership_ops = ops;
         header.suspensions = suspensions;
         header.verdict_sigs = verdict_sigs;
+        header.audit_reports = audit_reports;
         let (susp_root, decr_root) = self.smt_roots_at(&chain.blocks, r.height);
         header.susp_smt_root = susp_root;
         header.decryption_smt_root = decr_root;
@@ -910,6 +1065,22 @@ impl Node {
                 }
             }
         }
+        // Every audit report the block carries must re-validate against public chain data (real
+        // subject, truthful admission epoch, VRF-selected registered observer), be unique within the
+        // block, and not already be recorded — so no proposer injects unauthenticated attestations.
+        {
+            let recorded = self.recorded_audit_keys(&chain.blocks);
+            let mut seen: HashSet<([u8; 32], u64)> = HashSet::new();
+            for rep in &b.header.audit_reports {
+                let key = (rep.observer, rep.subject_epoch_id);
+                if recorded.contains(&key)
+                    || !seen.insert(key)
+                    || !self.validate_audit_report(&chain.blocks, rep)
+                {
+                    return false;
+                }
+            }
+        }
         if !vset.contains(&b.header.proposer_peer) {
             return false;
         }
@@ -962,6 +1133,7 @@ impl Node {
         pending: &HashMap<(u64, u64), EpochTransaction>,
         pending_membership: &[MembershipOp],
         pending_suspensions: &[(crate::verdict::SuspendRecord, [u8; 96])],
+        audit_pool: &[FirstObservation],
         peers: &PeersMap,
         mixer: &Mixer,
         slashed: &HashSet<[u8; 32]>,
@@ -982,13 +1154,13 @@ impl Node {
                 r.proposed_views.insert(r.view);
                 if self.equivocate {
                     // Byzantine: double-sign two conflicting blocks for this slot.
-                    let a = self.assemble_block(chain, r, pending, pending_membership, pending_suspensions, false);
-                    let b = self.assemble_block(chain, r, pending, pending_membership, pending_suspensions, true);
+                    let a = self.assemble_block(chain, r, pending, pending_membership, pending_suspensions, audit_pool, false);
+                    let b = self.assemble_block(chain, r, pending, pending_membership, pending_suspensions, audit_pool, true);
                     debug!(height = r.height, view = r.view, "EQUIVOCATING (double-signing the slot)");
                     mixer.publish(peers, r.beacon_t, Message::Proposal(a));
                     mixer.publish(peers, r.beacon_t, Message::Proposal(b));
                 } else {
-                    let block = self.assemble_block(chain, r, pending, pending_membership, pending_suspensions, false);
+                    let block = self.assemble_block(chain, r, pending, pending_membership, pending_suspensions, audit_pool, false);
                     let bid = block_id(&block.header, &block.txs);
                     debug!(height = r.height, view = r.view, txs = block.txs.len(), "proposing as VRF leader");
                     r.blocks.insert(bid, block.clone());
@@ -1061,6 +1233,7 @@ impl Node {
         pending_membership: &mut Vec<MembershipOp>,
         pending_suspensions: &mut Vec<(crate::verdict::SuspendRecord, [u8; 96])>,
         verdict_partials: &mut HashMap<u64, HashMap<u64, [u8; 96]>>,
+        audit_pool: &mut Vec<FirstObservation>,
         peers: &PeersMap,
         mixer: &Mixer,
         slashed: &mut HashSet<[u8; 32]>,
@@ -1111,6 +1284,22 @@ impl Node {
                     mixer.publish(peers, beacon_hint, Message::VerdictPartial { target_epoch_id, index, partial });
                     self.try_combine_verdict(chain, target_epoch_id, verdict_partials, pending_suspensions, peers, mixer, beacon_hint);
                 }
+            }
+            Message::Audit(rep) => {
+                // A first-observation attestation: pool it (for the next leader to record) only if it
+                // re-validates against the subject's on-chain admission and is not already recorded or
+                // pooled. Unlike the sparse verdict partials, audit reports are NOT re-gossiped: an
+                // observer already broadcasts to all its peers, so the report reaches every node — and
+                // thus the next leader — directly. Re-flooding would amplify the (per-observer ×
+                // per-subject) report volume `N`-fold and starve the consensus votes sharing the inbox.
+                let key = (rep.observer, rep.subject_epoch_id);
+                if self.recorded_audit_keys(&chain.blocks).contains(&key)
+                    || audit_pool.iter().any(|r| (r.observer, r.subject_epoch_id) == key)
+                    || !self.validate_audit_report(&chain.blocks, &rep)
+                {
+                    return;
+                }
+                audit_pool.push(rep);
             }
             Message::Membership(op) => {
                 // Pool self-authorized membership ops for the next leader to record on-chain, and
@@ -1336,6 +1525,10 @@ impl Node {
         // the pool of received partials per target (signer-index -> partial) awaiting a threshold.
         let mut emitted_partials: HashSet<u64> = HashSet::new();
         let mut verdict_partials: HashMap<u64, HashMap<u64, [u8; 96]>> = HashMap::new();
+        // Autonomous-audit state: subjects we have already considered for observation (observe-once),
+        // and the pool of first-observation reports awaiting inclusion by the next leader.
+        let mut audited: HashSet<u64> = HashSet::new();
+        let mut audit_pool: Vec<FirstObservation> = Vec::new();
         let mut epoch_ids: Vec<(u64, u64)> = Vec::new();
         let mut beacons: Vec<(u64, u64)> = Vec::new();
         let mut split_ok = true;
@@ -1401,6 +1594,9 @@ impl Node {
                     // Drop the partial pool for any target a finalized block has now suspended.
                     let suspended_targets_now = self.suspended_targets(&chain.blocks);
                     verdict_partials.retain(|t, _| !suspended_targets_now.contains(t));
+                    // Drop audit reports a finalized block has now recorded (self-healing).
+                    let recorded_audit = self.recorded_audit_keys(&chain.blocks);
+                    audit_pool.retain(|r| !recorded_audit.contains(&(r.observer, r.subject_epoch_id)));
                     // Learn the dial addresses of all current members so the dial task can reach a
                     // newly-admitted validator.
                     {
@@ -1418,12 +1614,14 @@ impl Node {
                     // (no-op unless this node is a verdict authority with a threshold key).
                     let beacon_hint = round.as_ref().map(|r| r.beacon_t).unwrap_or_else(|| chain.head().header.beacon_t);
                     self.drive_verdicts(&chain, &peers, &mixer, beacon_hint, &mut emitted_partials, &mut verdict_partials, &mut pending_suspensions);
+                    // Autonomous audit-observer driver (no-op unless this node is an audit authority).
+                    self.drive_audit(&chain, &peers, &mixer, beacon_hint, &mut audited, &mut audit_pool);
                     if let Some(r) = round.as_mut() {
-                        self.on_tick(r, &mut chain, &pending, &pending_membership, &pending_suspensions, &peers, &mixer, &slashed);
+                        self.on_tick(r, &mut chain, &pending, &pending_membership, &pending_suspensions, &audit_pool, &peers, &mixer, &slashed);
                     }
                 }
                 Some(msg) = inbox_rx.recv() => {
-                    self.on_msg(msg, round.as_mut(), &mut chain, &mut pending, &mut pending_membership, &mut pending_suspensions, &mut verdict_partials, &peers, &mixer, &mut slashed);
+                    self.on_msg(msg, round.as_mut(), &mut chain, &mut pending, &mut pending_membership, &mut pending_suspensions, &mut verdict_partials, &mut audit_pool, &peers, &mixer, &mut slashed);
                 }
             }
         }
@@ -1438,7 +1636,10 @@ impl Node {
         let final_active = self.active_set_at(&chain.blocks, chain.head().header.height + 1).peers;
         let mut suspended_targets: Vec<u64> = self.suspended_targets(&chain.blocks).into_iter().collect();
         suspended_targets.sort();
-        info!(peer = %hex::encode(&my_id[..4]), blocks = chain.blocks.len(), head = %hex::encode(&chain.head_hash()[..4]), all_qc_valid, max_view, slashed = slashed_vec.len(), active = final_active.len(), suspended = suspended_targets.len(), "node done");
+        let flagged_cohort = self.flagged_cohort(&chain.blocks);
+        let audit_reports_recorded =
+            chain.blocks.iter().map(|b| b.header.audit_reports.len()).sum::<usize>();
+        info!(peer = %hex::encode(&my_id[..4]), blocks = chain.blocks.len(), head = %hex::encode(&chain.head_hash()[..4]), all_qc_valid, max_view, slashed = slashed_vec.len(), active = final_active.len(), suspended = suspended_targets.len(), flagged = flagged_cohort.len(), audit_reports = audit_reports_recorded, "node done");
         NodeOutcome {
             peer_id: my_id,
             head_hash: chain.head_hash(),
@@ -1451,6 +1652,8 @@ impl Node {
             slashed: slashed_vec,
             final_active,
             suspended_targets,
+            flagged_cohort,
+            audit_reports_recorded,
         }
     }
 }
@@ -1557,6 +1760,16 @@ mod tests {
         assert!(Mixer::is_routable(&Message::GetChain { from_height: 0 }));
         assert!(Mixer::is_routable(&Message::Suspension { target_epoch_id: 0, sigma: Vec::new() }));
         assert!(Mixer::is_routable(&Message::VerdictPartial { target_epoch_id: 0, index: 1, partial: Vec::new() }));
+        assert!(Mixer::is_routable(&Message::Audit(crate::audit::FirstObservation {
+            observer: [0u8; 32],
+            vrf_pk: [0u8; 32],
+            subject_epoch_id: 0,
+            first_seen_epoch: 0,
+            preout: [0u8; 32],
+            proof: Vec::new(),
+            lottery: [0u8; 32],
+            sig: Vec::new(),
+        })));
         assert!(!Mixer::is_routable(&Message::Hello {
             peer_id: [0u8; 32],
             listen_addr: String::new(),
