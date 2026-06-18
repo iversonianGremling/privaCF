@@ -36,6 +36,7 @@ pub mod vdf;
 pub mod verdict;
 pub mod verenc;
 pub mod vrf;
+pub mod zkstmt;
 
 #[cfg(test)]
 mod tests {

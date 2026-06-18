@@ -72,6 +72,27 @@ impl Pedersen {
         let p2 = CompressedRistretto(*c2).decompress()?;
         Some((p1 - p2).compress().to_bytes())
     }
+
+    /// The blinding generator `H` — exposed for the ZK statement proofs (`zkstmt.rs`) that operate on
+    /// commitments produced here.
+    pub(crate) fn h(&self) -> RistrettoPoint {
+        self.h
+    }
+
+    /// Value generator `Gᵢ` — exposed for the ZK statement proofs.
+    pub(crate) fn g(&self, i: usize) -> RistrettoPoint {
+        self.gens[i]
+    }
+
+    /// Number of value generators (the max vector length the scheme supports).
+    pub fn width(&self) -> usize {
+        self.gens.len()
+    }
+
+    /// Map a signed integer to the scalar this scheme commits it as (exposed for `zkstmt.rs`).
+    pub(crate) fn value_scalar(v: i64) -> Scalar {
+        scalar_i64(v)
+    }
 }
 
 #[cfg(test)]
