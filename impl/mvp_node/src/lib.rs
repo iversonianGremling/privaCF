@@ -30,6 +30,7 @@ pub mod pedersen;
 pub mod psi;
 pub mod recommend;
 pub mod reputation;
+pub mod rewind;
 pub mod smt;
 pub mod sphinx;
 pub mod transport;
