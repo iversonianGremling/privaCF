@@ -42,6 +42,13 @@ fn derive32(sk_handle: &[u8; 32], epoch_id: u64, domain: &[u8]) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
+/// The Pedersen blinding a node uses for its `C_p(T)` commitment — deterministic in its `sk_handle`
+/// and `epoch_id`. Exposed so the node can recompute it to prove the §6.4 ZK statements (which open
+/// against the on-chain `C_p`) without storing per-epoch state.
+pub fn pref_blinding(sk_handle: &[u8; 32], epoch_id: u64) -> [u8; 32] {
+    derive32(sk_handle, epoch_id, b"cp-blind")
+}
+
 impl PreferencePayload {
     /// Build the payload from a node's clean preference row `prefs` (per-item integer weights),
     /// deterministically given the node's `sk_handle` and `epoch_id`: obfuscate the gossip with
@@ -58,7 +65,7 @@ impl PreferencePayload {
 
         // Pedersen commitment to the CLEAN vector under a secret per-epoch blinding.
         let pc = Pedersen::new(prefs.len().max(1));
-        let blinding = derive32(sk_handle, epoch_id, b"cp-blind");
+        let blinding = pref_blinding(sk_handle, epoch_id);
         let c_p = pc.commit(prefs, &blinding);
 
         // Behavioral root: an announce leaf binding the obfuscated gossip, salted per-epoch.
