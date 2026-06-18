@@ -46,6 +46,15 @@ pub enum Message {
     /// on-chain admission (so the flood is bounded to genuine newcomers); the next leader records it in
     /// `BlockHeader::audit_reports`, feeding the admission-time burst detector network-wide.
     Audit(crate::audit::FirstObservation),
+    /// A public verdict-commit pre-commitment (§4.9.6/§4.9.8, `verdict.rs`). Any node pools / records
+    /// one whose signature verifies; the next leader records it in `BlockHeader::verdict_commits`. An
+    /// anomalous burst of these — against targets with no behavioral justification — is the
+    /// mass-deanonymization signal the watchdog detects, *before* any identity is exposed.
+    VerdictCommit(crate::verdict::VerdictCommit),
+    /// A signed watchdog alarm (`watchdog.rs`) that an anomalous verdict-commit burst occurred at the
+    /// named oversight round. A node pools / records one that re-derives true against the on-chain
+    /// commit burst; a quorum of distinct signers triggers recursive oversight network-wide.
+    Watchdog(crate::watchdog::WatchdogSignal),
     /// A fixed-size Sphinx mix packet to peel and forward/deliver (the Loopix layer, `loopix.rs`).
     Sphinx(SphinxPacket),
     /// Request all finalized blocks at height ≥ `from_height`.

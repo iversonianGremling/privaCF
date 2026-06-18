@@ -29,6 +29,21 @@ use crate::identity::{verify as verify_ed25519, NodeIdentity};
 
 // ─────────────────────────────────── watchdog signals ───────────────────────────────────
 
+/// MVP in-loop calibration (§4.9.8). Legitimate verdict-commits are rare, so the expected per-chain
+/// rate is ~0; a cumulative burst beyond [`THRESHOLD_WATCHDOG`] commits *unmatched by behavioral
+/// signals* is anomalous. [`SIGNAL_QUORUM`] distinct on-chain signalers then trigger recursive
+/// oversight. Production calibrates these to the validator set and a sliding window; the MVP keeps them
+/// fixed and network-consistent so every node derives the same trigger.
+pub const EXPECTED_RATE: f64 = 0.0;
+pub const THRESHOLD_WATCHDOG: f64 = 4.0;
+pub const SIGNAL_QUORUM: usize = 3;
+
+/// The canonical wire encoding of [`EXPECTED_RATE`] (milli-units) — what an honest signal carries, so a
+/// validator can reject a signal that claims a different rate band.
+pub fn expected_rate_milli() -> u64 {
+    rate_milli(EXPECTED_RATE)
+}
+
 /// Whether an epoch's verdict-commit activity is anomalous: the observed count exceeds the expected
 /// rate by `threshold_watchdog` AND the behavioral signals fall short of matching the burst (a genuine
 /// wave of misbehavior would be accompanied by behavioral signals at a comparable rate). Both
