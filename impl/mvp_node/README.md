@@ -137,7 +137,7 @@ distinctness and the publish-`s₁` split.
 | Seam (trait → stub / real future impl) | MVP behavior | Deferred to |
 |---|---|---|
 | `Transport` — Noise XX + ed25519 channel binding **and** a real Loopix/Sphinx mixnet carrying the **whole BFT exchange** (VRF/vote/tx/membership/slash **+ fragmented blocks**) (real) → mixnet hardening | **confidential, authenticated, forward-secret** Noise channels **plus** a chain-seeded Sphinx mixnet (per-hop bitwise unlinkability, Poisson delays, loop cover) that **routes all consensus gossip incl. proposals/finalized blocks via fragmentation+reassembly** — consensus converges over it; **every message except the two transport frames (`Hello`/`Sphinx`) routes through the mixnet** (the chain-sync seam is closed — it's a dormant path, laggards catch up via the mixnet-routed `Finalized`); payload is a LIONESS wide-block SPRP (anti-tagging) with loop+drop cover and live SURB anonymous replies; remaining: deployment-scale anonymity-set tuning | SPEC §5.1 |
-| consensus — VRF election + aggregate-BLS quorum cert + view-change + proposer-equivocation + double-vote slashing + dynamic membership (real) → +DKG threshold key | **safety + leader-failure liveness + aggregate-BLS finality + both equivocation-slashing paths + dynamic validator-set membership with chain-derived quorum reconfiguration done**; remaining: the QC is an aggregatable MULTISIG (signer set recorded) not a DKG threshold key (`VA_pub` is the separate DKG construct); join admission is AcceptAll (the Sybil gate is the `Admission` seam) | SPEC §4.1, §4.3 |
+| consensus — VRF election + aggregate-BLS quorum cert + view-change + proposer-equivocation + double-vote slashing + dynamic membership (real); **DKG threshold key as a tested primitive** (`dkg.rs`) | **safety + leader-failure liveness + aggregate-BLS finality + both equivocation-slashing paths + dynamic validator-set membership with chain-derived quorum reconfiguration done**. The live QC is an aggregatable MULTISIG (no re-DKG on membership change); the spec's **`VA_pub` DKG threshold key** is implemented standalone — a Feldman-VSS DKG + non-interactive threshold BLS where any `t`-of-`n` shares combine into one signature under a single `VA_pub`. Wiring it live would require a re-share each membership change, which is why the running set uses the multisig | SPEC §4.1, §4.3 |
 | `vrf` — real EC-VRF (sr25519, `schnorrkel`) | **real VRF done** (unique, ungrindable lottery value per key+input); the beacon it binds to is now VRF-chained too (see the beacon row), leaving only the residual last-revealer bias → VDF/drand | SPEC EC-VRF, §4.1 |
 | `Admission` — AcceptAll **and** a real `VdfAdmission` (real, opt-in) | AcceptAll by default; opt **`VdfAdmission`** in (`Node::with_vdf_admission`, genesis-consistent) and a join must carry a valid **Wesolowski VDF** proof-of-work over its `peer_id` (`vdf.rs`) — a prover is admitted, a proofless freeloader is rejected, enforced at pooling/assembly/block-validation. The VDF runs over a genesis RSA modulus with **factors discarded** (the good-genesis trusted setup); a fully trustless class-group VDF is the heavier alternative | SPEC §4.3 |
 | `Discovery` — bootstrap + chain-driven address book (partial) → `PsiDiscovery` | peers come from the genesis bootstrap set plus a dynamic address book grown from on-chain joins and peers' `Hello`s; the private set-intersection discovery is deferred | SPEC §5.3/§5.4 |
@@ -167,10 +167,12 @@ VRF/vote/tx/slash messages **and fragmented proposals/finalized blocks**), with 
 anti-tagging payload, **loop + drop cover traffic**, and live **SURB** anonymous replies — and every
 message except the transport frames now routes through it. A real **Wesolowski VDF** (`vdf.rs`,
 over a genesis RSA modulus with factors discarded) now backs both an opt-in **VDF admission gate**
-and an opt-in **VDF-folded beacon**. The one remaining node subsystem is a **DKG threshold key**
-(`VA_pub`) in place of the aggregatable multisig. *(Globally, separate from this node roadmap, the
-optimized non-native ZK **bridge gadget** — see `../spike_bridge_cost/` and `SPIKE-statement5.md`
-§10 — remains the standing P-feasibility item.)*
+and an opt-in **VDF-folded beacon**, and a **Feldman-VSS DKG with non-interactive threshold BLS**
+(`dkg.rs`) realises the spec's **`VA_pub`** threshold key. Every research-grade node subsystem the MVP
+set out to skeletonise now has a real, tested implementation; the open frontier is *integration depth*
+(e.g. re-DKG on membership change to make `VA_pub` the live QC) and deployment-scale tuning, plus —
+globally, separate from this node roadmap — the optimized non-native ZK **bridge gadget** (see
+`../spike_bridge_cost/` and `SPIKE-statement5.md` §10), the standing P-feasibility item.
 
 ## Toolchain caveat
 

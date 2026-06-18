@@ -11,6 +11,7 @@ pub mod bls;
 pub mod chain;
 pub mod commit;
 pub mod consensus;
+pub mod dkg;
 pub mod discovery;
 pub mod epoch;
 pub mod field;
