@@ -22,6 +22,7 @@ pub mod message;
 pub mod node;
 pub mod sphinx;
 pub mod transport;
+pub mod vdf;
 pub mod vrf;
 
 #[cfg(test)]

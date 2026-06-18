@@ -54,15 +54,24 @@ fn check_sig(peer: &[u8; 32], msg: &[u8], sig: &[u8]) -> bool {
 /// A self-authorized membership change, recorded in a block header and applied at the next height.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum MembershipOp {
-    /// Admit `record` as a validator (the joiner signs `join_sig_bytes`).
-    Add { record: ValidatorRecord, sig: Vec<u8> },
+    /// Admit `record` as a validator (the joiner signs `join_sig_bytes`). `vdf` is an optional
+    /// admission proof-of-work (a serialized `vdf::VdfProof` over the joiner's `peer_id`) — empty
+    /// under AcceptAll admission, required and verified under `VdfAdmission`. It is **not** covered by
+    /// `sig` because the VDF already binds the `peer_id` (it is self-authenticating evidence, like the
+    /// quorum certificate), so it needs no separate signature.
+    Add { record: ValidatorRecord, sig: Vec<u8>, vdf: Vec<u8> },
     /// Remove `peer_id` from the validator set (the leaver signs `leave_sig_bytes`).
     Remove { peer_id: [u8; 32], sig: Vec<u8> },
 }
 
 impl MembershipOp {
-    /// Build a self-signed join op for `identity` advertising `addr`.
+    /// Build a self-signed join op for `identity` advertising `addr` (AcceptAll — no VDF proof).
     pub fn add(identity: &NodeIdentity, addr: String) -> Self {
+        Self::add_with_vdf(identity, addr, Vec::new())
+    }
+
+    /// Build a self-signed join op carrying an admission VDF proof (`VdfAdmission`).
+    pub fn add_with_vdf(identity: &NodeIdentity, addr: String, vdf: Vec<u8>) -> Self {
         let record = ValidatorRecord {
             peer_id: identity.peer_id(),
             addr,
@@ -70,7 +79,15 @@ impl MembershipOp {
             vrf_pk: identity.vrf_pk(),
         };
         let sig = identity.sign(&join_sig_bytes(&record)).to_bytes().to_vec();
-        MembershipOp::Add { record, sig }
+        MembershipOp::Add { record, sig, vdf }
+    }
+
+    /// The serialized admission VDF proof carried by an `Add` op (empty for `Remove`/AcceptAll).
+    pub fn vdf_proof(&self) -> &[u8] {
+        match self {
+            MembershipOp::Add { vdf, .. } => vdf,
+            MembershipOp::Remove { .. } => &[],
+        }
     }
 
     /// Build a self-signed leave op for `identity`.
@@ -92,7 +109,7 @@ impl MembershipOp {
     /// This is the safety-critical validity check — an op that fails it must never enter a block.
     pub fn verify(&self) -> bool {
         match self {
-            MembershipOp::Add { record, sig } => check_sig(&record.peer_id, &join_sig_bytes(record), sig),
+            MembershipOp::Add { record, sig, .. } => check_sig(&record.peer_id, &join_sig_bytes(record), sig),
             MembershipOp::Remove { peer_id, sig } => check_sig(peer_id, &leave_sig_bytes(peer_id), sig),
         }
     }
@@ -186,6 +203,7 @@ mod tests {
             MembershipOp::Add { record, .. } => MembershipOp::Add {
                 record,
                 sig: a.sign(b"nonsense").to_bytes().to_vec(),
+                vdf: Vec::new(),
             },
             other => other,
         };

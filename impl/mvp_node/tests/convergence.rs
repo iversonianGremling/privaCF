@@ -461,3 +461,73 @@ async fn nodes_converge_with_consensus_routed_through_the_mixnet() {
         assert!(o.split_ok, "publish-s1 split must still hold under mix routing");
     }
 }
+
+/// VDF admission gate: with `VdfAdmission` configured network-wide, a newcomer that computes a valid
+/// admission VDF proof over its peer_id is admitted, while one that sends no/invalid proof is
+/// rejected — so the active set grows by the prover only. (Difficulty is tiny here for test speed;
+/// the modulus factors are discarded inside `genesis_modulus`, the good-genesis trusted-setup.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn vdf_admission_admits_a_prover_and_rejects_a_freeloader() {
+    use mvp_node::admission::VdfAdmission;
+    use mvp_node::vdf;
+    use rand::SeedableRng;
+
+    let genesis_n = 4u64;
+    let epochs = 8u64;
+    let base_port = 10200u16;
+    let window_ms = 200u64;
+
+    // Genesis-shared admission parameters (every node must agree → no split-brain).
+    let modulus = vdf::genesis_modulus(256, &mut rand::rngs::StdRng::seed_from_u64(123));
+    let admission = VdfAdmission { modulus, difficulty: 2000 };
+
+    let validators = genesis_validator_set(genesis_n, base_port);
+    let genesis_min = (0..genesis_n).map(|i| NodeIdentity::from_seed(i).peer_id()).min().unwrap();
+    // Two small-id newcomers (below every genesis id → deterministic full mesh): a prover and a freeloader.
+    let good_seed = (2000u64..).find(|&s| NodeIdentity::from_seed(s).peer_id() < genesis_min).unwrap();
+    let bad_seed =
+        (good_seed + 1..).find(|&s| NodeIdentity::from_seed(s).peer_id() < genesis_min).unwrap();
+    let good_peer = NodeIdentity::from_seed(good_seed).peer_id();
+    let bad_peer = NodeIdentity::from_seed(bad_seed).peer_id();
+
+    let cfg = |port_off: u64| NodeConfig {
+        listen_addr: format!("127.0.0.1:{}", base_port + port_off as u16),
+        genesis_validators: validators.clone(),
+        window_ms,
+        max_height: epochs,
+        grace_ms: window_ms * 16,
+    };
+
+    let mut handles = Vec::new();
+    for i in 0..genesis_n {
+        let node = Node::new(NodeIdentity::from_seed(i), cfg(i)).with_vdf_admission(admission.clone());
+        handles.push(tokio::spawn(node.run()));
+    }
+    // Prover: has the admission params, so it computes and attaches a valid VDF proof.
+    let good = Node::new(NodeIdentity::from_seed(good_seed), cfg(genesis_n))
+        .joining()
+        .with_vdf_admission(admission.clone());
+    handles.push(tokio::spawn(good.run()));
+    // Freeloader: asks to join with no admission proof; the gated validators must refuse it.
+    let bad = Node::new(NodeIdentity::from_seed(bad_seed), cfg(genesis_n + 1)).joining();
+    handles.push(tokio::spawn(bad.run()));
+
+    let mut outs = Vec::new();
+    for h in handles {
+        outs.push(h.await.expect("node task panicked"));
+    }
+
+    let mut expected: Vec<[u8; 32]> =
+        (0..genesis_n).map(|i| NodeIdentity::from_seed(i).peer_id()).collect();
+    expected.push(good_peer);
+    expected.sort();
+
+    let head0 = outs[0].head_hash;
+    for o in &outs {
+        assert_eq!(o.head_hash, head0, "node {} forked", hex::encode(&o.peer_id[..4]));
+        assert!(o.all_qc_valid, "every block's QC valid");
+        assert_eq!(o.final_active, expected, "node {} membership", hex::encode(&o.peer_id[..4]));
+        assert!(o.final_active.contains(&good_peer), "the VDF prover must be admitted");
+        assert!(!o.final_active.contains(&bad_peer), "the proofless freeloader must be rejected");
+    }
+}

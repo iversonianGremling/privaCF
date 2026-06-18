@@ -48,6 +48,10 @@ serde-big-array = "0.5"
 # Ristretto prime-order group for the Sphinx mix-packet key-blinding (isolated in sphinx.rs). Ristretto
 # avoids the X25519 clamping that would break Sphinx's multiplicative blinding chain.
 curve25519-dalek = "4"
+# Big-integer modular arithmetic for the Wesolowski VDF over an RSA group (isolated in vdf.rs).
+num-bigint = { version = "0.4", features = ["rand"] }
+num-integer = "0.1"
+num-traits = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "test-util", "sync"] }

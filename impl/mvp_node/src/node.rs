@@ -15,6 +15,7 @@ use tokio::sync::mpsc;
 use tokio::time::{interval, Instant};
 use tracing::{debug, info};
 
+use crate::admission::VdfAdmission;
 use crate::beacon::next_beacon;
 use crate::bls;
 use crate::chain::{
@@ -245,6 +246,11 @@ pub struct Node {
     /// If set, consensus control messages are routed through the Loopix mixnet rather than
     /// broadcast in the clear (see `Mixer`); `None` keeps the original direct-gossip behavior.
     mix_settings: Option<MixSettings>,
+    /// If set, a join op must carry a valid admission VDF proof (genesis-consistent network-wide);
+    /// `None` keeps AcceptAll admission.
+    admission: Option<VdfAdmission>,
+    /// Memoised admission VDF proof for our own join — deterministic in our peer_id, computed once.
+    join_vdf: std::sync::OnceLock<Vec<u8>>,
 }
 
 impl Node {
@@ -263,7 +269,27 @@ impl Node {
             leave_at: None,
             joining: false,
             mix_settings: None,
+            admission: None,
+            join_vdf: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Builder: gate joins behind an admission VDF proof-of-work (`VdfAdmission`). The parameters must
+    /// be genesis-consistent across the network so every validator agrees on admissibility.
+    pub fn with_vdf_admission(mut self, admission: VdfAdmission) -> Self {
+        self.admission = Some(admission);
+        self
+    }
+
+    /// A membership op is admissible iff it is self-signed AND (for a join under `VdfAdmission`) it
+    /// carries a valid admission VDF proof. This is the network-wide gate enforced at pooling, block
+    /// assembly, and block validation, so all honest nodes agree.
+    fn op_admissible(&self, op: &MembershipOp) -> bool {
+        op.verify()
+            && match (&self.admission, op) {
+                (Some(adm), MembershipOp::Add { record, vdf, .. }) => adm.admits(&record.peer_id, vdf),
+                _ => true,
+            }
     }
 
     /// Builder: route consensus control messages (VRF claims, votes, txs, membership/slash) through
@@ -373,7 +399,15 @@ impl Node {
         // stops once it appears in the active set).
         if self.joining && !vset.contains(&self.me()) {
             debug!(height, "broadcasting self-signed JOIN op");
-            let op = MembershipOp::add(&self.identity, self.config.listen_addr.clone());
+            let addr = self.config.listen_addr.clone();
+            let op = match &self.admission {
+                // Attach the (memoised) admission VDF proof over our peer_id.
+                Some(adm) => {
+                    let vdf = self.join_vdf.get_or_init(|| adm.prove(&self.me())).clone();
+                    MembershipOp::add_with_vdf(&self.identity, addr, vdf)
+                }
+                None => MembershipOp::add(&self.identity, addr),
+            };
             mixer.publish(peers, beacon_t, Message::Membership(op));
         }
         // per-epoch commitment (publish-s1)
@@ -449,7 +483,7 @@ impl Node {
         let mut ops: Vec<MembershipOp> = Vec::new();
         let mut subjects: HashSet<[u8; 32]> = HashSet::new();
         for op in pending_membership {
-            if !op.verify() || !subjects.insert(op.subject()) {
+            if !self.op_admissible(op) || !subjects.insert(op.subject()) {
                 continue;
             }
             let changes = match op {
@@ -503,8 +537,8 @@ impl Node {
         if b.header.beacon_t != next_beacon(head.beacon_t, &head.vrf_output, b.header.height) {
             return false;
         }
-        // Every membership op the block carries must be self-authorized (the safety-critical check).
-        if !b.header.membership_ops.iter().all(|op| op.verify()) {
+        // Every membership op the block carries must be self-authorized AND admissible (VDF gate).
+        if !b.header.membership_ops.iter().all(|op| self.op_admissible(op)) {
             return false;
         }
         if !vset.contains(&b.header.proposer_peer) {
@@ -671,7 +705,9 @@ impl Node {
                 // Pool self-authorized membership ops for the next leader to record on-chain, and
                 // re-gossip the first time we see one so it reaches the full mesh even when the
                 // originator is only partially connected (bounded: dedup by subject stops the flood).
-                if op.verify() && !pending_membership.iter().any(|o| o.subject() == op.subject()) {
+                if self.op_admissible(&op)
+                    && !pending_membership.iter().any(|o| o.subject() == op.subject())
+                {
                     pending_membership.push(op.clone());
                     mixer.publish(peers, beacon_hint, Message::Membership(op));
                 }
