@@ -14,6 +14,33 @@ use serde::{Deserialize, Serialize};
 use crate::identity::{verify as verify_ed25519, NodeIdentity};
 use crate::vrf::vrf_verify;
 
+/// Network-wide selection threshold for VRF observers (MVP default). A validator is an eligible
+/// first-observation observer for a subject iff its VRF lottery falls below this. `u64::MAX` admits
+/// every validator as an observer — the right default for the small MVP network, where the value is
+/// the *attestation* (signed, VRF-bound, on-chain evidence), not bandwidth rate-limiting. A
+/// production deployment lowers this to thin observers out; every node must agree on it (it gates
+/// which reports validate), so it is a network constant, not a per-node knob.
+pub const SELECT_THRESHOLD: u64 = u64::MAX;
+
+/// Admission-clustering window (epochs/heights) for the burst score. Subjects first-seen within this
+/// many epochs of each other count toward one another's burst. A network constant so every node
+/// derives the identical flagged cohort.
+pub const BURST_WINDOW: u64 = 6;
+
+/// Burst-score threshold: a subject co-admitted with at least this many subjects (itself included)
+/// inside [`BURST_WINDOW`] is flagged as part of a likely Sybil cohort. Organic growth trickles in
+/// under this; a coordinated mass-join trips it. A network constant.
+pub const BURST_THRESHOLD: usize = 3;
+
+/// The public audit pseudonym for an admission subject: a stable `u64` derived from the newcomer's
+/// peer id. The newly-admitted node's `MembershipOp::Add` "announces" this pseudonym on-chain;
+/// observers VRF-select on `(subject_id, beacon)` and report first-observation against it. (Binding
+/// the subject to the admission event — not a per-epoch pseudonym — is what makes admission-time
+/// clustering, the Sybil-cohort signal, observable: per-epoch ids rotate every height for everyone.)
+pub fn subject_id(peer_id: &[u8; 32]) -> u64 {
+    u64::from_le_bytes(peer_id[..8].try_into().expect("8 bytes"))
+}
+
 /// The VRF input selecting observers for `subject_epoch_id` at `beacon`.
 fn audit_input(subject_epoch_id: u64, beacon: u64) -> Vec<u8> {
     bincode::serialize(&("class2-observe", subject_epoch_id, beacon)).expect("audit input")
@@ -108,6 +135,34 @@ pub fn is_burst(score: usize, threshold: usize) -> bool {
     score >= threshold
 }
 
+/// The consensus first-seen map over every subject appearing in `reports`: subject → median
+/// first-seen epoch ([`consensus_first_seen`]), robust to a minority of lying observers. The
+/// substrate for [`flagged_cohort`] when driving detection off the on-chain attestation reports.
+pub fn first_seen_map(reports: &[FirstObservation]) -> std::collections::BTreeMap<u64, u64> {
+    let mut subjects: Vec<u64> = reports.iter().map(|r| r.subject_epoch_id).collect();
+    subjects.sort_unstable();
+    subjects.dedup();
+    subjects.into_iter().filter_map(|s| consensus_first_seen(reports, s).map(|e| (s, e))).collect()
+}
+
+/// The subjects flagged as a likely Sybil cohort: every subject whose admission-time burst score
+/// ([`burst_score`], how many subjects were first-seen within `window` epochs of it) meets
+/// `threshold`. A pure function of the consensus first-seen map, so every node derives the identical
+/// set with no coordination. Returned sorted.
+pub fn flagged_cohort(
+    first_seen: &std::collections::BTreeMap<u64, u64>,
+    window: u64,
+    threshold: usize,
+) -> Vec<u64> {
+    let mut flagged: Vec<u64> = first_seen
+        .keys()
+        .copied()
+        .filter(|&s| is_burst(burst_score(first_seen, s, window), threshold))
+        .collect();
+    flagged.sort_unstable();
+    flagged
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,6 +201,38 @@ mod tests {
         }
         assert_eq!(burst_score(&first_seen, 2000, 1), 1, "an isolated join scores 1");
         assert!(!is_burst(burst_score(&first_seen, 2000, 1), 4), "isolated join not flagged");
+    }
+
+    #[test]
+    fn flagged_cohort_catches_the_burst_and_spares_isolated_joins() {
+        // Three subjects co-admitted in a tight window (a Sybil cohort) plus two isolated joins.
+        let mut first_seen = BTreeMap::new();
+        for s in 0..3u64 {
+            first_seen.insert(1000 + s, 10 + s); // 10, 11, 12 — all within BURST_WINDOW
+        }
+        first_seen.insert(2000, 1); // isolated early
+        first_seen.insert(2001, 50); // isolated late
+        let flagged = flagged_cohort(&first_seen, BURST_WINDOW, BURST_THRESHOLD);
+        assert_eq!(flagged, vec![1000, 1001, 1002], "exactly the co-admitted cohort is flagged");
+        assert!(!flagged.contains(&2000) && !flagged.contains(&2001), "isolated joins are spared");
+    }
+
+    #[test]
+    fn first_seen_map_takes_the_median_per_subject() {
+        // Two subjects, each with three observer reports; the map is the per-subject median.
+        let obs: Vec<NodeIdentity> = (0..3).map(NodeIdentity::from_seed).collect();
+        let mut reports = Vec::new();
+        for (&e, o) in [7u64, 8, 9].iter().zip(&obs) {
+            reports.push(FirstObservation::create(o, 100, e, 1));
+        }
+        for (&e, o) in [20u64, 21, 22].iter().zip(&obs) {
+            reports.push(FirstObservation::create(o, 200, e, 1));
+        }
+        let m = first_seen_map(&reports);
+        assert_eq!(m.get(&100), Some(&8), "median first-seen for subject 100");
+        assert_eq!(m.get(&200), Some(&21), "median first-seen for subject 200");
+        // 8 and 21 are 13 apart — beyond BURST_WINDOW — so neither clusters with the other.
+        assert!(flagged_cohort(&m, BURST_WINDOW, 2).is_empty(), "subjects outside the window do not cluster");
     }
 
     #[test]

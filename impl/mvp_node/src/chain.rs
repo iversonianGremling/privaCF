@@ -47,6 +47,12 @@ pub struct BlockHeader {
     /// `suspensions[i]` (same length). Carried in the header so any validator independently re-verifies
     /// the suspension against the target's on-chain `(s₁, d_T)` — the proposer cannot fabricate one.
     pub verdict_sigs: Vec<Vec<u8>>,
+    /// Class-2 first-observation audit reports finalized by this block (`audit.rs`). Each is a
+    /// VRF-selected, ed25519-signed attestation that an observer first saw a newly-admitted subject at
+    /// a given epoch. Header-covered (so `block_id` binds them, voted-over) and re-validated by every
+    /// validator against the subject's on-chain admission — accountable, rate-limited evidence from
+    /// which any node derives the admission-time burst score (the Sybil-cohort signal, §4.9.7/§7).
+    pub audit_reports: Vec<crate::audit::FirstObservation>,
 }
 
 /// A validator's BLS vote over a slot — the unit aggregated into the quorum certificate. The signed
@@ -219,6 +225,7 @@ impl BlockHeader {
             membership_ops: Vec::new(), // set by the proposer (assemble_block) before block_id is fixed
             suspensions: Vec::new(),
             verdict_sigs: Vec::new(),
+            audit_reports: Vec::new(),
         }
     }
 }
@@ -254,6 +261,7 @@ impl Chain {
             membership_ops: Vec::new(),
             suspensions: Vec::new(),
             verdict_sigs: Vec::new(),
+            audit_reports: Vec::new(),
         };
         Chain {
             blocks: vec![Block {
