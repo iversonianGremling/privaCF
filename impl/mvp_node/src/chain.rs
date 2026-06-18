@@ -53,6 +53,15 @@ pub struct BlockHeader {
     /// validator against the subject's on-chain admission — accountable, rate-limited evidence from
     /// which any node derives the admission-time burst score (the Sybil-cohort signal, §4.9.7/§7).
     pub audit_reports: Vec<crate::audit::FirstObservation>,
+    /// §4.9.8 recursive-oversight evidence. `verdict_commits` are public commit-reveal pre-commitments
+    /// to verdicts (`verdict.rs`): a rogue committee mounting mass-deanonymization must post these
+    /// BEFORE any `null_v` is decryptable, so an anomalous burst is visible on-chain *before* a single
+    /// identity is exposed. `watchdog_signals` are the signed alarms watchers raise over that burst
+    /// (`watchdog.rs`); a quorum of distinct signers triggers recursive oversight. Both header-covered
+    /// (so `block_id` binds them, voted-over) and re-validated by every validator — accountable evidence
+    /// from which any node deterministically derives the oversight trigger.
+    pub verdict_commits: Vec<crate::verdict::VerdictCommit>,
+    pub watchdog_signals: Vec<crate::watchdog::WatchdogSignal>,
 }
 
 /// A validator's BLS vote over a slot — the unit aggregated into the quorum certificate. The signed
@@ -226,6 +235,8 @@ impl BlockHeader {
             suspensions: Vec::new(),
             verdict_sigs: Vec::new(),
             audit_reports: Vec::new(),
+            verdict_commits: Vec::new(),
+            watchdog_signals: Vec::new(),
         }
     }
 }
@@ -262,6 +273,8 @@ impl Chain {
             suspensions: Vec::new(),
             verdict_sigs: Vec::new(),
             audit_reports: Vec::new(),
+            verdict_commits: Vec::new(),
+            watchdog_signals: Vec::new(),
         };
         Chain {
             blocks: vec![Block {

@@ -21,6 +21,8 @@ use crate::admission::VdfAdmission;
 use crate::audit::FirstObservation;
 use crate::beacon::{next_beacon, next_beacon_vdf};
 use crate::bls;
+use crate::verdict::VerdictCommit;
+use crate::watchdog::WatchdogSignal;
 use crate::chain::{
     block_id, proposal_sig_bytes, qc_valid, Block, BlockHeader, Chain, EquivocationProof,
     QuorumCert, Vote, VoteEquivocationProof,
@@ -216,6 +218,14 @@ pub struct NodeOutcome {
     /// Count of first-observation audit reports recorded across this node's finalized chain — evidence
     /// the in-loop observers (`with_audit_authority`) actually attested.
     pub audit_reports_recorded: usize,
+    /// Whether the in-loop §4.9.8 watchdog reached a signal quorum on this node's finalized chain — a
+    /// recursive-oversight trigger over an anomalous verdict-commit burst. A pure function of the chain,
+    /// so all honest nodes converge (see `oversight_triggered` / `watchdog.rs`).
+    pub oversight_triggered: bool,
+    /// Count of watchdog signals recorded across this node's finalized chain (evidence the in-loop
+    /// watchers attested), and of public verdict-commits (the burst they flagged).
+    pub watchdog_signals_recorded: usize,
+    pub verdict_commits_recorded: usize,
 }
 
 /// Per-height consensus state.
@@ -321,6 +331,18 @@ pub struct Node {
     /// `BlockHeader::audit_reports`. Every node then derives the admission-time burst (Sybil-cohort)
     /// flag from the on-chain reports. Honest default `false`.
     audit_authority: bool,
+    /// If true, this node is an in-loop §4.9.8 watchdog: each tick it scans the on-chain verdict-commit
+    /// count, and if it is anomalous (a burst beyond `THRESHOLD_WATCHDOG` unmatched by behavioral
+    /// signals) it raises a signed `WatchdogSignal` for the next leader to record in
+    /// `BlockHeader::watchdog_signals`. A quorum of distinct signers triggers recursive oversight. Every
+    /// node then derives the trigger from the on-chain signals. Honest default `false`.
+    watchdog_authority: bool,
+    /// Fault injection: if non-empty, this node is a rogue committee mounting mass-deanonymization —
+    /// each tick it publicly posts a `verdict_commit` (SUSPEND) against each configured *innocent*
+    /// `target_epoch_id`. The §4.9.6 commit-reveal ordering forces these to be public before any `null_v`
+    /// is decryptable, so the burst (with no behavioral justification) is what the watchdog catches.
+    /// Honest default empty.
+    rogue_commit_targets: Vec<u64>,
 }
 
 impl Node {
@@ -348,6 +370,8 @@ impl Node {
             verdict_authority: false,
             malform_pref: false,
             audit_authority: false,
+            watchdog_authority: false,
+            rogue_commit_targets: Vec::new(),
         }
     }
 
@@ -356,6 +380,23 @@ impl Node {
     /// the next leader records on-chain, driving the admission-time burst detector.
     pub fn with_audit_authority(mut self) -> Self {
         self.audit_authority = true;
+        self
+    }
+
+    /// Builder: let this node act as an in-loop §4.9.8 watchdog (`drive_watchdog`) — raising a signed
+    /// `WatchdogSignal` when the on-chain verdict-commit burst is anomalous, for the next leader to
+    /// record. A quorum of distinct signers triggers recursive oversight network-wide.
+    pub fn with_watchdog_authority(mut self) -> Self {
+        self.watchdog_authority = true;
+        self
+    }
+
+    /// Fault-injection builder: a rogue committee that publicly posts a burst of verdict-commits
+    /// (SUSPEND) against `targets` (innocent pseudonyms), modelling the §4.9.8 mass-deanonymization the
+    /// watchdog defends against. Because the commit is public before any `null_v` is decryptable, the
+    /// burst is caught at the commit stage — before a single identity is exposed.
+    pub fn byzantine_rogue_verdict_commits(mut self, targets: Vec<u64>) -> Self {
+        self.rogue_commit_targets = targets;
         self
     }
 
@@ -764,6 +805,166 @@ impl Node {
         }
     }
 
+    // ───────────────────────────── §4.9.8 watchdog / recursive oversight ─────────────────────────────
+
+    /// Every `(member, target_epoch_id, commit_hash)` verdict-commit already finalized on `blocks` — the
+    /// dedup the proposer and validators use so a public commit is recorded at most once.
+    fn recorded_commit_keys(&self, blocks: &[Block]) -> HashSet<([u8; 32], u64, [u8; 32])> {
+        blocks
+            .iter()
+            .flat_map(|b| b.header.verdict_commits.iter())
+            .map(|c| (c.member, c.target_epoch_id, c.commit_hash))
+            .collect()
+    }
+
+    /// Every `(signer, round)` watchdog signal already finalized on `blocks` — the recording dedup.
+    fn recorded_watchdog_keys(&self, blocks: &[Block]) -> HashSet<([u8; 32], u64)> {
+        blocks
+            .iter()
+            .flat_map(|b| b.header.watchdog_signals.iter())
+            .map(|s| (s.epoch_id, s.epoch_t))
+            .collect()
+    }
+
+    /// The cumulative count of valid on-chain verdict-commits, and how many are *behaviorally justified*
+    /// (their target carries an objectively-malformed on-chain tx). The watchdog fires only when the
+    /// commit burst outruns the behavioral signals — a genuine misbehavior wave would carry matching
+    /// behavioral evidence (`anomalous`). A pure function of the finalized chain.
+    fn commit_counts(&self, blocks: &[Block]) -> (u64, u64) {
+        let (mut observed, mut justified) = (0u64, 0u64);
+        for c in blocks.iter().flat_map(|b| b.header.verdict_commits.iter()) {
+            if !c.verify() {
+                continue;
+            }
+            observed += 1;
+            if self.target_is_malformed(blocks, c.target_epoch_id) {
+                justified += 1;
+            }
+        }
+        (observed, justified)
+    }
+
+    /// The canonical oversight round for the current chain: the height of the first finalized block
+    /// carrying any verdict-commit (the epoch the burst began). `None` until a commit is on-chain.
+    /// Deterministic, so every node keys its watchdog signal to the same round and they tally together.
+    fn oversight_round(&self, blocks: &[Block]) -> Option<u64> {
+        blocks.iter().find(|b| !b.header.verdict_commits.is_empty()).map(|b| b.header.height)
+    }
+
+    /// Independently validate a watchdog signal against public chain data: the signature checks, the
+    /// claimed rate band matches `EXPECTED_RATE`, the signer was a validator at the round it names, the
+    /// round is the chain's canonical oversight round, the on-chain verdict-commit burst is genuinely
+    /// anomalous *now*, and the claimed count does not exceed what is actually on-chain (no inflation).
+    /// Self-contained, so a proposer cannot inject a false oversight trigger and every node agrees.
+    fn validate_watchdog_signal(&self, blocks: &[Block], s: &WatchdogSignal) -> bool {
+        if !s.verify() || s.expected_rate_milli != crate::watchdog::expected_rate_milli() {
+            return false;
+        }
+        if !self.active_set_at(blocks, s.epoch_t).contains(&s.epoch_id) {
+            return false;
+        }
+        if self.oversight_round(blocks) != Some(s.epoch_t) {
+            return false;
+        }
+        let (observed, justified) = self.commit_counts(blocks);
+        crate::watchdog::anomalous(
+            observed,
+            crate::watchdog::EXPECTED_RATE,
+            crate::watchdog::THRESHOLD_WATCHDOG,
+            justified,
+        ) && s.observed_commits <= observed
+    }
+
+    /// Whether the in-loop watchdog has reached a signal quorum on `blocks`: a recursive-oversight
+    /// trigger over an anomalous verdict-commit burst. A pure function of the finalized chain (the
+    /// signals and the burst both live on-chain), so all honest nodes converge on the same verdict.
+    fn oversight_triggered(&self, blocks: &[Block]) -> bool {
+        let Some(round) = self.oversight_round(blocks) else { return false };
+        let signals: Vec<WatchdogSignal> =
+            blocks.iter().flat_map(|b| b.header.watchdog_signals.iter().cloned()).collect();
+        crate::watchdog::tally_signals(&signals, round) >= crate::watchdog::SIGNAL_QUORUM
+    }
+
+    /// Rogue mass-deanonymization driver (fault injection, §4.9.8). Each tick a rogue node publicly
+    /// posts a `verdict_commit` (SUSPEND) against each configured innocent `target` exactly once
+    /// (`committed`), pools it, and gossips it for the next leader to record. The verdict stays hidden
+    /// (the matching reveal is never sent); the *public commitment* is what the watchdog counts.
+    fn drive_rogue_commits(
+        &self,
+        chain: &Chain,
+        peers: &PeersMap,
+        mixer: &Mixer,
+        beacon: u64,
+        committed: &mut HashSet<u64>,
+        commit_pool: &mut Vec<VerdictCommit>,
+    ) {
+        if self.rogue_commit_targets.is_empty() {
+            return;
+        }
+        let recorded = self.recorded_commit_keys(&chain.blocks);
+        for &target in &self.rogue_commit_targets {
+            if !committed.insert(target) {
+                continue;
+            }
+            // Deterministic nonce: the value stays hidden behind the commit hash, but the commitment is
+            // reproducible (no stored state) and uniquely this node's.
+            let mut h = blake3::Hasher::new();
+            h.update(b"privacf-rogue-commit-nonce-v1");
+            h.update(&target.to_le_bytes());
+            h.update(&self.me());
+            let nonce = *h.finalize().as_bytes();
+            let (commit, _reveal) =
+                crate::verdict::cast(&self.identity, target, crate::verdict::SUSPEND, nonce);
+            let key = (commit.member, commit.target_epoch_id, commit.commit_hash);
+            if recorded.contains(&key)
+                || commit_pool.iter().any(|c| (c.member, c.target_epoch_id, c.commit_hash) == key)
+            {
+                continue;
+            }
+            commit_pool.push(commit.clone());
+            mixer.publish(peers, beacon, Message::VerdictCommit(commit));
+        }
+    }
+
+    /// Autonomous §4.9.8 watchdog driver. Once the on-chain verdict-commit burst is anomalous, a
+    /// watchdog-authority node raises its signed `WatchdogSignal` for the canonical oversight round
+    /// **once** (`raised`), pools it, and gossips it for the next leader to record. `SIGNAL_QUORUM`
+    /// distinct signers on-chain then trigger recursive oversight — all derived from public chain data.
+    fn drive_watchdog(
+        &self,
+        chain: &Chain,
+        peers: &PeersMap,
+        mixer: &Mixer,
+        beacon: u64,
+        raised: &mut bool,
+        watchdog_pool: &mut Vec<WatchdogSignal>,
+    ) {
+        if !self.watchdog_authority || *raised {
+            return;
+        }
+        let (observed, justified) = self.commit_counts(&chain.blocks);
+        if !crate::watchdog::anomalous(
+            observed,
+            crate::watchdog::EXPECTED_RATE,
+            crate::watchdog::THRESHOLD_WATCHDOG,
+            justified,
+        ) {
+            return;
+        }
+        let Some(round) = self.oversight_round(&chain.blocks) else { return };
+        *raised = true;
+        let signal =
+            WatchdogSignal::raise(&self.identity, round, observed, crate::watchdog::EXPECTED_RATE);
+        let key = (signal.epoch_id, signal.epoch_t);
+        if self.recorded_watchdog_keys(&chain.blocks).contains(&key)
+            || watchdog_pool.iter().any(|s| (s.epoch_id, s.epoch_t) == key)
+        {
+            return;
+        }
+        watchdog_pool.push(signal.clone());
+        mixer.publish(peers, beacon, Message::Watchdog(signal));
+    }
+
     /// Fault-injection builder: this node will never propose (Byzantine leader that withholds its
     /// block), exercising the other validators' view-change path.
     pub fn byzantine_withhold(mut self) -> Self {
@@ -933,6 +1134,8 @@ impl Node {
         pending_membership: &[MembershipOp],
         pending_suspensions: &[(crate::verdict::SuspendRecord, [u8; 96])],
         audit_pool: &[FirstObservation],
+        verdict_commit_pool: &[VerdictCommit],
+        watchdog_pool: &[WatchdogSignal],
         alt: bool,
     ) -> Block {
         let prev = chain.head_hash();
@@ -985,12 +1188,39 @@ impl Node {
                 audit_reports.push(rep.clone());
             }
         }
+        // Include public verdict-commits awaiting inclusion — one per (member, target, hash),
+        // signature-checked, not already recorded (the burst the watchdog counts).
+        let recorded_commits = self.recorded_commit_keys(&chain.blocks);
+        let mut commit_keys: HashSet<([u8; 32], u64, [u8; 32])> = HashSet::new();
+        let mut verdict_commits: Vec<VerdictCommit> = Vec::new();
+        for c in verdict_commit_pool {
+            let key = (c.member, c.target_epoch_id, c.commit_hash);
+            if !recorded_commits.contains(&key) && commit_keys.insert(key) && c.verify() {
+                verdict_commits.push(c.clone());
+            }
+        }
+        // Include watchdog signals awaiting inclusion — one per (signer, round), re-validated against
+        // the on-chain burst, not already recorded (a quorum of these triggers oversight).
+        let recorded_wd = self.recorded_watchdog_keys(&chain.blocks);
+        let mut wd_keys: HashSet<([u8; 32], u64)> = HashSet::new();
+        let mut watchdog_signals: Vec<WatchdogSignal> = Vec::new();
+        for s in watchdog_pool {
+            let key = (s.epoch_id, s.epoch_t);
+            if !recorded_wd.contains(&key)
+                && wd_keys.insert(key)
+                && self.validate_watchdog_signal(&chain.blocks, s)
+            {
+                watchdog_signals.push(s.clone());
+            }
+        }
         if alt {
             txs.clear(); // a conflicting variant of the same slot -> a different block id
             ops.clear();
             suspensions.clear();
             verdict_sigs.clear();
             audit_reports.clear();
+            verdict_commits.clear();
+            watchdog_signals.clear();
         }
         let mut header = BlockHeader::create(
             &self.identity, r.height, r.view, r.beacon_t, prev, my_epoch_id, &r.my_vrf,
@@ -999,6 +1229,8 @@ impl Node {
         header.suspensions = suspensions;
         header.verdict_sigs = verdict_sigs;
         header.audit_reports = audit_reports;
+        header.verdict_commits = verdict_commits;
+        header.watchdog_signals = watchdog_signals;
         let (susp_root, decr_root) = self.smt_roots_at(&chain.blocks, r.height);
         header.susp_smt_root = susp_root;
         header.decryption_smt_root = decr_root;
@@ -1081,6 +1313,34 @@ impl Node {
                 }
             }
         }
+        // Every verdict-commit the block carries must be signature-valid, unique within the block, and
+        // not already recorded — public pre-commitments the watchdog counts; no proposer fabricates them.
+        {
+            let recorded = self.recorded_commit_keys(&chain.blocks);
+            let mut seen: HashSet<([u8; 32], u64, [u8; 32])> = HashSet::new();
+            for c in &b.header.verdict_commits {
+                let key = (c.member, c.target_epoch_id, c.commit_hash);
+                if recorded.contains(&key) || !seen.insert(key) || !c.verify() {
+                    return false;
+                }
+            }
+        }
+        // Every watchdog signal must re-validate against the on-chain burst (true anomaly, registered
+        // signer, canonical round), be unique within the block, and not already be recorded — so no
+        // proposer injects a false oversight trigger.
+        {
+            let recorded = self.recorded_watchdog_keys(&chain.blocks);
+            let mut seen: HashSet<([u8; 32], u64)> = HashSet::new();
+            for s in &b.header.watchdog_signals {
+                let key = (s.epoch_id, s.epoch_t);
+                if recorded.contains(&key)
+                    || !seen.insert(key)
+                    || !self.validate_watchdog_signal(&chain.blocks, s)
+                {
+                    return false;
+                }
+            }
+        }
         if !vset.contains(&b.header.proposer_peer) {
             return false;
         }
@@ -1134,6 +1394,8 @@ impl Node {
         pending_membership: &[MembershipOp],
         pending_suspensions: &[(crate::verdict::SuspendRecord, [u8; 96])],
         audit_pool: &[FirstObservation],
+        verdict_commit_pool: &[VerdictCommit],
+        watchdog_pool: &[WatchdogSignal],
         peers: &PeersMap,
         mixer: &Mixer,
         slashed: &HashSet<[u8; 32]>,
@@ -1154,13 +1416,13 @@ impl Node {
                 r.proposed_views.insert(r.view);
                 if self.equivocate {
                     // Byzantine: double-sign two conflicting blocks for this slot.
-                    let a = self.assemble_block(chain, r, pending, pending_membership, pending_suspensions, audit_pool, false);
-                    let b = self.assemble_block(chain, r, pending, pending_membership, pending_suspensions, audit_pool, true);
+                    let a = self.assemble_block(chain, r, pending, pending_membership, pending_suspensions, audit_pool, verdict_commit_pool, watchdog_pool, false);
+                    let b = self.assemble_block(chain, r, pending, pending_membership, pending_suspensions, audit_pool, verdict_commit_pool, watchdog_pool, true);
                     debug!(height = r.height, view = r.view, "EQUIVOCATING (double-signing the slot)");
                     mixer.publish(peers, r.beacon_t, Message::Proposal(a));
                     mixer.publish(peers, r.beacon_t, Message::Proposal(b));
                 } else {
-                    let block = self.assemble_block(chain, r, pending, pending_membership, pending_suspensions, audit_pool, false);
+                    let block = self.assemble_block(chain, r, pending, pending_membership, pending_suspensions, audit_pool, verdict_commit_pool, watchdog_pool, false);
                     let bid = block_id(&block.header, &block.txs);
                     debug!(height = r.height, view = r.view, txs = block.txs.len(), "proposing as VRF leader");
                     r.blocks.insert(bid, block.clone());
@@ -1234,6 +1496,8 @@ impl Node {
         pending_suspensions: &mut Vec<(crate::verdict::SuspendRecord, [u8; 96])>,
         verdict_partials: &mut HashMap<u64, HashMap<u64, [u8; 96]>>,
         audit_pool: &mut Vec<FirstObservation>,
+        verdict_commit_pool: &mut Vec<VerdictCommit>,
+        watchdog_pool: &mut Vec<WatchdogSignal>,
         peers: &PeersMap,
         mixer: &Mixer,
         slashed: &mut HashSet<[u8; 32]>,
@@ -1300,6 +1564,35 @@ impl Node {
                     return;
                 }
                 audit_pool.push(rep);
+            }
+            Message::VerdictCommit(c) => {
+                // A public verdict-commit pre-commitment: pool it (for the next leader to record) if its
+                // signature verifies and it is not already recorded or pooled, then re-gossip once so it
+                // reaches the full mesh. Bounded (dedup by member/target/hash), so the relay is one hop
+                // per node — the §4.9.6 ordering means this is visible before any decrypt.
+                let key = (c.member, c.target_epoch_id, c.commit_hash);
+                if self.recorded_commit_keys(&chain.blocks).contains(&key)
+                    || verdict_commit_pool.iter().any(|x| (x.member, x.target_epoch_id, x.commit_hash) == key)
+                    || !c.verify()
+                {
+                    return;
+                }
+                verdict_commit_pool.push(c.clone());
+                mixer.publish(peers, beacon_hint, Message::VerdictCommit(c));
+            }
+            Message::Watchdog(s) => {
+                // A watchdog alarm: pool it (dedup by signer/round) only if it re-validates against the
+                // on-chain burst (a true anomaly, registered signer), then re-gossip once. Low volume
+                // (one per watchdog node), so the single relay aids propagation without starving votes.
+                let key = (s.epoch_id, s.epoch_t);
+                if self.recorded_watchdog_keys(&chain.blocks).contains(&key)
+                    || watchdog_pool.iter().any(|x| (x.epoch_id, x.epoch_t) == key)
+                    || !self.validate_watchdog_signal(&chain.blocks, &s)
+                {
+                    return;
+                }
+                watchdog_pool.push(s.clone());
+                mixer.publish(peers, beacon_hint, Message::Watchdog(s));
             }
             Message::Membership(op) => {
                 // Pool self-authorized membership ops for the next leader to record on-chain, and
@@ -1529,6 +1822,13 @@ impl Node {
         // and the pool of first-observation reports awaiting inclusion by the next leader.
         let mut audited: HashSet<u64> = HashSet::new();
         let mut audit_pool: Vec<FirstObservation> = Vec::new();
+        // Autonomous oversight state: targets a rogue node has already committed against (emit-once), the
+        // pool of public verdict-commits awaiting inclusion, whether this watchdog has raised its signal
+        // (raise-once), and the pool of watchdog signals awaiting inclusion.
+        let mut rogue_committed: HashSet<u64> = HashSet::new();
+        let mut verdict_commit_pool: Vec<VerdictCommit> = Vec::new();
+        let mut watchdog_raised = false;
+        let mut watchdog_pool: Vec<WatchdogSignal> = Vec::new();
         let mut epoch_ids: Vec<(u64, u64)> = Vec::new();
         let mut beacons: Vec<(u64, u64)> = Vec::new();
         let mut split_ok = true;
@@ -1597,6 +1897,12 @@ impl Node {
                     // Drop audit reports a finalized block has now recorded (self-healing).
                     let recorded_audit = self.recorded_audit_keys(&chain.blocks);
                     audit_pool.retain(|r| !recorded_audit.contains(&(r.observer, r.subject_epoch_id)));
+                    // Drop verdict-commits / watchdog signals a finalized block has now recorded.
+                    let recorded_commits = self.recorded_commit_keys(&chain.blocks);
+                    verdict_commit_pool
+                        .retain(|c| !recorded_commits.contains(&(c.member, c.target_epoch_id, c.commit_hash)));
+                    let recorded_wd = self.recorded_watchdog_keys(&chain.blocks);
+                    watchdog_pool.retain(|s| !recorded_wd.contains(&(s.epoch_id, s.epoch_t)));
                     // Learn the dial addresses of all current members so the dial task can reach a
                     // newly-admitted validator.
                     {
@@ -1616,12 +1922,15 @@ impl Node {
                     self.drive_verdicts(&chain, &peers, &mixer, beacon_hint, &mut emitted_partials, &mut verdict_partials, &mut pending_suspensions);
                     // Autonomous audit-observer driver (no-op unless this node is an audit authority).
                     self.drive_audit(&chain, &peers, &mixer, beacon_hint, &mut audited, &mut audit_pool);
+                    // Rogue-commit burst (no-op unless rogue) and watchdog driver (no-op unless authority).
+                    self.drive_rogue_commits(&chain, &peers, &mixer, beacon_hint, &mut rogue_committed, &mut verdict_commit_pool);
+                    self.drive_watchdog(&chain, &peers, &mixer, beacon_hint, &mut watchdog_raised, &mut watchdog_pool);
                     if let Some(r) = round.as_mut() {
-                        self.on_tick(r, &mut chain, &pending, &pending_membership, &pending_suspensions, &audit_pool, &peers, &mixer, &slashed);
+                        self.on_tick(r, &mut chain, &pending, &pending_membership, &pending_suspensions, &audit_pool, &verdict_commit_pool, &watchdog_pool, &peers, &mixer, &slashed);
                     }
                 }
                 Some(msg) = inbox_rx.recv() => {
-                    self.on_msg(msg, round.as_mut(), &mut chain, &mut pending, &mut pending_membership, &mut pending_suspensions, &mut verdict_partials, &mut audit_pool, &peers, &mixer, &mut slashed);
+                    self.on_msg(msg, round.as_mut(), &mut chain, &mut pending, &mut pending_membership, &mut pending_suspensions, &mut verdict_partials, &mut audit_pool, &mut verdict_commit_pool, &mut watchdog_pool, &peers, &mixer, &mut slashed);
                 }
             }
         }
@@ -1639,7 +1948,12 @@ impl Node {
         let flagged_cohort = self.flagged_cohort(&chain.blocks);
         let audit_reports_recorded =
             chain.blocks.iter().map(|b| b.header.audit_reports.len()).sum::<usize>();
-        info!(peer = %hex::encode(&my_id[..4]), blocks = chain.blocks.len(), head = %hex::encode(&chain.head_hash()[..4]), all_qc_valid, max_view, slashed = slashed_vec.len(), active = final_active.len(), suspended = suspended_targets.len(), flagged = flagged_cohort.len(), audit_reports = audit_reports_recorded, "node done");
+        let oversight_triggered = self.oversight_triggered(&chain.blocks);
+        let watchdog_signals_recorded =
+            chain.blocks.iter().map(|b| b.header.watchdog_signals.len()).sum::<usize>();
+        let verdict_commits_recorded =
+            chain.blocks.iter().map(|b| b.header.verdict_commits.len()).sum::<usize>();
+        info!(peer = %hex::encode(&my_id[..4]), blocks = chain.blocks.len(), head = %hex::encode(&chain.head_hash()[..4]), all_qc_valid, max_view, slashed = slashed_vec.len(), active = final_active.len(), suspended = suspended_targets.len(), flagged = flagged_cohort.len(), audit_reports = audit_reports_recorded, oversight = oversight_triggered, wd_signals = watchdog_signals_recorded, commits = verdict_commits_recorded, "node done");
         NodeOutcome {
             peer_id: my_id,
             head_hash: chain.head_hash(),
@@ -1654,6 +1968,9 @@ impl Node {
             suspended_targets,
             flagged_cohort,
             audit_reports_recorded,
+            oversight_triggered,
+            watchdog_signals_recorded,
+            verdict_commits_recorded,
         }
     }
 }
@@ -1768,6 +2085,19 @@ mod tests {
             preout: [0u8; 32],
             proof: Vec::new(),
             lottery: [0u8; 32],
+            sig: Vec::new(),
+        })));
+        assert!(Mixer::is_routable(&Message::VerdictCommit(crate::verdict::VerdictCommit {
+            member: [0u8; 32],
+            target_epoch_id: 0,
+            commit_hash: [0u8; 32],
+            sig: Vec::new(),
+        })));
+        assert!(Mixer::is_routable(&Message::Watchdog(crate::watchdog::WatchdogSignal {
+            epoch_id: [0u8; 32],
+            epoch_t: 0,
+            observed_commits: 0,
+            expected_rate_milli: 0,
             sig: Vec::new(),
         })));
         assert!(!Mixer::is_routable(&Message::Hello {
