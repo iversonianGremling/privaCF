@@ -37,6 +37,7 @@ pub mod vdf;
 pub mod verdict;
 pub mod verenc;
 pub mod vrf;
+pub mod watchdog;
 pub mod zkstmt;
 
 #[cfg(test)]
