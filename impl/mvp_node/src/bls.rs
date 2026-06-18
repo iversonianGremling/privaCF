@@ -22,8 +22,14 @@ pub fn keypair_from_ikm(ikm: &[u8]) -> ([u8; 32], [u8; 48]) {
 
 /// Sign `msg` with a secret key (bytes) → compressed signature.
 pub fn sign(sk_bytes: &[u8; 32], msg: &[u8]) -> [u8; 96] {
+    sign_dst(sk_bytes, msg, DST)
+}
+
+/// Sign `msg` under an explicit domain-separation tag — used by the verdict threshold signature,
+/// which must sign with `verenc::VERENC_DST` so the combined signature unlocks `d_T`.
+pub fn sign_dst(sk_bytes: &[u8; 32], msg: &[u8], dst: &[u8]) -> [u8; 96] {
     let sk = SecretKey::from_bytes(sk_bytes).expect("valid sk bytes");
-    sk.sign(msg, DST, &[]).to_bytes()
+    sk.sign(msg, dst, &[]).to_bytes()
 }
 
 /// Verify a single signature against a public key (both as bytes).

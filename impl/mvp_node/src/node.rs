@@ -24,8 +24,9 @@ use crate::chain::{
     block_id, proposal_sig_bytes, qc_valid, Block, BlockHeader, Chain, EquivocationProof,
     QuorumCert, Vote, VoteEquivocationProof,
 };
-use crate::commit::{CommitT, StubVerEnc, VerEnc};
+use crate::commit::{CommitT, NativeGroupVerEnc, StubVerEnc, VerEnc};
 use crate::consensus::{leader_for, quorum};
+use crate::dkg;
 use crate::epoch::EpochTransaction;
 use crate::field::{add_mod, from_u64, random_field, sub_mod, to_u64};
 use crate::identity::{verify as verify_ed25519, NodeIdentity};
@@ -223,10 +224,42 @@ struct Round {
     view_deadline: Instant,                            // when to advance to the next view
 }
 
+/// This validator's share of the genesis DKG threshold key `VA_pub` — a presupposed-good-genesis
+/// artifact. `va_pub` seals `s₂` (`NativeGroupVerEnc`); `share`/`index`/`threshold` let it
+/// threshold-sign verdicts so any `threshold` validators reconstruct `σ_VERDICT` (P1.4).
+#[derive(Clone)]
+pub struct ThresholdKey {
+    pub va_pub: [u8; 48],
+    pub share: [u8; 32],
+    pub index: u64, // 1-based party index in the sorted validator order
+    pub threshold: usize,
+}
+
+/// Run the genesis DKG over `idents` and assign each its `ThresholdKey` — the trusted genesis
+/// ceremony (presupposed-good-genesis). Used by the demo/tests to provision the validator set.
+pub fn genesis_threshold_keys(
+    idents: &[NodeIdentity],
+    threshold: usize,
+) -> HashMap<[u8; 32], ThresholdKey> {
+    let mut parties: Vec<([u8; 32], Vec<u8>)> =
+        idents.iter().map(|id| (id.peer_id(), id.dkg_ikm().to_vec())).collect();
+    parties.sort_by_key(|(p, _)| *p);
+    let (va_pub, shares) = dkg::genesis_keys(threshold, &parties);
+    parties
+        .iter()
+        .enumerate()
+        .map(|(idx, (pid, _))| {
+            (*pid, ThresholdKey { va_pub, share: shares[pid], index: idx as u64 + 1, threshold })
+        })
+        .collect()
+}
+
 pub struct Node {
     identity: Arc<NodeIdentity>,
     config: NodeConfig,
-    verenc: StubVerEnc,
+    verenc: Box<dyn VerEnc>,
+    /// This validator's genesis threshold-key share (`None` ⇒ no real sealing; `StubVerEnc`).
+    threshold_key: Option<ThresholdKey>,
     /// The genesis validator records — the base the active set is folded forward from.
     genesis: Vec<ValidatorRecord>,
     /// Test fault injection: participate in VRF + voting but never propose when elected leader,
@@ -266,7 +299,8 @@ impl Node {
         Self {
             identity: Arc::new(identity),
             config,
-            verenc: StubVerEnc,
+            verenc: Box::new(StubVerEnc),
+            threshold_key: None,
             genesis,
             withhold_proposals: false,
             equivocate: false,
@@ -278,6 +312,24 @@ impl Node {
             join_vdf: std::sync::OnceLock::new(),
             beacon_vdf: None,
         }
+    }
+
+    /// Builder: provision this validator with its genesis DKG threshold-key share. Switches sealing to
+    /// the real `NativeGroupVerEnc` (so `s₂` is encrypted to `VA_pub`) and enables verdict
+    /// threshold-signing (P1.4). Without it the node uses `StubVerEnc`.
+    pub fn with_threshold_key(mut self, tk: ThresholdKey) -> Self {
+        self.verenc = Box::new(NativeGroupVerEnc { va_pub: tk.va_pub });
+        self.threshold_key = Some(tk);
+        self
+    }
+
+    /// This validator's verdict threshold signature on `verdict_id(epoch_id)` — its partial of
+    /// `σ_VERDICT`. `(index, partial)` combine via `dkg::combine_signatures` once `threshold` of them
+    /// exist. `None` if this node holds no threshold-key share.
+    pub fn verdict_partial(&self, epoch_id: u64) -> Option<(u64, [u8; 96])> {
+        let tk = self.threshold_key.as_ref()?;
+        let id = crate::verenc::verdict_id(epoch_id);
+        Some((tk.index, crate::bls::sign_dst(&tk.share, &id, crate::verenc::VERENC_DST)))
     }
 
     /// Builder: gate joins behind an admission VDF proof-of-work (`VdfAdmission`). The parameters must

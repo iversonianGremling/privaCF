@@ -376,6 +376,32 @@ mod tests {
     }
 
     #[test]
+    fn the_dkg_threshold_signature_unlocks_a_sealed_share() {
+        use crate::{bls, dkg};
+        // Genesis DKG among 5 validators (threshold 3); VA_pub seals, t shares unlock.
+        let (t, n) = (3usize, 5usize);
+        let parties: Vec<([u8; 32], Vec<u8>)> = (0..n as u8)
+            .map(|i| ([i; 32], format!("validator-{i}").into_bytes()))
+            .collect();
+        let (va_pub, shares) = dkg::genesis_keys(t, &parties);
+
+        let id = verdict_id(0xABCD_1234);
+        let s2 = 0x0102_0304_0506_0708u64;
+        let ct = encrypt(&va_pub, &id, s2).expect("encrypt under VA_pub");
+
+        // Any t validators threshold-sign verdict_id (with VERENC_DST); combine → σ_VERDICT.
+        let partials: Vec<(u64, [u8; 96])> = parties
+            .iter()
+            .enumerate()
+            .take(t)
+            .map(|(idx, (pid, _))| (idx as u64 + 1, bls::sign_dst(&shares[pid], &id, VERENC_DST)))
+            .collect();
+        let sigma = dkg::combine_signatures(&partials).expect("combine verdict signature");
+
+        assert_eq!(decrypt(&ct, &sigma, &id), Some(s2), "the DKG threshold verdict sig unlocks s₂");
+    }
+
+    #[test]
     fn ciphertext_round_trips_through_bytes() {
         let (x, va_pub) = group_keypair(b"v");
         let id = verdict_id(123);

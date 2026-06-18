@@ -24,6 +24,8 @@
 //! key and a *changing* validator set are in tension — which is exactly why the running consensus
 //! uses the aggregatable multisig, that needs no re-DKG). The two coexist deliberately.
 
+use std::collections::BTreeMap;
+
 use blst::*;
 
 use crate::bls;
@@ -305,6 +307,24 @@ pub fn combine_signatures(partials: &[(u64, [u8; 96])]) -> Option<[u8; 96]> {
         acc = g2_add(&acc, &g2_mul(&point, &lambda));
     }
     Some(g2_compress(&acc))
+}
+
+/// Run the genesis DKG among `parties` (each `(peer_id, ikm)`, **sorted by peer_id** so the 1-based
+/// party index is consistent network-wide) and return `(VA_pub, peer_id → secret-key share)`. Every
+/// party deals, shares are verified and summed, and `VA_pub` is the sum of constant-term commitments.
+/// This is the trusted genesis ceremony's output — a presupposed-good-genesis artifact distributed to
+/// the validators (`VA_pub` public for sealing, each share private for verdict threshold-signing).
+pub fn genesis_keys(threshold: usize, parties: &[([u8; 32], Vec<u8>)]) -> ([u8; 48], BTreeMap<[u8; 32], [u8; 32]>) {
+    let n = parties.len();
+    let dealings: Vec<Dealing> = parties.iter().map(|(_, ikm)| deal(threshold, n, ikm)).collect();
+    let mut shares = BTreeMap::new();
+    for (j, (pid, _)) in parties.iter().enumerate() {
+        let mine: Vec<[u8; 32]> = dealings.iter().map(|d| d.shares[j]).collect();
+        shares.insert(*pid, combine_shares(&mine));
+    }
+    let constants: Vec<[u8; 48]> = dealings.iter().map(|d| d.commitments[0]).collect();
+    let va_pub = group_public_key(&constants).expect("group key");
+    (va_pub, shares)
 }
 
 #[cfg(test)]

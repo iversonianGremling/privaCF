@@ -31,6 +31,8 @@ pub struct NodeIdentity {
     mix_sk: [u8; 32],
     /// Ristretto Sphinx mix public key (advertised in the mix directory, `loopix.rs`).
     mix_pk: [u8; 32],
+    /// Key material this validator deals into the genesis DKG threshold key (`dkg.rs`); secret.
+    dkg_ikm: [u8; 32],
 }
 
 impl NodeIdentity {
@@ -49,12 +51,19 @@ impl NodeIdentity {
         let mut mix_ikm = [0u8; 32];
         rng.fill_bytes(&mut mix_ikm);
         let (mix_sk, mix_pk) = derive_mix_keypair(&mix_ikm);
-        Self { signing, verifying, sk, null_v, bls_sk, bls_pk, vrf_seed, vrf_pk, mix_sk, mix_pk }
+        let mut dkg_ikm = [0u8; 32];
+        rng.fill_bytes(&mut dkg_ikm);
+        Self { signing, verifying, sk, null_v, bls_sk, bls_pk, vrf_seed, vrf_pk, mix_sk, mix_pk, dkg_ikm }
     }
 
     /// The Ristretto Sphinx mix public key (advertised in the genesis mix directory).
     pub fn mix_pk(&self) -> [u8; 32] {
         self.mix_pk
+    }
+
+    /// This validator's genesis-DKG dealing key material (secret; the genesis ceremony's input).
+    pub fn dkg_ikm(&self) -> [u8; 32] {
+        self.dkg_ikm
     }
 
     /// The Ristretto Sphinx mix secret-key bytes (used to peel inbound mix packets).

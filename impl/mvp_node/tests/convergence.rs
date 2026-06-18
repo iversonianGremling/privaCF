@@ -7,7 +7,9 @@ use std::collections::HashSet;
 use mvp_node::beacon::{next_beacon, GENESIS_BEACON, GENESIS_VRF_OUTPUT};
 use mvp_node::identity::NodeIdentity;
 use mvp_node::loopix::{MixDirectory, MixEntry};
-use mvp_node::node::{genesis_validator_set, MixSettings, Node, NodeConfig};
+use mvp_node::node::{
+    genesis_threshold_keys, genesis_validator_set, MixSettings, Node, NodeConfig,
+};
 use mvp_node::vrf::VrfClaim;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -579,4 +581,48 @@ async fn vdf_beacon_keeps_the_network_converging() {
     // The beacon still rotates each height (the VDF fold did not collapse it to a constant).
     let distinct: HashSet<u64> = beacons0.iter().map(|(_, b)| *b).collect();
     assert_eq!(distinct.len(), beacons0.len(), "VDF-folded beacons stay per-height distinct");
+}
+
+/// Real sealing in the loop: a network provisioned with the genesis DKG threshold key seals s₂ into a
+/// real VerEnc ciphertext (NativeGroupVerEnc) every epoch and must still converge with valid QCs and
+/// a correct publish-s₁ split — proving the real encryption runs per-epoch without disturbing
+/// consensus. (Recovering the sealed s₂ end-to-end is the P1.5 dark-node-extraction capstone.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nodes_converge_while_sealing_s2_under_the_genesis_threshold_key() {
+    let nodes = 4u64;
+    let epochs = 4u64;
+    let base_port = 10400u16;
+    let window_ms = 250u64;
+
+    // The trusted genesis ceremony: a 3-of-4 DKG threshold key, each node assigned its share.
+    let idents: Vec<NodeIdentity> = (0..nodes).map(NodeIdentity::from_seed).collect();
+    let tks = genesis_threshold_keys(&idents, 3);
+
+    let validators = genesis_validator_set(nodes, base_port);
+    let mut handles = Vec::new();
+    for i in 0..nodes {
+        let cfg = NodeConfig {
+            listen_addr: format!("127.0.0.1:{}", base_port + i as u16),
+            genesis_validators: validators.clone(),
+            window_ms,
+            max_height: epochs,
+            grace_ms: window_ms * 10,
+        };
+        let id = NodeIdentity::from_seed(i);
+        let tk = tks[&id.peer_id()].clone();
+        handles.push(tokio::spawn(Node::new(id, cfg).with_threshold_key(tk).run()));
+    }
+
+    let mut outs = Vec::new();
+    for h in handles {
+        outs.push(h.await.expect("node task panicked"));
+    }
+
+    let head0 = outs[0].head_hash;
+    for o in &outs {
+        assert_eq!(o.head_hash, head0, "node {} diverged with real sealing", hex::encode(&o.peer_id[..4]));
+        assert_eq!(o.blocks_len as u64, epochs + 1, "every height finalized");
+        assert!(o.all_qc_valid, "every block's QC valid");
+        assert!(o.split_ok, "publish-s1 split held while sealing real d_T");
+    }
 }
