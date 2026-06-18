@@ -236,21 +236,37 @@ pub struct Dealing {
     pub shares: Vec<[u8; 32]>,
 }
 
-/// Deal a degree-`threshold-1` polynomial for an `n`-party group from key material `ikm`.
-pub fn deal(threshold: usize, n: usize, ikm: &[u8]) -> Dealing {
-    assert!(threshold >= 1 && threshold <= n, "need 1 <= threshold <= n");
+/// Build a dealing (commitments + per-party shares) from explicit polynomial coefficients.
+fn deal_coeffs(coeffs: &[blst_fr], n: usize) -> Dealing {
     let g = g1_generator();
-    let coeffs: Vec<blst_fr> = (0..threshold)
+    let commitments = coeffs.iter().map(|a| g1_compress(&g1_mul(&g, a))).collect();
+    let shares = (1..=n as u64).map(|j| fr_to_be(&poly_eval(coeffs, &fr_from_u64(j)))).collect();
+    Dealing { commitments, shares }
+}
+
+fn random_coeffs(threshold: usize, ikm: &[u8]) -> Vec<blst_fr> {
+    (0..threshold)
         .map(|k| {
             let mut m = ikm.to_vec();
             m.extend_from_slice(b"dkg-coeff");
             m.extend_from_slice(&(k as u64).to_le_bytes());
             fr_random(&m)
         })
-        .collect();
-    let commitments = coeffs.iter().map(|a| g1_compress(&g1_mul(&g, a))).collect();
-    let shares = (1..=n as u64).map(|j| fr_to_be(&poly_eval(&coeffs, &fr_from_u64(j)))).collect();
-    Dealing { commitments, shares }
+        .collect()
+}
+
+/// Deal a degree-`threshold-1` polynomial for an `n`-party group from key material `ikm`.
+pub fn deal(threshold: usize, n: usize, ikm: &[u8]) -> Dealing {
+    assert!(threshold >= 1 && threshold <= n, "need 1 <= threshold <= n");
+    deal_coeffs(&random_coeffs(threshold, ikm), n)
+}
+
+/// Deal a polynomial whose constant term is a FIXED `secret` (the rest random). Used by proactive
+/// re-sharing, where each old shareholder re-shares its own share `x_i = f(0)`.
+fn deal_with_secret(threshold: usize, n: usize, secret: &[u8; 32], ikm: &[u8]) -> Dealing {
+    let mut coeffs = random_coeffs(threshold, ikm);
+    coeffs[0] = fr_from_be(secret); // constant term = the secret to re-share
+    deal_coeffs(&coeffs, n)
 }
 
 /// Verify a received share `s = f_i(j)` against dealer `i`'s commitments: `s·G1 == Σ_k j^k·C_{i,k}`.
@@ -327,6 +343,44 @@ pub fn genesis_keys(threshold: usize, parties: &[([u8; 32], Vec<u8>)]) -> ([u8; 
     (va_pub, shares)
 }
 
+/// **Proactive re-share** (PSS) — refresh the threshold shares to a NEW validator set while keeping
+/// the SAME secret (so `VA_pub` is unchanged): a quorum of old shareholders `qualified`
+/// (`(old_index, share)`, ≥ `threshold` of them) each re-shares its own share `x_i = f(0)` to the
+/// new parties; new party `k` (1-based by sorted order) gets `x'_k = Σ_i λ_i·g_i(k)`, where `λ_i` is
+/// the Lagrange coefficient reconstructing the secret from the qualified set, so
+/// `x'(0) = Σ_i λ_i·x_i = x`. This is the rotation step P1.3 deferred — the threshold key survives a
+/// changing validator set without a fresh genesis DKG (`VA_pub` constant).
+pub fn reshare(
+    threshold: usize,
+    qualified: &[(u64, [u8; 32])],
+    new_parties: &[([u8; 32], Vec<u8>)],
+) -> BTreeMap<[u8; 32], [u8; 32]> {
+    let n_new = new_parties.len();
+    let old_indices: Vec<u64> = qualified.iter().map(|(i, _)| *i).collect();
+    // Each qualified old member re-shares its share to the new set (constant term = its share).
+    let subdeals: Vec<(u64, Dealing)> = qualified
+        .iter()
+        .map(|(idx, share)| {
+            let mut ikm = b"privacf-reshare".to_vec();
+            ikm.extend_from_slice(&idx.to_le_bytes());
+            for (pid, _) in new_parties {
+                ikm.extend_from_slice(pid);
+            }
+            (*idx, deal_with_secret(threshold, n_new, share, &ikm))
+        })
+        .collect();
+    let mut out = BTreeMap::new();
+    for (k, (pid, _)) in new_parties.iter().enumerate() {
+        let mut acc = blst_fr::default(); // 0
+        for (idx, dealing) in &subdeals {
+            let lambda = lagrange_at_zero(*idx, &old_indices);
+            acc = fr_add(&acc, &fr_mul(&lambda, &fr_from_be(&dealing.shares[k])));
+        }
+        out.insert(*pid, fr_to_be(&acc));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,5 +453,38 @@ mod tests {
         let mut tampered = d.shares[1];
         tampered[0] ^= 0x01;
         assert!(!verify_share(2, &tampered, &d.commitments), "a tampered share is rejected");
+    }
+
+    #[test]
+    fn reshare_rotates_the_committee_preserving_va_pub() {
+        use crate::bls;
+        // Old set: a 3-of-4 genesis key.
+        let mut old: Vec<([u8; 32], Vec<u8>)> =
+            (0..4u8).map(|i| ([i; 32], format!("old-{i}").into_bytes())).collect();
+        old.sort_by_key(|(p, _)| *p);
+        let (va_pub, old_shares) = genesis_keys(3, &old);
+
+        // A quorum of 3 old shareholders re-shares (1-based index = sorted position).
+        let qualified: Vec<(u64, [u8; 32])> =
+            old.iter().enumerate().take(3).map(|(i, (pid, _))| (i as u64 + 1, old_shares[pid])).collect();
+
+        // New set: 5 DIFFERENT validators. The secret/VA_pub must survive the rotation.
+        let mut newp: Vec<([u8; 32], Vec<u8>)> =
+            (10..15u8).map(|i| ([i; 32], format!("new-{i}").into_bytes())).collect();
+        newp.sort_by_key(|(p, _)| *p);
+        let new_shares = reshare(3, &qualified, &newp);
+
+        let msg = b"after-rotation";
+        let sign_subset = |range: std::ops::Range<usize>| -> [u8; 96] {
+            let partials: Vec<(u64, [u8; 96])> = newp[range.clone()]
+                .iter()
+                .enumerate()
+                .map(|(off, (pid, _))| (range.start as u64 + off as u64 + 1, sign_share(&new_shares[pid], msg)))
+                .collect();
+            combine_signatures(&partials).expect("combine")
+        };
+        // The re-shared NEW committee signs under the UNCHANGED VA_pub — two different 3-subsets.
+        assert!(bls::verify(&va_pub, msg, &sign_subset(0..3)), "new committee signs under the same VA_pub");
+        assert!(bls::verify(&va_pub, msg, &sign_subset(2..5)), "a different new 3-subset also verifies");
     }
 }

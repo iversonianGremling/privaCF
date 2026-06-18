@@ -170,9 +170,14 @@ still does NOT demonstrate Sybil cost, or any sealing/verdict/ZK property.
   **structural influence bound** `I_struct` (proven floor: per-node cap × hop attenuation, gated below
   the reputation band ρ, capped by the cohort ceiling).
 
-Remaining Phase 2: the **arbitration committee** (Shamir custody of node state + ZK handoff proof +
-slashing) and **re-DKG on validator rotation** (proactive re-share, the hard piece deferred from
-P1.3); watchdog / recursive oversight; rewind.
+- **Re-DKG on rotation** (`dkg::reshare`, §4.1): **proactive secret re-sharing (PSS)** — a quorum of
+  old shareholders re-shares to a *new* validator set, refreshing the shares while keeping the SAME
+  secret, so **`VA_pub` is unchanged** across the rotation (the hard piece deferred from P1.3). The
+  re-shared committee threshold-signs under the unchanged key. Tested with disjoint old/new sets.
+
+Remaining Phase 2: the **arbitration committee** orchestration around the re-share (Shamir custody of
+node state + the ZK handoff/re-encryption proof + slashing for non-completion); watchdog / recursive
+oversight; rewind.
 
 ## What to make real next
 
