@@ -159,6 +159,21 @@ chain-seeded paths/delays and cover traffic (the who-talks-to-whom hiding the ro
 fragmented proposals/finalized blocks** route through the mixnet and the network still converges). It
 still does NOT demonstrate Sybil cost, or any sealing/verdict/ZK property.
 
+## Phase 2 — reputation & Sybil resistance (in progress)
+
+- **Reputation** (`reputation.rs`, §6.1/§7.2): per-epoch score `q_v(T)` in discrete bands 1–4 with the
+  **asymmetric penalty** — climb `+Δ_rise` when active, a hard cliff to `BAND_1` on a detected
+  violation, universal `−δ_decay` slow decay; quiet absence costs only the decay (the faithful
+  reading, ported from `temporal.py`).
+- **Detection** (`detection.rs`, §7/§P5): **FoolsGold** soft trust weights (a mutually-similar
+  coordinated Sybil group is damped ≈0, diverse honest nodes ≈1) ported from `attack.py`, plus the
+  **structural influence bound** `I_struct` (proven floor: per-node cap × hop attenuation, gated below
+  the reputation band ρ, capped by the cohort ceiling).
+
+Remaining Phase 2: the **arbitration committee** (Shamir custody of node state + ZK handoff proof +
+slashing) and **re-DKG on validator rotation** (proactive re-share, the hard piece deferred from
+P1.3); watchdog / recursive oversight; rewind.
+
 ## What to make real next
 
 Consensus now has a real EC-VRF, a VRF-chained beacon, catches both equivocation faults, and supports
