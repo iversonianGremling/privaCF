@@ -26,6 +26,7 @@ pub mod message;
 pub mod node;
 pub mod pedersen;
 pub mod psi;
+pub mod recommend;
 pub mod reputation;
 pub mod smt;
 pub mod sphinx;

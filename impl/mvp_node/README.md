@@ -179,6 +179,22 @@ Remaining Phase 2: the **arbitration committee** orchestration around the re-sha
 node state + the ZK handoff/re-encryption proof + slashing for non-completion); watchdog / recursive
 oversight; rewind.
 
+## Phase 3 — Layer 5: the actual private recommendation (in progress)
+
+- **Item-CF engine** (`recommend.rs`, §3): the recommendation core ported from the Python PoC `cf.py`
+  — `trust_total` with the **DSybil cap** `c` (a Sybil pushing one item can never exceed `c`), novelty
+  + IDF item-weight boosts that lift long-tail items at ranking time, item–item cosine similarity, and
+  `score(u,i)` with the dislike penalty. `ItemCF::fit` / `score_all` / `top_k`.
+- **Whole-protocol capstone** (`tests/recommendation.rs`): a real recommendation in which a Sybil
+  cohort's influence is **bounded by the full stack** — damped by **FoolsGold** (detection), **capped**
+  by the DSybil `c`, and **excluded** once suspended (the dark-node machinery, P1.5). A user interested
+  in the honest niche is recommended the honest co-liked item, not the Sybil's. This is the end-to-end
+  payoff the substrate exists to enable.
+
+Remaining Phase 3: Statements 1–3 (preference-norm/directional/temporal, bridged via the `C_p`
+commitments), the Laplace-DP obfuscation mode, and wiring `C_p`/`M_v` + obfuscated gossip into the live
+epoch transaction so the recommendation runs over real on-chain substrate gossip.
+
 ## What to make real next
 
 Consensus now has a real EC-VRF, a VRF-chained beacon, catches both equivocation faults, and supports
