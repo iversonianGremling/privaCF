@@ -531,3 +531,52 @@ async fn vdf_admission_admits_a_prover_and_rejects_a_freeloader() {
         assert!(!o.final_active.contains(&bad_peer), "the proofless freeloader must be rejected");
     }
 }
+
+/// VDF-folded beacon: with `with_vdf_beacon` set network-wide, each height's beacon folds a VDF
+/// output over the previous beacon (small delay here for test speed). The network must still converge
+/// on one head with valid QCs, and all nodes must agree on the (still per-height-distinct) beacon
+/// chain — proving the VDF beacon is a pure function of the finalized chain + genesis params.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn vdf_beacon_keeps_the_network_converging() {
+    use mvp_node::vdf;
+    use rand::SeedableRng;
+
+    let nodes = 4u64;
+    let epochs = 4u64;
+    let base_port = 10300u16;
+    let window_ms = 300u64;
+
+    let modulus = vdf::genesis_modulus(256, &mut rand::rngs::StdRng::seed_from_u64(99));
+    let validators = genesis_validator_set(nodes, base_port);
+
+    let mut handles = Vec::new();
+    for i in 0..nodes {
+        let cfg = NodeConfig {
+            listen_addr: format!("127.0.0.1:{}", base_port + i as u16),
+            genesis_validators: validators.clone(),
+            window_ms,
+            max_height: epochs,
+            grace_ms: window_ms * 12,
+        };
+        let node = Node::new(NodeIdentity::from_seed(i), cfg).with_vdf_beacon(modulus.clone(), 300);
+        handles.push(tokio::spawn(node.run()));
+    }
+
+    let mut outs = Vec::new();
+    for h in handles {
+        outs.push(h.await.expect("node task panicked"));
+    }
+
+    let head0 = outs[0].head_hash;
+    let beacons0 = outs[0].beacons.clone();
+    for o in &outs {
+        assert_eq!(o.head_hash, head0, "node {} diverged under the VDF beacon", hex::encode(&o.peer_id[..4]));
+        assert_eq!(o.blocks_len as u64, epochs + 1, "every height finalized");
+        assert!(o.all_qc_valid, "every block's QC valid");
+        assert!(o.split_ok, "publish-s1 split held");
+        assert_eq!(o.beacons, beacons0, "all nodes derive the identical VDF-folded beacon chain");
+    }
+    // The beacon still rotates each height (the VDF fold did not collapse it to a constant).
+    let distinct: HashSet<u64> = beacons0.iter().map(|(_, b)| *b).collect();
+    assert_eq!(distinct.len(), beacons0.len(), "VDF-folded beacons stay per-height distinct");
+}

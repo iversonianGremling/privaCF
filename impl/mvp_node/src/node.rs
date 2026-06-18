@@ -15,8 +15,10 @@ use tokio::sync::mpsc;
 use tokio::time::{interval, Instant};
 use tracing::{debug, info};
 
+use num_bigint::BigUint;
+
 use crate::admission::VdfAdmission;
-use crate::beacon::next_beacon;
+use crate::beacon::{next_beacon, next_beacon_vdf};
 use crate::bls;
 use crate::chain::{
     block_id, proposal_sig_bytes, qc_valid, Block, BlockHeader, Chain, EquivocationProof,
@@ -251,6 +253,9 @@ pub struct Node {
     admission: Option<VdfAdmission>,
     /// Memoised admission VDF proof for our own join — deterministic in our peer_id, computed once.
     join_vdf: std::sync::OnceLock<Vec<u8>>,
+    /// If set `(modulus, delay)`, the per-height beacon folds in a VDF output over the previous
+    /// beacon (genesis-consistent network-wide), removing the residual last-revealer grinding bias.
+    beacon_vdf: Option<(BigUint, u64)>,
 }
 
 impl Node {
@@ -271,6 +276,7 @@ impl Node {
             mix_settings: None,
             admission: None,
             join_vdf: std::sync::OnceLock::new(),
+            beacon_vdf: None,
         }
     }
 
@@ -279,6 +285,29 @@ impl Node {
     pub fn with_vdf_admission(mut self, admission: VdfAdmission) -> Self {
         self.admission = Some(admission);
         self
+    }
+
+    /// Builder: fold a VDF (over the previous beacon, `delay` sequential squarings, modulus `n`) into
+    /// each height's beacon, removing the residual last-revealer bias. Genesis-consistent network-wide.
+    pub fn with_vdf_beacon(mut self, n: BigUint, delay: u64) -> Self {
+        self.beacon_vdf = Some((n, delay));
+        self
+    }
+
+    /// The beacon at `height` given the finalized `head` — VRF-chained, optionally VDF-folded. Both
+    /// the proposer (in `start_round`) and every validator (in `structural_and_vrf_ok`) call this, so
+    /// they derive the identical beacon (a pure function of the finalized chain + genesis params).
+    fn beacon_for(&self, head: &BlockHeader, height: u64) -> u64 {
+        match &self.beacon_vdf {
+            Some((n, delay)) => {
+                let mut seed = head.beacon_t.to_le_bytes().to_vec();
+                seed.extend_from_slice(&height.to_le_bytes());
+                let x = crate::vdf::input_from_bytes(n, &seed);
+                let y = crate::vdf::eval(n, &x, *delay).y;
+                next_beacon_vdf(head.beacon_t, &head.vrf_output, height, &y.to_bytes_be())
+            }
+            None => next_beacon(head.beacon_t, &head.vrf_output, height),
+        }
     }
 
     /// A membership op is admissible iff it is self-signed AND (for a join under `VdfAdmission`) it
@@ -385,7 +414,7 @@ impl Node {
         rng: &mut impl rand::RngCore,
     ) -> Round {
         let head = &chain.head().header;
-        let beacon_t = next_beacon(head.beacon_t, &head.vrf_output, height);
+        let beacon_t = self.beacon_for(head, height);
         beacons.push((height, beacon_t));
         // Active validator set for this height — fixed by the finalized chain below it.
         let vset = self.active_set_at(&chain.blocks, height);
@@ -534,7 +563,7 @@ impl Node {
         if b.header.height != head.height + 1 || b.header.prev_block_hash != chain.head_hash() {
             return false;
         }
-        if b.header.beacon_t != next_beacon(head.beacon_t, &head.vrf_output, b.header.height) {
+        if b.header.beacon_t != self.beacon_for(head, b.header.height) {
             return false;
         }
         // Every membership op the block carries must be self-authorized AND admissible (VDF gate).

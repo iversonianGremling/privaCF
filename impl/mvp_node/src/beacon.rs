@@ -30,9 +30,25 @@ pub const GENESIS_VRF_OUTPUT: [u8; 32] = [0u8; 32];
 /// output of the previous block is folded in as four field-element limbs.
 pub fn next_beacon(prev_beacon: u64, prev_vrf_output: &[u8; 32], height: u64) -> u64 {
     let mut inputs = vec![from_u64(prev_beacon), from_u64(height)];
-    for chunk in prev_vrf_output.chunks_exact(8) {
+    fold_le(&mut inputs, prev_vrf_output);
+    to_u64(poseidon_scalar(&inputs))
+}
+
+/// `beacon_T = Poseidon(beacon_{T-1}, T, fold(vrf_output_{T-1}), fold(H(vdf_output)))` — the VRF-chained
+/// beacon additionally folding a **VDF output** over the previous beacon. The VDF makes the next
+/// beacon uncomputable until its sequential delay elapses, so a last-revealing leader cannot compute
+/// the alternative beacon fast enough to decide whether withholding its block helps it — removing the
+/// residual grinding bias `next_beacon` still has (SPEC §4.1). `vdf_out` is the serialized VDF output.
+pub fn next_beacon_vdf(prev_beacon: u64, prev_vrf_output: &[u8; 32], height: u64, vdf_out: &[u8]) -> u64 {
+    let mut inputs = vec![from_u64(prev_beacon), from_u64(height)];
+    fold_le(&mut inputs, prev_vrf_output);
+    fold_le(&mut inputs, blake3::hash(vdf_out).as_bytes());
+    to_u64(poseidon_scalar(&inputs))
+}
+
+/// Fold a 32-byte value into Poseidon inputs as four little-endian u64 limbs.
+fn fold_le(inputs: &mut Vec<Fp>, bytes: &[u8; 32]) {
+    for chunk in bytes.chunks_exact(8) {
         inputs.push(from_u64(u64::from_le_bytes(chunk.try_into().expect("8-byte chunk"))));
     }
-    let b: Fp = poseidon_scalar(&inputs);
-    to_u64(b)
 }

@@ -142,7 +142,7 @@ distinctness and the publish-`s₁` split.
 | `Admission` — AcceptAll **and** a real `VdfAdmission` (real, opt-in) | AcceptAll by default; opt **`VdfAdmission`** in (`Node::with_vdf_admission`, genesis-consistent) and a join must carry a valid **Wesolowski VDF** proof-of-work over its `peer_id` (`vdf.rs`) — a prover is admitted, a proofless freeloader is rejected, enforced at pooling/assembly/block-validation. The VDF runs over a genesis RSA modulus with **factors discarded** (the good-genesis trusted setup); a fully trustless class-group VDF is the heavier alternative | SPEC §4.3 |
 | `Discovery` — bootstrap + chain-driven address book (partial) → `PsiDiscovery` | peers come from the genesis bootstrap set plus a dynamic address book grown from on-chain joins and peers' `Hello`s; the private set-intersection discovery is deferred | SPEC §5.3/§5.4 |
 | `VerEnc` → `StubVerEnc` / `NativeGroupVerEnc` | `d_T` is a placeholder; `s₂` is **not** sealed | DESIGN-f1, SPEC §4.9.4 |
-| beacon — VRF-chained (real) → +VDF/drand | `beacon_T = Poseidon(beacon_{T-1}, T, fold(vrf_output_{T-1}))` — folds in the prior block's *ungrindable* VRF output, so the leader schedule is no longer computable from genesis; residual last-revealer (withhold-to-regrind) bias remains → VDF/drand for full unbiasability | SPEC §4.1 |
+| beacon — VRF-chained **and** optionally VDF-folded (real) | `beacon_T = Poseidon(beacon_{T-1}, T, fold(vrf_output_{T-1}))` folds in the prior block's *ungrindable* VRF output (no genesis-predictable schedule); with `Node::with_vdf_beacon` (genesis-consistent) it **also folds a Wesolowski VDF output over the previous beacon** (`next_beacon_vdf`), so the next beacon is uncomputable until the VDF's sequential delay elapses — removing the residual last-revealer (withhold-to-regrind) bias. Convergence-tested with the VDF beacon on; the security margin scales with the chosen delay | SPEC §4.1 |
 | SMT roots | zero stubs — no suspensions, no non-membership proofs | SPEC §4.9.2 |
 | ZK proof in the loop | omitted entirely | SPEC §4.9.5 |
 
@@ -165,13 +165,12 @@ is a real **Noise XX** channel (confidential, authenticated, forward-secret); an
 that **already carries the entire BFT exchange** (consensus converges over mix-routed
 VRF/vote/tx/slash messages **and fragmented proposals/finalized blocks**), with a **LIONESS**
 anti-tagging payload, **loop + drop cover traffic**, and live **SURB** anonymous replies — and every
-message except the transport frames now routes through it. The remaining steps each open a larger,
-decision-laden subsystem: a **VDF/drand beacon** (to remove the
-residual last-revealer bias — needs a VDF artifact or an external drand network); a **VDF `Admission`
-gate** (the real Sybil cost replacing AcceptAll joins); and a **DKG threshold key** (`VA_pub`) in place
-of the aggregatable multisig. *(Globally, separate from this node roadmap, the optimized non-native ZK
-**bridge gadget** — see `../spike_bridge_cost/` and `SPIKE-statement5.md` §10 — remains the standing
-P-feasibility item.)*
+message except the transport frames now routes through it. A real **Wesolowski VDF** (`vdf.rs`,
+over a genesis RSA modulus with factors discarded) now backs both an opt-in **VDF admission gate**
+and an opt-in **VDF-folded beacon**. The one remaining node subsystem is a **DKG threshold key**
+(`VA_pub`) in place of the aggregatable multisig. *(Globally, separate from this node roadmap, the
+optimized non-native ZK **bridge gadget** — see `../spike_bridge_cost/` and `SPIKE-statement5.md`
+§10 — remains the standing P-feasibility item.)*
 
 ## Toolchain caveat
 
