@@ -443,6 +443,41 @@ impl Node {
         (crate::smt::Smt::from_keys(&suspended).root(), crate::smt::Smt::from_keys(&decrypted).root())
     }
 
+    /// The set of `null_v`s already suspended somewhere in `blocks` (any height) — used to dedup new
+    /// suspensions so a block never re-records an existing one.
+    fn already_suspended(&self, blocks: &[Block]) -> HashSet<u64> {
+        blocks.iter().flat_map(|b| b.header.suspensions.iter().map(|s| s.null_v)).collect()
+    }
+
+    /// Find the on-chain commitment `(s₁, d_T)` published by the pseudonym `target_epoch_id`.
+    fn commitment_for(&self, blocks: &[Block], target_epoch_id: u64) -> Option<(u64, Vec<u8>)> {
+        blocks
+            .iter()
+            .flat_map(|b| b.txs.iter())
+            .find(|tx| tx.epoch_id == target_epoch_id)
+            .map(|tx| (tx.commit.s1, tx.commit.d_t.clone()))
+    }
+
+    /// Build a [`SuspendRecord`] from a verdict signature: look up the target's on-chain `(s₁, d_T)`,
+    /// extract `null_v = s₁ + s₂` with NO node cooperation, and bind the record to `σ_VERDICT`
+    /// (`verdict_hash = H(σ)`). `None` if the target's commitment is not on-chain or `σ` does not
+    /// decrypt it (the pairing only yields `null_v` under the `VA_pub` that sealed `d_T`).
+    fn make_suspension(&self, blocks: &[Block], target_epoch_id: u64, sigma: &[u8; 96]) -> Option<crate::verdict::SuspendRecord> {
+        let (s1, d_t) = self.commitment_for(blocks, target_epoch_id)?;
+        let null_v = crate::verdict::extract_null_v(s1, &d_t, sigma, target_epoch_id)?;
+        Some(crate::verdict::SuspendRecord { target_epoch_id, null_v, verdict_hash: *blake3::hash(sigma).as_bytes() })
+    }
+
+    /// Independently validate that `record` is a legitimate suspension authorized by `sigma`: the
+    /// `verdict_hash` binds `σ`, and re-extracting from the target's on-chain `(s₁, d_T)` reproduces
+    /// `record.null_v`. Self-contained from public chain data — a successful extraction proves a verdict
+    /// threshold quorum signed `verdict_id(target_epoch_id)` (only such a `σ` decrypts `d_T`), so the
+    /// proposer cannot fabricate a suspension.
+    fn validate_suspension(&self, blocks: &[Block], record: &crate::verdict::SuspendRecord, sigma: &[u8; 96]) -> bool {
+        record.verdict_hash == *blake3::hash(sigma).as_bytes()
+            && self.make_suspension(blocks, record.target_epoch_id, sigma).is_some_and(|r| r.null_v == record.null_v)
+    }
+
     /// Fault-injection builder: this node will never propose (Byzantine leader that withholds its
     /// block), exercising the other validators' view-change path.
     pub fn byzantine_withhold(mut self) -> Self {
@@ -597,12 +632,14 @@ impl Node {
         leader_for(&live, view)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn assemble_block(
         &self,
         chain: &Chain,
         r: &Round,
         pending: &HashMap<(u64, u64), EpochTransaction>,
         pending_membership: &[MembershipOp],
+        pending_suspensions: &[(crate::verdict::SuspendRecord, [u8; 96])],
         alt: bool,
     ) -> Block {
         let prev = chain.head_hash();
@@ -626,14 +663,33 @@ impl Node {
                 ops.push(op.clone());
             }
         }
+        // Include verdict-backed suspensions that re-validate against public chain data and aren't
+        // already recorded — each carried with its σ_VERDICT so every validator re-checks it.
+        let on_chain = self.already_suspended(&chain.blocks);
+        let mut susp_subjects: HashSet<u64> = HashSet::new();
+        let mut suspensions: Vec<crate::verdict::SuspendRecord> = Vec::new();
+        let mut verdict_sigs: Vec<Vec<u8>> = Vec::new();
+        for (record, sigma) in pending_suspensions {
+            if !on_chain.contains(&record.null_v)
+                && susp_subjects.insert(record.null_v)
+                && self.validate_suspension(&chain.blocks, record, sigma)
+            {
+                suspensions.push(record.clone());
+                verdict_sigs.push(sigma.to_vec());
+            }
+        }
         if alt {
             txs.clear(); // a conflicting variant of the same slot -> a different block id
             ops.clear();
+            suspensions.clear();
+            verdict_sigs.clear();
         }
         let mut header = BlockHeader::create(
             &self.identity, r.height, r.view, r.beacon_t, prev, my_epoch_id, &r.my_vrf,
         );
         header.membership_ops = ops;
+        header.suspensions = suspensions;
+        header.verdict_sigs = verdict_sigs;
         let (susp_root, decr_root) = self.smt_roots_at(&chain.blocks, r.height);
         header.susp_smt_root = susp_root;
         header.decryption_smt_root = decr_root;
@@ -681,6 +737,25 @@ impl Node {
         if !b.header.membership_ops.iter().all(|op| self.op_admissible(op)) {
             return false;
         }
+        // Every suspension the block carries must re-validate against public chain data under its
+        // accompanying σ_VERDICT, carry no duplicate or already-recorded null_v, and the two parallel
+        // vectors must align — so no proposer can inject an unauthorized dark-node extraction.
+        if b.header.suspensions.len() != b.header.verdict_sigs.len() {
+            return false;
+        }
+        {
+            let on_chain = self.already_suspended(&chain.blocks);
+            let mut seen: HashSet<u64> = HashSet::new();
+            for (record, sigma) in b.header.suspensions.iter().zip(b.header.verdict_sigs.iter()) {
+                let Ok(sig) = <[u8; 96]>::try_from(sigma.as_slice()) else { return false };
+                if on_chain.contains(&record.null_v)
+                    || !seen.insert(record.null_v)
+                    || !self.validate_suspension(&chain.blocks, record, &sig)
+                {
+                    return false;
+                }
+            }
+        }
         if !vset.contains(&b.header.proposer_peer) {
             return false;
         }
@@ -725,12 +800,14 @@ impl Node {
 
     /// After claim collection: advance the view on leader timeout, the current view's leader
     /// proposes, and everyone votes for that leader's block.
+    #[allow(clippy::too_many_arguments)]
     fn on_tick(
         &self,
         r: &mut Round,
         chain: &mut Chain,
         pending: &HashMap<(u64, u64), EpochTransaction>,
         pending_membership: &[MembershipOp],
+        pending_suspensions: &[(crate::verdict::SuspendRecord, [u8; 96])],
         peers: &PeersMap,
         mixer: &Mixer,
         slashed: &HashSet<[u8; 32]>,
@@ -751,13 +828,13 @@ impl Node {
                 r.proposed_views.insert(r.view);
                 if self.equivocate {
                     // Byzantine: double-sign two conflicting blocks for this slot.
-                    let a = self.assemble_block(chain, r, pending, pending_membership, false);
-                    let b = self.assemble_block(chain, r, pending, pending_membership, true);
+                    let a = self.assemble_block(chain, r, pending, pending_membership, pending_suspensions, false);
+                    let b = self.assemble_block(chain, r, pending, pending_membership, pending_suspensions, true);
                     debug!(height = r.height, view = r.view, "EQUIVOCATING (double-signing the slot)");
                     mixer.publish(peers, r.beacon_t, Message::Proposal(a));
                     mixer.publish(peers, r.beacon_t, Message::Proposal(b));
                 } else {
-                    let block = self.assemble_block(chain, r, pending, pending_membership, false);
+                    let block = self.assemble_block(chain, r, pending, pending_membership, pending_suspensions, false);
                     let bid = block_id(&block.header, &block.txs);
                     debug!(height = r.height, view = r.view, txs = block.txs.len(), "proposing as VRF leader");
                     r.blocks.insert(bid, block.clone());
@@ -828,6 +905,7 @@ impl Node {
         chain: &mut Chain,
         pending: &mut HashMap<(u64, u64), EpochTransaction>,
         pending_membership: &mut Vec<MembershipOp>,
+        pending_suspensions: &mut Vec<(crate::verdict::SuspendRecord, [u8; 96])>,
         peers: &PeersMap,
         mixer: &Mixer,
         slashed: &mut HashSet<[u8; 32]>,
@@ -839,6 +917,21 @@ impl Node {
             Message::Tx(tx) => {
                 if tx.verify_sig() {
                     pending.insert((tx.height, tx.epoch_id), tx);
+                }
+            }
+            Message::Suspension { target_epoch_id, sigma } => {
+                // A verdict-backed dark-node extraction: rebuild the SuspendRecord from public chain
+                // data, validate it under σ_VERDICT, pool it for the next leader (dedup by null_v), and
+                // re-gossip the first time so it reaches the full mesh.
+                let Ok(sig) = <[u8; 96]>::try_from(sigma.as_slice()) else { return };
+                if let Some(record) = self.make_suspension(&chain.blocks, target_epoch_id, &sig) {
+                    if self.validate_suspension(&chain.blocks, &record, &sig)
+                        && !self.already_suspended(&chain.blocks).contains(&record.null_v)
+                        && !pending_suspensions.iter().any(|(r, _)| r.null_v == record.null_v)
+                    {
+                        pending_suspensions.push((record, sig));
+                        mixer.publish(peers, beacon_hint, Message::Suspension { target_epoch_id, sigma });
+                    }
                 }
             }
             Message::Membership(op) => {
@@ -1060,6 +1153,7 @@ impl Node {
         let mut chain = Chain::genesis();
         let mut pending: HashMap<(u64, u64), EpochTransaction> = HashMap::new();
         let mut pending_membership: Vec<MembershipOp> = Vec::new();
+        let mut pending_suspensions: Vec<(crate::verdict::SuspendRecord, [u8; 96])> = Vec::new();
         let mut epoch_ids: Vec<(u64, u64)> = Vec::new();
         let mut beacons: Vec<(u64, u64)> = Vec::new();
         let mut split_ok = true;
@@ -1119,6 +1213,9 @@ impl Node {
                         MembershipOp::Add { record, .. } => !next.contains(&record.peer_id),
                         MembershipOp::Remove { peer_id, .. } => next.contains(peer_id),
                     });
+                    // Drop suspensions already recorded by a finalized block.
+                    let suspended_now = self.already_suspended(&chain.blocks);
+                    pending_suspensions.retain(|(r, _)| !suspended_now.contains(&r.null_v));
                     // Learn the dial addresses of all current members so the dial task can reach a
                     // newly-admitted validator.
                     {
@@ -1133,11 +1230,11 @@ impl Node {
             tokio::select! {
                 _ = ticker.tick() => {
                     if let Some(r) = round.as_mut() {
-                        self.on_tick(r, &mut chain, &pending, &pending_membership, &peers, &mixer, &slashed);
+                        self.on_tick(r, &mut chain, &pending, &pending_membership, &pending_suspensions, &peers, &mixer, &slashed);
                     }
                 }
                 Some(msg) = inbox_rx.recv() => {
-                    self.on_msg(msg, round.as_mut(), &mut chain, &mut pending, &mut pending_membership, &peers, &mixer, &mut slashed);
+                    self.on_msg(msg, round.as_mut(), &mut chain, &mut pending, &mut pending_membership, &mut pending_suspensions, &peers, &mixer, &mut slashed);
                 }
             }
         }
@@ -1266,10 +1363,78 @@ mod tests {
         // Chain-sync and every consensus message route through the mixnet; only the pre-mixnet
         // handshake and the mix packet itself stay direct.
         assert!(Mixer::is_routable(&Message::GetChain { from_height: 0 }));
+        assert!(Mixer::is_routable(&Message::Suspension { target_epoch_id: 0, sigma: Vec::new() }));
         assert!(!Mixer::is_routable(&Message::Hello {
             peer_id: [0u8; 32],
             listen_addr: String::new(),
             binding: Vec::new(),
         }));
+    }
+
+    /// The in-loop suspension path validates a real verdict-backed extraction from public chain data
+    /// and rejects forgeries — the security core of `make_suspension`/`validate_suspension` that
+    /// `assemble_block` and `structural_and_vrf_ok` rely on.
+    #[test]
+    fn verdict_backed_suspension_validates_and_forgeries_are_rejected() {
+        use crate::bls::sign_dst;
+        use crate::commit::{CommitT, NativeGroupVerEnc, VerEnc};
+        use crate::dkg::combine_signatures;
+        use crate::field::{from_u64, random_field, sub_mod, to_u64};
+        use crate::verenc::VERENC_DST;
+
+        // Genesis 3-of-4 threshold key; the target seals s₂ on-chain, then the committee threshold-signs
+        // the verdict (mirrors the dark-node capstone, but here feeding the live block path).
+        let validators: Vec<NodeIdentity> = (0..4).map(NodeIdentity::from_seed).collect();
+        let ids: Vec<[u8; 32]> = validators.iter().map(|v| v.peer_id()).collect();
+        let tks = genesis_threshold_keys(&validators, 3);
+        let va_pub = tks[&ids[0]].va_pub;
+
+        let target = &validators[0];
+        let beacon = from_u64(0xFEED_BEEF);
+        let epoch_id_fp = target.epoch_id(beacon);
+        let epoch_id = to_u64(epoch_id_fp);
+        let mut rng = rand::rngs::OsRng;
+        let s2 = random_field(&mut rng);
+        let s1 = sub_mod(target.null_v, s2);
+        let d_t = NativeGroupVerEnc { va_pub }.encrypt(s2, epoch_id_fp);
+
+        let id = crate::verdict::verdict_id(epoch_id);
+        let partials: Vec<(u64, [u8; 96])> =
+            ids.iter().skip(1).map(|p| (tks[p].index, sign_dst(&tks[p].share, &id, VERENC_DST))).collect();
+        let sigma = combine_signatures(&partials).expect("σ_VERDICT");
+
+        // A chain carrying the target's epoch tx (the public (s₁, d_T) any node extracts from).
+        let mut chain = Chain::genesis();
+        let mut blk = chain.blocks[0].clone();
+        blk.header.height = 1;
+        blk.txs = vec![EpochTransaction::create(target, 1, epoch_id, CommitT { s1: to_u64(s1), d_t })];
+        chain.blocks.push(blk);
+
+        let cfg = NodeConfig {
+            listen_addr: "127.0.0.1:0".into(),
+            genesis_validators: Vec::new(),
+            window_ms: 100,
+            max_height: 1,
+            grace_ms: 0,
+        };
+        let node = Node::new(NodeIdentity::from_seed(9), cfg);
+
+        // The honest extraction reproduces the target's null_v and validates.
+        let rec = node.make_suspension(&chain.blocks, epoch_id, &sigma).expect("extraction succeeds");
+        assert_eq!(rec.null_v, to_u64(target.null_v), "null_v recovered from public chain data");
+        assert!(node.validate_suspension(&chain.blocks, &rec, &sigma), "a real suspension validates");
+
+        // Forged σ: the verdict_hash no longer binds it, and it cannot decrypt to the claimed null_v.
+        let mut forged = sigma;
+        forged[0] ^= 0xff;
+        assert!(!node.validate_suspension(&chain.blocks, &rec, &forged), "a forged σ is rejected");
+
+        // Tampered null_v under the real σ: re-extraction mismatches.
+        let mut lying = rec.clone();
+        lying.null_v ^= 1;
+        assert!(!node.validate_suspension(&chain.blocks, &lying, &sigma), "a tampered null_v is rejected");
+
+        // No on-chain commitment for the target ⇒ nothing to extract.
+        assert!(node.make_suspension(&chain.blocks, epoch_id ^ 0x9999, &sigma).is_none(), "absent target tx ⇒ no suspension");
     }
 }
