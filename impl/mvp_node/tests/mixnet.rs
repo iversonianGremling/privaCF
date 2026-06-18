@@ -132,6 +132,39 @@ async fn a_large_message_fragments_across_packets_and_reassembles_at_the_destina
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_surb_carries_an_anonymous_reply_back_to_its_creator() {
+    let base = 19600u16;
+    let (ids, dir) = network(5, base);
+
+    let mut handles = Vec::new();
+    for (i, id) in ids.iter().enumerate() {
+        let cfg = config(&dir, format!("127.0.0.1:{}", base + i as u16));
+        handles.push(loopix::spawn(id.clone(), cfg).await.expect("spawn mix"));
+    }
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    // Node 0 (A) mints a SURB whose return path leads back to itself, and hands it to node 4 (B).
+    // (Delivering the SURB to B is an ordinary forward message, already covered; here we pass it
+    // directly to focus on the anonymous return journey.)
+    let surb = handles[0].mint_surb(3, 10, 0xA11CE).expect("mint a SURB");
+
+    // B replies through the SURB without ever learning A's identity.
+    handles[4].reply.send((surb, b"anonymous reply to A".to_vec())).expect("send reply");
+
+    // A recovers the reply on its anonymous-replies stream.
+    let got = tokio::time::timeout(Duration::from_secs(3), handles[0].replies.recv())
+        .await
+        .expect("the SURB reply must return to its creator")
+        .expect("replies channel open");
+    assert_eq!(got, b"anonymous reply to A", "A recovers B's reply via the SURB");
+
+    // The reply never appears as ordinary application delivery on any node.
+    for (i, h) in handles.iter_mut().enumerate() {
+        assert!(h.delivered.try_recv().is_err(), "node {i} must not see a SURB reply as a delivery");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn loop_cover_traffic_returns_to_its_sender() {
     let base = 19200u16;
     let (ids, dir) = network(5, base);

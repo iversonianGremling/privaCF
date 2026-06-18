@@ -90,8 +90,11 @@ Companion to `SPEC.md` §4.1 (chain/epochs), §4.2/§4.9.1 (identity derivation)
   when a node genuinely transmits. **SURBs** (single-use reply blocks) let an anonymous sender hand a
   recipient a pre-built return header so it can reply without ever learning the sender's identity:
   the recipient encrypts its reply under a SURB key, the mixes LIONESS-decrypt it like any packet,
-  and only the creator (which kept the per-hop secrets) inverts the chain to read it. (Honest scope:
-  statistical anonymity-set guarantees are a deployment-scale property and out of scope.)
+  and only the creator (which kept the per-hop secrets) inverts the chain to read it. This is **wired
+  into the live `MixNode`** — `mint_surb` builds a chain-selected return block and stores its keys,
+  `reply` sends through one, recovered replies surface on a dedicated stream — tested end-to-end over
+  real Noise. (Honest scope: statistical anonymity-set guarantees are a deployment-scale property and
+  out of scope.)
 - **Consensus routed through the mixnet, blocks included** (`Node::with_mixnet`, `--mix`): the whole
   BFT exchange no longer broadcasts in the clear. With mixing on, every **VRF claim, vote, tx,
   membership/slash, proposal, and finalized block** is wrapped in Sphinx packets and unicast to each

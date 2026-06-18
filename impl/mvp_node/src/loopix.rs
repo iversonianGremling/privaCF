@@ -38,7 +38,7 @@ use tracing::debug;
 
 use crate::identity::NodeIdentity;
 use crate::message::Message;
-use crate::sphinx::{self, Hop, Processed, SphinxPacket};
+use crate::sphinx::{self, recover_reply, Hop, Processed, ReplyKeys, SphinxPacket, Surb};
 use crate::transport::{noise_handshake, read_frame, write_frame};
 
 /// One mix's public record in the genesis directory.
@@ -357,14 +357,44 @@ pub struct MixConfig {
     pub drop_cover_delay_ms: u64,
 }
 
+type SurbStore = Arc<Mutex<HashMap<[u8; 16], ReplyKeys>>>;
+
 /// Handle to a spawned mix node: a stream of *real* payloads delivered to this node, an injector to
-/// send from this node, and counters for observed cover traffic (loop packets that returned to us,
-/// drop packets we received and discarded) — cover never appears on the `delivered` stream.
+/// send from this node, a SURB-reply injector + a stream of recovered anonymous replies, and counters
+/// for observed cover traffic (loop/drop) — cover never appears on the `delivered` stream.
 pub struct MixHandle {
     pub delivered: mpsc::UnboundedReceiver<Vec<u8>>,
     pub inject: mpsc::UnboundedSender<Injection>,
+    /// Send `(surb, payload)` to reply anonymously through a SURB handed to us by its creator.
+    pub reply: mpsc::UnboundedSender<(Surb, Vec<u8>)>,
+    /// Anonymous replies addressed to *us* via SURBs we minted, recovered to plaintext.
+    pub replies: mpsc::UnboundedReceiver<Vec<u8>>,
     pub cover_returned: Arc<AtomicU64>,
     pub cover_dropped: Arc<AtomicU64>,
+    // For minting SURBs (return blocks that route back to us).
+    directory: Arc<MixDirectory>,
+    my_id: [u8; 32],
+    surbs: SurbStore,
+    surb_seq: Arc<AtomicU64>,
+}
+
+impl MixHandle {
+    /// Mint a single-use reply block whose return path (length `hops`, ending at us) is chain-selected
+    /// from `beacon`. Stores the reply keys so an inbound reply can be recovered, and returns the SURB
+    /// to hand (e.g. inside a forward message) to whoever should reply. `None` if no path is available.
+    pub fn mint_surb(&self, hops: usize, mean_delay_ms: u64, beacon: u64) -> Option<Surb> {
+        let nonce = self.surb_seq.fetch_add(1, Ordering::Relaxed);
+        // A return path to self: relays exclude us, the final hop is us.
+        let path = select_full_path(&self.directory, &self.my_id, &self.my_id, hops, beacon, nonce)?;
+        let delays = sample_delays(path.len(), mean_delay_ms, beacon, nonce ^ 0x51);
+        // A non-zero SURB id (id 0 is reserved for ordinary delivery), prefixed by our id.
+        let mut surb_id = [0u8; 16];
+        surb_id[..8].copy_from_slice(&self.my_id[..8]);
+        surb_id[8..].copy_from_slice(&nonce.wrapping_add(1).to_le_bytes());
+        let (surb, keys) = sphinx::create_surb(&path, &delays, surb_id).ok()?;
+        self.surbs.lock().unwrap().insert(surb_id, keys);
+        Some(surb)
+    }
 }
 
 /// Spawn a mix node: bind a listener, dial the larger-id directory peers (one Noise channel per
@@ -379,6 +409,9 @@ pub async fn spawn(identity: Arc<NodeIdentity>, config: MixConfig) -> std::io::R
     let directory = Arc::new(config.directory);
     let cover_returned = Arc::new(AtomicU64::new(0));
     let cover_dropped = Arc::new(AtomicU64::new(0));
+    let surbs: SurbStore = Arc::new(Mutex::new(HashMap::new()));
+    let (replies_tx, replies_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<(Surb, Vec<u8>)>();
 
     let listener = TcpListener::bind(&config.listen_addr).await?;
     // Accept loop (Noise responder).
@@ -424,6 +457,7 @@ pub async fn spawn(identity: Arc<NodeIdentity>, config: MixConfig) -> std::io::R
     {
         let (peers, mix_sk) = (peers.clone(), mix_sk);
         let (cover_returned, cover_dropped) = (cover_returned.clone(), cover_dropped.clone());
+        let (surbs, replies_tx) = (surbs.clone(), replies_tx);
         tokio::spawn(async move {
             let mut reasm = Reassembler::new(256);
             while let Some((_from, msg)) = inbox_rx.recv().await {
@@ -455,8 +489,21 @@ pub async fn spawn(identity: Arc<NodeIdentity>, config: MixConfig) -> std::io::R
                                 send_to(&peers, &next, Message::Sphinx(packet));
                             });
                         }
-                        // SURB replies are not used by this transport-level engine yet.
-                        Ok(Processed::SurbReply { .. }) => debug!("dropping unexpected SURB reply"),
+                        // A SURB reply addressed to us: look up the reply keys we stored when we
+                        // minted the SURB, recover the plaintext, and surface it as an anon reply.
+                        Ok(Processed::SurbReply { surb_id, payload }) => {
+                            let recovered = surbs
+                                .lock()
+                                .unwrap()
+                                .get(&surb_id)
+                                .and_then(|keys| recover_reply(keys, &payload).ok());
+                            match recovered {
+                                Some(msg) => {
+                                    let _ = replies_tx.send(msg);
+                                }
+                                None => debug!("SURB reply for an unknown/!recoverable id, dropping"),
+                            }
+                        }
                         Err(e) => debug!(?e, "dropping un-processable mix packet"),
                     }
                 }
@@ -477,6 +524,26 @@ pub async fn spawn(identity: Arc<NodeIdentity>, config: MixConfig) -> std::io::R
                 msg_seq = msg_seq.wrapping_add(1);
                 for (first, pkt) in route_message(&dir, &my_id, &inj, msg_id) {
                     send_to(&peers, &first, Message::Sphinx(pkt));
+                }
+            }
+        });
+    }
+
+    // Reply task: turn a (SURB, payload) into the reply packet and send it to the SURB's first hop.
+    // The reply payload must fit one packet (SURBs carry a single fixed-size header, not fragments).
+    // The first hop can be *us* (the creator's return path only excludes the creator, not the
+    // replier), in which case we process it locally instead of dialing ourselves.
+    {
+        let peers = peers.clone();
+        let inbox = inbox_tx.clone();
+        tokio::spawn(async move {
+            while let Some((surb, payload)) = reply_rx.recv().await {
+                match sphinx::use_surb(&surb, &payload) {
+                    Ok((first, pkt)) if first == my_id => {
+                        let _ = inbox.send((Some(my_id), Message::Sphinx(pkt)));
+                    }
+                    Ok((first, pkt)) => send_to(&peers, &first, Message::Sphinx(pkt)),
+                    Err(e) => debug!(?e, "could not build a SURB reply (payload too large?)"),
                 }
             }
         });
@@ -540,7 +607,18 @@ pub async fn spawn(identity: Arc<NodeIdentity>, config: MixConfig) -> std::io::R
         });
     }
 
-    Ok(MixHandle { delivered: delivered_rx, inject: inject_tx, cover_returned, cover_dropped })
+    Ok(MixHandle {
+        delivered: delivered_rx,
+        inject: inject_tx,
+        reply: reply_tx,
+        replies: replies_rx,
+        cover_returned,
+        cover_dropped,
+        directory,
+        my_id,
+        surbs,
+        surb_seq: Arc::new(AtomicU64::new(0)),
+    })
 }
 
 /// Fragment an injection's payload and build one chain-routed Sphinx packet per fragment, returning
