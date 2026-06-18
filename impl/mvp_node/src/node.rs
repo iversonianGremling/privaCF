@@ -398,14 +398,22 @@ impl Node {
     }
 
     /// The SUSP_SMT and DECRYPTION_SMT roots in effect AT `height` — a pure function of the finalized
-    /// chain below it (like `active_set_at`), so every node derives identical roots. The suspended
-    /// `null_v`s and `dec_nullifier`s come from finalized SUSPEND verdicts / `null_v` extractions;
-    /// none exist yet (the verdict machinery is increment P1.5), so both trees are currently empty —
-    /// but the roots are real empty-tree Poseidon roots, not zero stubs.
+    /// chain below it (like `active_set_at`), so every node derives identical roots. Suspended
+    /// `null_v`s and their `dec_nullifier`s are folded from the `SuspendRecord`s in finalized blocks
+    /// (dark-node extractions, `verdict.rs`); empty until the first suspension, but a real empty-tree
+    /// root either way.
     fn smt_roots_at(&self, blocks: &[Block], height: u64) -> ([u8; 32], [u8; 32]) {
-        let _ = (blocks, height);
-        let suspended: Vec<u64> = Vec::new(); // P1.5: fold SUSPEND verdicts' null_v
-        let decrypted: Vec<u64> = Vec::new(); // P1.5: fold null_v_decryption dec_nullifiers
+        let cutoff = height.saturating_sub(ACTIVATION_DELAY - 1);
+        let mut suspended: Vec<u64> = Vec::new();
+        let mut decrypted: Vec<u64> = Vec::new();
+        for b in blocks {
+            if b.header.height >= 1 && b.header.height < cutoff {
+                for s in &b.header.suspensions {
+                    suspended.push(s.null_v);
+                    decrypted.push(s.dec_nullifier());
+                }
+            }
+        }
         (crate::smt::Smt::from_keys(&suspended).root(), crate::smt::Smt::from_keys(&decrypted).root())
     }
 

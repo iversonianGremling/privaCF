@@ -16,6 +16,7 @@ use crate::epoch::EpochTransaction;
 use crate::identity::{verify, NodeIdentity};
 use crate::membership::MembershipOp;
 use crate::smt;
+use crate::verdict::SuspendRecord;
 use crate::vrf::VrfClaim;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -38,6 +39,10 @@ pub struct BlockHeader {
     /// `block_id` covers them (proposer-signed and voted-over); they take effect at the NEXT height,
     /// once this block is finalized and identical for every node (see `membership.rs`).
     pub membership_ops: Vec<MembershipOp>,
+    /// Finalized dark-node suspensions carried by this block (extracted `null_v`s). Like
+    /// `membership_ops` they are header-covered and fold into the SUSP_SMT / DECRYPTION_SMT at the
+    /// next height (see `verdict.rs`, `node.rs::smt_roots_at`).
+    pub suspensions: Vec<SuspendRecord>,
 }
 
 /// A validator's BLS vote over a slot — the unit aggregated into the quorum certificate. The signed
@@ -208,6 +213,7 @@ impl BlockHeader {
             vrf_preout: vrf.preout,
             vrf_proof: vrf.proof.clone(),
             membership_ops: Vec::new(), // set by the proposer (assemble_block) before block_id is fixed
+            suspensions: Vec::new(),
         }
     }
 }
@@ -241,6 +247,7 @@ impl Chain {
             vrf_preout: [0u8; 32],
             vrf_proof: Vec::new(),
             membership_ops: Vec::new(),
+            suspensions: Vec::new(),
         };
         Chain {
             blocks: vec![Block {

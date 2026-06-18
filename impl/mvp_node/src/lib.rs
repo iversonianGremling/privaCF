@@ -25,6 +25,7 @@ pub mod smt;
 pub mod sphinx;
 pub mod transport;
 pub mod vdf;
+pub mod verdict;
 pub mod verenc;
 pub mod vrf;
 
