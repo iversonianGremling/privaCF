@@ -64,6 +64,11 @@ pub enum Message {
     /// custody share + commitment blinding to one committee member's `mix_pk`. Routed to the mesh; only
     /// the addressed member can open it and act on it. Transient — consumed, not recorded on-chain.
     CustodyDispatch(crate::arbitration::CustodyParcel),
+    /// A confidential §4.1/§6.4 **re-handoff** parcel (`arbitration.rs`): when an original custodian
+    /// departs, a surviving custodian seals its distributed re-share sub-share + the on-chain blinding to
+    /// one fresh-committee member's `mix_pk`. Routed to the mesh; only the addressed member opens it.
+    /// Transient — consumed, not recorded on-chain (the resulting round-1 handoff receipt is what's recorded).
+    Reshare(crate::arbitration::ReshareParcel),
     /// A committee member's signed arbitration handoff receipt (`arbitration.rs`): the re-encrypted
     /// commitment it now custodies + the ZK proof binding it to the subject's on-chain `c_old`. A node
     /// pools / records one that verifies; the next leader records it in `BlockHeader::handoff_receipts`.

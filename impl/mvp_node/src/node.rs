@@ -21,7 +21,7 @@ use crate::admission::VdfAdmission;
 use crate::audit::FirstObservation;
 use crate::beacon::{next_beacon, next_beacon_vdf};
 use crate::bls;
-use crate::arbitration::{CustodyParcel, HandoffReceipt};
+use crate::arbitration::{CustodyParcel, HandoffReceipt, ReshareParcel};
 use crate::rewind::RewindSignal;
 use crate::verdict::VerdictCommit;
 use crate::watchdog::WatchdogSignal;
@@ -247,6 +247,11 @@ pub struct NodeOutcome {
     /// deadline (sorted). A pure function of the chain, so all honest nodes derive the same set; these
     /// also appear in `slashed` (leadership exclusion).
     pub handoff_defaults: Vec<[u8; 32]>,
+    /// Whether every **re-handoff** (proactive custody rotation triggered when an original committee member
+    /// departs) reached a custody threshold of valid round-1 receipts under its fresh beacon-selected
+    /// committee — the departed-custodian rotation completed without the subject's profile ever losing
+    /// threshold custody. A pure function of the chain (`rehandoff_complete`); `false` if none was triggered.
+    pub rehandoff_complete: bool,
 }
 
 /// The public, chain-derived context of one arbitration handoff (`handoff_context`).
@@ -256,6 +261,22 @@ struct HandoffCtx {
     c_old: [u8; 32],
     width: usize,
     committee: Vec<[u8; 32]>,
+}
+
+/// The public, chain-derived context of a **re-handoff** (`rehandoff_context`) — the proactive custody
+/// rotation triggered when an original committee member departs. Everything is re-derived identically by
+/// every node from the chain: the same on-chain `c_old`, the `trigger_height` (the departing custodian's
+/// `Remove`), the fresh beacon-selected `new_committee`, and the canonical set of surviving dealers
+/// (`canonical` = the `CUSTODY_THRESHOLD` survivors with the lowest original share index, paired with that
+/// index) whose distributed re-share every new member must combine over identically.
+struct ReHandoffCtx {
+    nonce: u64, // rehandoff_subject(orig_subject, round)
+    subject_peer: [u8; 32],
+    c_old: [u8; 32],
+    width: usize,
+    trigger_height: u64,
+    new_committee: Vec<[u8; 32]>,
+    canonical: Vec<(u64, [u8; 32])>, // (original 1-based share index, original member) — the dealers
 }
 
 /// Per-height consensus state.
@@ -1253,7 +1274,7 @@ impl Node {
     /// How many committee members have a valid recorded receipt for `subject` (`arbitration::settle` over
     /// the on-chain receipts). A pure function of the finalized chain, so all nodes agree.
     fn handoff_completed_count(&self, blocks: &[Block], subject: u64) -> usize {
-        let Some(ctx) = self.handoff_context(blocks, subject) else { return 0 };
+        let Some(ctx) = self.any_handoff_context(blocks, subject) else { return 0 };
         let pc = crate::pedersen::Pedersen::new(ctx.width.max(1));
         let receipts: Vec<HandoffReceipt> =
             blocks.iter().flat_map(|b| b.header.handoff_receipts.iter().cloned()).collect();
@@ -1291,7 +1312,7 @@ impl Node {
     /// `c_old`, the member is in the beacon-selected committee, and the signed re-encryption proof binds
     /// `c_new` to `c_old`. Self-contained, so a proposer cannot inject a forged handoff.
     fn validate_handoff_receipt(&self, blocks: &[Block], r: &HandoffReceipt) -> bool {
-        let Some(ctx) = self.handoff_context(blocks, r.subject) else { return false };
+        let Some(ctx) = self.any_handoff_context(blocks, r.subject) else { return false };
         let pc = crate::pedersen::Pedersen::new(ctx.width.max(1));
         r.verify(&pc, &ctx.c_old, &ctx.committee)
     }
@@ -1400,11 +1421,13 @@ impl Node {
     /// subject's on-chain `c_old` to a fresh `r_new` it controls (homomorphically, never seeing the
     /// vector), prove the re-encryption, and file a signed receipt for the next leader to record. Pools
     /// once per subject (`recorded`/`pool` dedup).
+    #[allow(clippy::too_many_arguments)]
     fn handle_custody_parcel(
         &self,
         chain: &Chain,
         parcel: &CustodyParcel,
         handoff_pool: &mut Vec<HandoffReceipt>,
+        custody_held: &mut HashMap<u64, ([u8; 32], [u8; 32])>,
         peers: &PeersMap,
         mixer: &Mixer,
         beacon: u64,
@@ -1435,6 +1458,296 @@ impl Node {
         let proof = crate::arbitration::prove_reencryption(&pc, &ctx.c_old, &c_new, &r_old, &r_new, &seed);
         let receipt = HandoffReceipt::create(&self.identity, subject, c_new, proof, &share);
         if !receipt.verify(&pc, &ctx.c_old, &ctx.committee) {
+            return;
+        }
+        handoff_pool.push(receipt.clone());
+        mixer.publish(peers, beacon, Message::Handoff(receipt));
+        // Remember our custody (the on-chain blinding + our Shamir share) so that, if an original
+        // committee member later departs, we can proactively re-share it to a fresh committee.
+        custody_held.insert(subject, (r_old, share));
+    }
+
+    // ─────────────────────────── §4.1/§6.4 re-handoff (proactive custody rotation) ───────────────────────────
+
+    /// The single supported re-handoff round (round 1). Generalising to round ≥ 2 (a re-handoff of a
+    /// re-handoff) is mechanical — re-key the nonce/committee off the previous round — but bounded here.
+    const REHANDOFF_ROUND: u32 = 1;
+
+    /// Earliest height each peer's `Remove` was finalized at (a departure), across `blocks`.
+    fn remove_heights(&self, blocks: &[Block]) -> HashMap<[u8; 32], u64> {
+        let mut out: HashMap<[u8; 32], u64> = HashMap::new();
+        for b in blocks {
+            for op in &b.header.membership_ops {
+                if let MembershipOp::Remove { peer_id, .. } = op {
+                    out.entry(*peer_id).or_insert(b.header.height);
+                }
+            }
+        }
+        out
+    }
+
+    /// The re-handoff context for an original `orig_subject`, or `None` if no re-handoff is triggered: it
+    /// requires (1) a completed round-0 handoff and (2) at least one original committee member departed
+    /// after the handoff. Pure function of the chain, so every node derives the identical fresh committee
+    /// and canonical dealer set.
+    fn rehandoff_context(&self, blocks: &[Block], orig_subject: u64) -> Option<ReHandoffCtx> {
+        let base = self.handoff_context(blocks, orig_subject)?;
+        if self.handoff_completed_count(blocks, orig_subject) < crate::arbitration::CUSTODY_THRESHOLD {
+            return None; // round 0 never reached custody — nothing to rotate
+        }
+        let removes = self.remove_heights(blocks);
+        // Surviving original custodians, each tagged with its 1-based original share index (= committee
+        // position + 1, matching the round-0 `shamir_split` ordering). A departure after the handoff
+        // height triggers the rotation.
+        let mut survivors: Vec<(u64, [u8; 32])> = Vec::new();
+        let mut any_departed = false;
+        for (pos, member) in base.committee.iter().enumerate() {
+            match removes.get(member) {
+                Some(&rh) if rh >= base.height => any_departed = true, // departed custodian
+                _ => survivors.push((pos as u64 + 1, *member)),
+            }
+        }
+        if !any_departed || survivors.len() < crate::arbitration::CUSTODY_THRESHOLD {
+            return None; // no trigger, or too few survivors to re-share the secret
+        }
+        // Canonical dealer set: the threshold survivors with the lowest original share index. Every node
+        // and every new member combines the re-share over EXACTLY this set.
+        survivors.sort_unstable_by_key(|(idx, _)| *idx);
+        let canonical: Vec<(u64, [u8; 32])> =
+            survivors.into_iter().take(crate::arbitration::CUSTODY_THRESHOLD).collect();
+        // The trigger height: the earliest departure of an original custodian after the handoff.
+        let trigger_height = base
+            .committee
+            .iter()
+            .filter_map(|m| removes.get(m).copied().filter(|&rh| rh >= base.height))
+            .min()?;
+        let beacon = blocks.iter().find(|b| b.header.height == trigger_height).map(|b| b.header.beacon_t)?;
+        let nonce = crate::arbitration::rehandoff_subject(orig_subject, Self::REHANDOFF_ROUND);
+        // Fresh committee: validators active at the trigger, excluding the subject AND the entire original
+        // committee — a genuinely rotated custody. Falls back to including survivors if the pool is thin.
+        let active = self.active_set_at(blocks, trigger_height).peers;
+        let exclude: HashSet<[u8; 32]> =
+            base.committee.iter().copied().chain(std::iter::once(base.subject_peer)).collect();
+        let mut pool: Vec<[u8; 32]> = active.iter().copied().filter(|p| !exclude.contains(p)).collect();
+        if pool.len() < crate::arbitration::CUSTODY_THRESHOLD {
+            // Thin validator set: allow surviving originals back in (still excludes the subject + departed).
+            let departed: HashSet<[u8; 32]> = base
+                .committee
+                .iter()
+                .copied()
+                .filter(|m| removes.get(m).map(|&rh| rh >= base.height).unwrap_or(false))
+                .collect();
+            pool = active
+                .iter()
+                .copied()
+                .filter(|p| *p != base.subject_peer && !departed.contains(p))
+                .collect();
+        }
+        let new_committee =
+            crate::arbitration::select_committee(&pool, beacon, nonce, crate::arbitration::COMMITTEE_SIZE);
+        Some(ReHandoffCtx {
+            nonce,
+            subject_peer: base.subject_peer,
+            c_old: base.c_old,
+            width: base.width,
+            trigger_height,
+            new_committee,
+            canonical,
+        })
+    }
+
+    /// Unified handoff context resolving EITHER a round-0 subject (an `epoch_id` with an on-chain pref tx)
+    /// or a round-1 re-handoff nonce — used by the generic settle/validate paths so round-1 receipts ride
+    /// the same recording/validation machinery as round-0, keyed only by their distinct subject nonce.
+    fn any_handoff_context(&self, blocks: &[Block], subject: u64) -> Option<HandoffCtx> {
+        if let Some(ctx) = self.handoff_context(blocks, subject) {
+            return Some(ctx); // round 0
+        }
+        // round 1: is `subject` the re-handoff nonce of some departed node's original subject?
+        for orig in self.handoff_subjects(blocks) {
+            if crate::arbitration::rehandoff_subject(orig, Self::REHANDOFF_ROUND) == subject {
+                let r = self.rehandoff_context(blocks, orig)?;
+                return Some(HandoffCtx {
+                    subject_peer: r.subject_peer,
+                    height: r.trigger_height,
+                    c_old: r.c_old,
+                    width: r.width,
+                    committee: r.new_committee,
+                });
+            }
+        }
+        None
+    }
+
+    /// Whether every triggered re-handoff has reached a custody threshold of valid round-1 receipts under
+    /// its fresh committee — the proactive rotation completed. A pure function of the chain.
+    fn rehandoff_complete(&self, blocks: &[Block]) -> bool {
+        let triggered: Vec<u64> = self
+            .handoff_subjects(blocks)
+            .into_iter()
+            .filter_map(|orig| self.rehandoff_context(blocks, orig).map(|r| r.nonce))
+            .collect();
+        !triggered.is_empty()
+            && triggered
+                .iter()
+                .all(|&nonce| self.handoff_completed_count(blocks, nonce) >= crate::arbitration::CUSTODY_THRESHOLD)
+    }
+
+    /// Dealer side of the re-handoff: a canonical surviving custodian proactively re-shares the custody it
+    /// holds (its round-0 Shamir share + the on-chain blinding `r_old`, from `custody_held`) to the fresh
+    /// committee — `dkg::reshare_subdeal` of its share, sealed per new member (`arbitration::seal_reshare`),
+    /// so the secret is rotated without anyone reconstructing it. Re-dispatched at most once per height
+    /// until a threshold of new custodians have filed.
+    #[allow(clippy::too_many_arguments)]
+    fn drive_rehandoff(
+        &self,
+        chain: &Chain,
+        custody_held: &HashMap<u64, ([u8; 32], [u8; 32])>,
+        reshare_held: &mut HashMap<u64, Vec<(u64, [u8; 32], [u8; 32])>>,
+        handoff_pool: &mut Vec<HandoffReceipt>,
+        peers: &PeersMap,
+        mixer: &Mixer,
+        beacon: u64,
+        last_height: &mut Option<u64>,
+    ) {
+        if !self.arbitration_authority {
+            return;
+        }
+        let head = chain.head().header.height;
+        if *last_height == Some(head) {
+            return;
+        }
+        let mut dispatched = false;
+        for orig in self.handoff_subjects(&chain.blocks) {
+            let Some(rctx) = self.rehandoff_context(&chain.blocks, orig) else { continue };
+            // Am I a canonical dealer for this re-handoff, and do I still hold the custody?
+            let Some(&(my_index, _)) = rctx.canonical.iter().find(|(_, m)| *m == self.me()) else { continue };
+            let Some(&(r_old, share)) = custody_held.get(&orig) else { continue };
+            if self.handoff_completed_count(&chain.blocks, rctx.nonce) >= crate::arbitration::CUSTODY_THRESHOLD {
+                continue; // enough fresh custodians already hold it
+            }
+            let vset = self.active_set_at(&chain.blocks, rctx.trigger_height);
+            let subdeal = crate::dkg::reshare_subdeal(
+                crate::arbitration::CUSTODY_THRESHOLD,
+                rctx.new_committee.len().max(1),
+                &share,
+                &my_index.to_le_bytes(),
+            );
+            for (k, member) in rctx.new_committee.iter().enumerate() {
+                if *member == self.me() {
+                    // I am both a dealer AND on the fresh committee: there is no network loopback to self,
+                    // so deliver my own sub-share to myself directly (it counts toward my canonical set).
+                    self.accumulate_reshare(&chain.blocks, &rctx, my_index, r_old, subdeal[k].1, reshare_held, handoff_pool, peers, mixer, beacon);
+                    dispatched = true;
+                    continue;
+                }
+                let Some(mix_pk) = vset.mix.get(member).copied() else { continue };
+                let mut hs = blake3::Hasher::new();
+                hs.update(b"privacf-arbitration-reshare-eph-seed-v1");
+                hs.update(&to_u64(self.identity.sk).to_le_bytes());
+                hs.update(&orig.to_le_bytes());
+                hs.update(&my_index.to_le_bytes());
+                hs.update(member);
+                let eph_seed = *hs.finalize().as_bytes();
+                if let Some(parcel) = crate::arbitration::seal_reshare(
+                    &mix_pk,
+                    orig,
+                    Self::REHANDOFF_ROUND,
+                    my_index,
+                    member,
+                    &r_old,
+                    &subdeal[k].1,
+                    &eph_seed,
+                ) {
+                    mixer.publish(peers, beacon, Message::Reshare(parcel));
+                    dispatched = true;
+                }
+            }
+        }
+        if dispatched {
+            *last_height = Some(head);
+        }
+    }
+
+    /// Fresh-committee-member reaction to a re-share parcel: open it, accumulate one sub-share per canonical
+    /// dealer (`reshare_held`), and once it holds the full canonical set, combine them into its fresh custody
+    /// share (`dkg::reshare_combine`), homomorphically re-blind the subject's on-chain `c_old` to a fresh
+    /// `r_new`, prove the re-encryption, and file a round-1 receipt (keyed by the re-handoff nonce).
+    #[allow(clippy::too_many_arguments)]
+    fn handle_reshare_parcel(
+        &self,
+        chain: &Chain,
+        parcel: &ReshareParcel,
+        reshare_held: &mut HashMap<u64, Vec<(u64, [u8; 32], [u8; 32])>>,
+        handoff_pool: &mut Vec<HandoffReceipt>,
+        peers: &PeersMap,
+        mixer: &Mixer,
+        beacon: u64,
+    ) {
+        if !self.arbitration_authority || parcel.member != self.me() || self.withhold_handoff {
+            return;
+        }
+        if parcel.round != Self::REHANDOFF_ROUND {
+            return;
+        }
+        let Some(rctx) = self.rehandoff_context(&chain.blocks, parcel.subject) else { return };
+        let Some((r_old, subshare)) = crate::arbitration::open_reshare(&self.identity.mix_sk(), parcel) else { return };
+        self.accumulate_reshare(&chain.blocks, &rctx, parcel.old_index, r_old, subshare, reshare_held, handoff_pool, peers, mixer, beacon);
+    }
+
+    /// Accumulate one canonical-dealer sub-share for re-handoff `rctx` and, once this fresh-committee member
+    /// holds the full canonical set, combine them into its fresh custody share, re-blind `c_old`, and file a
+    /// round-1 receipt. Shared by the gossip path (`handle_reshare_parcel`) and a dealer's own self-delivery
+    /// when it is itself on the fresh committee (`drive_rehandoff`) — there is no network loopback to self.
+    #[allow(clippy::too_many_arguments)]
+    fn accumulate_reshare(
+        &self,
+        blocks: &[Block],
+        rctx: &ReHandoffCtx,
+        old_index: u64,
+        r_old: [u8; 32],
+        subshare: [u8; 32],
+        reshare_held: &mut HashMap<u64, Vec<(u64, [u8; 32], [u8; 32])>>,
+        handoff_pool: &mut Vec<HandoffReceipt>,
+        peers: &PeersMap,
+        mixer: &Mixer,
+        beacon: u64,
+    ) {
+        if !rctx.new_committee.contains(&self.me()) {
+            return; // not on the fresh committee
+        }
+        if !rctx.canonical.iter().any(|(idx, _)| *idx == old_index) {
+            return; // a non-canonical dealer's contribution would corrupt the Lagrange set
+        }
+        let key = (self.me(), rctx.nonce);
+        if self.recorded_handoff_keys(blocks).contains(&key)
+            || handoff_pool.iter().any(|r| (r.member, r.subject) == key)
+        {
+            return; // already filed
+        }
+        let acc = reshare_held.entry(rctx.nonce).or_default();
+        if acc.iter().any(|(idx, _, _)| *idx == old_index) {
+            return; // dedup this dealer
+        }
+        acc.push((old_index, r_old, subshare));
+        if acc.len() < crate::arbitration::CUSTODY_THRESHOLD {
+            return; // wait for the full canonical dealer set before combining
+        }
+        // Combine the sub-shares into our fresh custody share, and re-blind the SAME on-chain c_old.
+        let contributions: Vec<(u64, [u8; 32])> = acc.iter().map(|(idx, _, sub)| (*idx, *sub)).collect();
+        let fresh_share = crate::dkg::reshare_combine(&contributions);
+        let r_old = acc[0].1;
+        let pc = crate::pedersen::Pedersen::new(rctx.width.max(1));
+        let r_new = self.handoff_r_new(rctx.nonce);
+        let Some(c_new) = crate::arbitration::reencrypt(&pc, &rctx.c_old, &r_old, &r_new) else { return };
+        let mut hs = blake3::Hasher::new();
+        hs.update(b"privacf-arbitration-reshare-reenc-seed-v1");
+        hs.update(&to_u64(self.identity.sk).to_le_bytes());
+        hs.update(&rctx.nonce.to_le_bytes());
+        let seed = *hs.finalize().as_bytes();
+        let proof = crate::arbitration::prove_reencryption(&pc, &rctx.c_old, &c_new, &r_old, &r_new, &seed);
+        let receipt = HandoffReceipt::create(&self.identity, rctx.nonce, c_new, proof, &fresh_share);
+        if !receipt.verify(&pc, &rctx.c_old, &rctx.new_committee) {
             return;
         }
         handoff_pool.push(receipt.clone());
@@ -2054,6 +2367,8 @@ impl Node {
         watchdog_pool: &mut Vec<WatchdogSignal>,
         rewind_pool: &mut Vec<RewindSignal>,
         handoff_pool: &mut Vec<HandoffReceipt>,
+        custody_held: &mut HashMap<u64, ([u8; 32], [u8; 32])>,
+        reshare_held: &mut HashMap<u64, Vec<(u64, [u8; 32], [u8; 32])>>,
         peers: &PeersMap,
         mixer: &Mixer,
         slashed: &mut HashSet<[u8; 32]>,
@@ -2169,7 +2484,13 @@ impl Node {
                 // A confidential arbitration custody parcel: if it is addressed to us and we serve on the
                 // committee, open it and file our handoff receipt (consumed here, never re-gossiped or
                 // recorded — it carries the subject's secret blinding, sealed to us alone).
-                self.handle_custody_parcel(chain, &parcel, handoff_pool, peers, mixer, beacon_hint);
+                self.handle_custody_parcel(chain, &parcel, handoff_pool, custody_held, peers, mixer, beacon_hint);
+            }
+            Message::Reshare(parcel) => {
+                // A confidential re-handoff sub-share addressed to a fresh-committee member: accumulate it
+                // and, once the canonical dealer set is complete, file a round-1 handoff receipt. Consumed
+                // here, never re-gossiped (it carries a custody sub-share sealed to us alone).
+                self.handle_reshare_parcel(chain, &parcel, reshare_held, handoff_pool, peers, mixer, beacon_hint);
             }
             Message::Handoff(r) => {
                 // A committee member's handoff receipt: pool it (dedup by member/subject) only if it
@@ -2423,6 +2744,12 @@ impl Node {
         let mut rewind_pool: Vec<RewindSignal> = Vec::new();
         let mut handoff_pool: Vec<HandoffReceipt> = Vec::new();
         let mut custody_dispatch_height: Option<u64> = None;
+        // Custody this node took at round-0 handoff (orig subject → (r_old, our share)), so it can later
+        // proactively re-share to a fresh committee; and the sub-shares it accumulates as a fresh-committee
+        // member of a re-handoff (re-handoff nonce → [(old dealer index, r_old, sub-share)]).
+        let mut custody_held: HashMap<u64, ([u8; 32], [u8; 32])> = HashMap::new();
+        let mut reshare_held: HashMap<u64, Vec<(u64, [u8; 32], [u8; 32])>> = HashMap::new();
+        let mut rehandoff_dispatch_height: Option<u64> = None;
         let mut epoch_ids: Vec<(u64, u64)> = Vec::new();
         let mut beacons: Vec<(u64, u64)> = Vec::new();
         let mut split_ok = true;
@@ -2525,6 +2852,9 @@ impl Node {
                     self.drive_watchdog(&chain, &peers, &mixer, beacon_hint, &mut watchdog_raised, &mut watchdog_pool);
                     self.drive_rewind(&chain, &peers, &mixer, beacon_hint, &mut rewind_raised, &mut rewind_pool);
                     self.drive_custody_dispatch(&chain, &peers, &mixer, beacon_hint, &mut custody_dispatch_height);
+                    // Re-handoff driver: a surviving custodian proactively re-shares to a fresh committee
+                    // once an original custodian departs (no-op unless triggered + we are a canonical dealer).
+                    self.drive_rehandoff(&chain, &custody_held, &mut reshare_held, &mut handoff_pool, &peers, &mixer, beacon_hint, &mut rehandoff_dispatch_height);
                     // §6.4 slashing: a committee member that defaulted on a handoff (no valid receipt by
                     // the deadline) is excluded from leadership, exactly like an equivocator — derived
                     // identically from the finalized chain on every node, so no evidence message is needed.
@@ -2538,7 +2868,7 @@ impl Node {
                     }
                 }
                 Some(msg) = inbox_rx.recv() => {
-                    self.on_msg(msg, round.as_mut(), &mut chain, &mut pending, &mut pending_membership, &mut pending_suspensions, &mut verdict_partials, &mut audit_pool, &mut verdict_commit_pool, &mut watchdog_pool, &mut rewind_pool, &mut handoff_pool, &peers, &mixer, &mut slashed);
+                    self.on_msg(msg, round.as_mut(), &mut chain, &mut pending, &mut pending_membership, &mut pending_suspensions, &mut verdict_partials, &mut audit_pool, &mut verdict_commit_pool, &mut watchdog_pool, &mut rewind_pool, &mut handoff_pool, &mut custody_held, &mut reshare_held, &peers, &mixer, &mut slashed);
                 }
             }
         }
@@ -2572,7 +2902,8 @@ impl Node {
                 self.handoff_completed_count(&chain.blocks, s) >= crate::arbitration::CUSTODY_THRESHOLD
             });
         let handoff_defaults = self.handoff_defaults(&chain.blocks);
-        info!(peer = %hex::encode(&my_id[..4]), blocks = chain.blocks.len(), head = %hex::encode(&chain.head_hash()[..4]), all_qc_valid, max_view, slashed = slashed_vec.len(), active = final_active.len(), suspended = suspended_targets.len(), flagged = flagged_cohort.len(), audit_reports = audit_reports_recorded, oversight = oversight_triggered, wd_signals = watchdog_signals_recorded, commits = verdict_commits_recorded, class3 = class3_triggered, rewind_signals = rewind_signals_recorded, handoffs = handoff_receipts_recorded, handoff_complete, "node done");
+        let rehandoff_complete = self.rehandoff_complete(&chain.blocks);
+        info!(peer = %hex::encode(&my_id[..4]), blocks = chain.blocks.len(), head = %hex::encode(&chain.head_hash()[..4]), all_qc_valid, max_view, slashed = slashed_vec.len(), active = final_active.len(), suspended = suspended_targets.len(), flagged = flagged_cohort.len(), audit_reports = audit_reports_recorded, oversight = oversight_triggered, wd_signals = watchdog_signals_recorded, commits = verdict_commits_recorded, class3 = class3_triggered, rewind_signals = rewind_signals_recorded, handoffs = handoff_receipts_recorded, handoff_complete, rehandoff_complete, "node done");
         NodeOutcome {
             peer_id: my_id,
             head_hash: chain.head_hash(),
@@ -2595,6 +2926,7 @@ impl Node {
             handoff_receipts_recorded,
             handoff_complete,
             handoff_defaults,
+            rehandoff_complete,
         }
     }
 }
@@ -2733,6 +3065,14 @@ mod tests {
         })));
         assert!(Mixer::is_routable(&Message::CustodyDispatch(crate::arbitration::CustodyParcel {
             subject: 0,
+            member: [0u8; 32],
+            eph: [0u8; 32],
+            ct: Vec::new(),
+        })));
+        assert!(Mixer::is_routable(&Message::Reshare(crate::arbitration::ReshareParcel {
+            subject: 0,
+            round: 1,
+            old_index: 1,
             member: [0u8; 32],
             eph: [0u8; 32],
             ct: Vec::new(),
