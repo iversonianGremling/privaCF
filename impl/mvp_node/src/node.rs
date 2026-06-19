@@ -243,6 +243,10 @@ pub struct NodeOutcome {
     /// receipts — the §4.1 handoff completed under the new committee's custody. A pure function of the
     /// chain, so all honest nodes agree (see `handoff_completed_count` / `arbitration.rs`).
     pub handoff_complete: bool,
+    /// Committee members slashed for §6.4 handoff default — selected but filed no valid receipt by the
+    /// deadline (sorted). A pure function of the chain, so all honest nodes derive the same set; these
+    /// also appear in `slashed` (leadership exclusion).
+    pub handoff_defaults: Vec<[u8; 32]>,
 }
 
 /// The public, chain-derived context of one arbitration handoff (`handoff_context`).
@@ -379,6 +383,9 @@ pub struct Node {
     /// departing node's handoff and receives its custody parcel, it re-encrypts the subject's on-chain
     /// `C_p` under a fresh blinding it holds and files a signed `HandoffReceipt`. Honest default `false`.
     arbitration_authority: bool,
+    /// Fault injection: a committee member that opens its custody parcel but files NO handoff receipt —
+    /// the non-completion the §6.4 slashing path defaults and slashes. Honest default `false`.
+    withhold_handoff: bool,
     /// Fault injection: if `Some((item, weight, from_epoch))`, this node is part of a coordinated push
     /// cohort — from epoch `from_epoch` it overwrites its obfuscated gossip with a single, within-bound
     /// concentration on `item` (weight `weight`). Several such nodes spike `item`'s on-chain gossip
@@ -415,6 +422,7 @@ impl Node {
             rogue_commit_targets: Vec::new(),
             rewind_authority: false,
             arbitration_authority: false,
+            withhold_handoff: false,
             push_item: None,
         }
     }
@@ -450,6 +458,14 @@ impl Node {
     /// under a fresh blinding and files a signed `HandoffReceipt` the next leader records.
     pub fn with_arbitration_authority(mut self) -> Self {
         self.arbitration_authority = true;
+        self
+    }
+
+    /// Fault-injection builder: a committee member that takes custody but files no handoff receipt,
+    /// exercising the §6.4 default detection + slashing path.
+    pub fn byzantine_withhold_handoff(mut self) -> Self {
+        self.arbitration_authority = true;
+        self.withhold_handoff = true;
         self
     }
 
@@ -1245,6 +1261,32 @@ impl Node {
         completed.len()
     }
 
+    /// The committee members that **defaulted** on a handoff (§6.4): for every subject whose deadline
+    /// (`HANDOFF_DEADLINE` epochs past its departure) has elapsed on `blocks`, the selected members with
+    /// no valid recorded receipt. A pure function of the finalized chain (committee, receipts, and
+    /// deadline all on-chain), so every node slashes the same set with no extra evidence message.
+    fn handoff_defaults(&self, blocks: &[Block]) -> Vec<[u8; 32]> {
+        let head = blocks.last().map(|b| b.header.height).unwrap_or(0);
+        let mut out: Vec<[u8; 32]> = Vec::new();
+        for subject in self.handoff_subjects(blocks) {
+            let Some(ctx) = self.handoff_context(blocks, subject) else { continue };
+            if head < ctx.height + crate::arbitration::HANDOFF_DEADLINE {
+                continue; // the round is still open
+            }
+            let pc = crate::pedersen::Pedersen::new(ctx.width.max(1));
+            let receipts: Vec<HandoffReceipt> =
+                blocks.iter().flat_map(|b| b.header.handoff_receipts.iter().cloned()).collect();
+            let (_, defaulted) = crate::arbitration::settle(&pc, &ctx.c_old, &ctx.committee, subject, &receipts);
+            for d in defaulted {
+                if !out.contains(&d.member) {
+                    out.push(d.member);
+                }
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
     /// Independently validate a handoff receipt against public chain data: its subject has a finalized
     /// `c_old`, the member is in the beacon-selected committee, and the signed re-encryption proof binds
     /// `c_new` to `c_old`. Self-contained, so a proposer cannot inject a forged handoff.
@@ -1367,8 +1409,8 @@ impl Node {
         mixer: &Mixer,
         beacon: u64,
     ) {
-        if !self.arbitration_authority || parcel.member != self.me() {
-            return;
+        if !self.arbitration_authority || parcel.member != self.me() || self.withhold_handoff {
+            return; // a withholding member opens nothing it would have to file
         }
         let subject = parcel.subject;
         let key = (self.me(), subject);
@@ -2483,6 +2525,14 @@ impl Node {
                     self.drive_watchdog(&chain, &peers, &mixer, beacon_hint, &mut watchdog_raised, &mut watchdog_pool);
                     self.drive_rewind(&chain, &peers, &mixer, beacon_hint, &mut rewind_raised, &mut rewind_pool);
                     self.drive_custody_dispatch(&chain, &peers, &mixer, beacon_hint, &mut custody_dispatch_height);
+                    // §6.4 slashing: a committee member that defaulted on a handoff (no valid receipt by
+                    // the deadline) is excluded from leadership, exactly like an equivocator — derived
+                    // identically from the finalized chain on every node, so no evidence message is needed.
+                    for d in self.handoff_defaults(&chain.blocks) {
+                        if slashed.insert(d) {
+                            info!(slashed = %hex::encode(&d[..4]), "slashed committee member for handoff default");
+                        }
+                    }
                     if let Some(r) = round.as_mut() {
                         self.on_tick(r, &mut chain, &pending, &pending_membership, &pending_suspensions, &audit_pool, &verdict_commit_pool, &watchdog_pool, &rewind_pool, &handoff_pool, &peers, &mixer, &slashed);
                     }
@@ -2521,6 +2571,7 @@ impl Node {
             && handoff_subjects.iter().all(|&s| {
                 self.handoff_completed_count(&chain.blocks, s) >= crate::arbitration::CUSTODY_THRESHOLD
             });
+        let handoff_defaults = self.handoff_defaults(&chain.blocks);
         info!(peer = %hex::encode(&my_id[..4]), blocks = chain.blocks.len(), head = %hex::encode(&chain.head_hash()[..4]), all_qc_valid, max_view, slashed = slashed_vec.len(), active = final_active.len(), suspended = suspended_targets.len(), flagged = flagged_cohort.len(), audit_reports = audit_reports_recorded, oversight = oversight_triggered, wd_signals = watchdog_signals_recorded, commits = verdict_commits_recorded, class3 = class3_triggered, rewind_signals = rewind_signals_recorded, handoffs = handoff_receipts_recorded, handoff_complete, "node done");
         NodeOutcome {
             peer_id: my_id,
@@ -2543,6 +2594,7 @@ impl Node {
             rewind_signals_recorded,
             handoff_receipts_recorded,
             handoff_complete,
+            handoff_defaults,
         }
     }
 }

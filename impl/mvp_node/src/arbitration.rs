@@ -40,6 +40,10 @@ pub const COMMITTEE_SIZE: usize = 4;
 /// Shamir custody threshold — any `CUSTODY_THRESHOLD` committee members reconstruct the custody secret
 /// (`dkg::shamir_recover`); fewer learn nothing.
 pub const CUSTODY_THRESHOLD: usize = 3;
+/// Epochs after a subject's departure by which every selected committee member must have filed a valid
+/// handoff receipt; one that has not by the close has defaulted (`settle`) and is slashable. Set well
+/// above the leaver's self-healing re-dispatch window so an honest member is never spuriously defaulted.
+pub const HANDOFF_DEADLINE: u64 = 5;
 
 // ───────────────────────────────── committee selection ─────────────────────────────────
 
