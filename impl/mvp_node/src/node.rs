@@ -351,6 +351,9 @@ pub struct Node {
     /// If true, this node is NOT in the genesis set and seeks to join: each height until admitted it
     /// gossips a self-signed join op (`config.genesis_validators` is its bootstrap peer list).
     joining: bool,
+    /// If set with `joining`, the node holds back its join op until this height — so it is admitted only
+    /// after an earlier event (e.g. a handoff already formed its committee), not from boot.
+    join_at: Option<u64>,
     /// If set, consensus control messages are routed through the Loopix mixnet rather than
     /// broadcast in the clear (see `Mixer`); `None` keeps the original direct-gossip behavior.
     mix_settings: Option<MixSettings>,
@@ -430,6 +433,7 @@ impl Node {
             double_vote: false,
             leave_at: None,
             joining: false,
+            join_at: None,
             mix_settings: None,
             admission: None,
             join_vdf: std::sync::OnceLock::new(),
@@ -1288,15 +1292,17 @@ impl Node {
     /// deadline all on-chain), so every node slashes the same set with no extra evidence message.
     fn handoff_defaults(&self, blocks: &[Block]) -> Vec<[u8; 32]> {
         let head = blocks.last().map(|b| b.header.height).unwrap_or(0);
+        let receipts: Vec<HandoffReceipt> =
+            blocks.iter().flat_map(|b| b.header.handoff_receipts.iter().cloned()).collect();
         let mut out: Vec<[u8; 32]> = Vec::new();
-        for subject in self.handoff_subjects(blocks) {
-            let Some(ctx) = self.handoff_context(blocks, subject) else { continue };
+        // Both rounds default-slash identically: a round-0 subject (an `epoch_id`) and, when a re-handoff
+        // was triggered, its round-1 nonce — each settled over its own committee via `any_handoff_context`.
+        for subject in self.defaultable_subjects(blocks) {
+            let Some(ctx) = self.any_handoff_context(blocks, subject) else { continue };
             if head < ctx.height + crate::arbitration::HANDOFF_DEADLINE {
                 continue; // the round is still open
             }
             let pc = crate::pedersen::Pedersen::new(ctx.width.max(1));
-            let receipts: Vec<HandoffReceipt> =
-                blocks.iter().flat_map(|b| b.header.handoff_receipts.iter().cloned()).collect();
             let (_, defaulted) = crate::arbitration::settle(&pc, &ctx.c_old, &ctx.committee, subject, &receipts);
             for d in defaulted {
                 if !out.contains(&d.member) {
@@ -1306,6 +1312,19 @@ impl Node {
         }
         out.sort_unstable();
         out
+    }
+
+    /// Every subject that can incur a handoff default: each departed node's round-0 `epoch_id`, plus the
+    /// round-1 re-handoff nonce for any subject whose re-handoff has been triggered. A pure function of the
+    /// chain, so every node settles the same default set across both rounds.
+    fn defaultable_subjects(&self, blocks: &[Block]) -> Vec<u64> {
+        let mut subjects = self.handoff_subjects(blocks);
+        for orig in self.handoff_subjects(blocks) {
+            if let Some(rctx) = self.rehandoff_context(blocks, orig) {
+                subjects.push(rctx.nonce);
+            }
+        }
+        subjects
     }
 
     /// Independently validate a handoff receipt against public chain data: its subject has a finalized
@@ -1790,6 +1809,14 @@ impl Node {
         self
     }
 
+    /// Builder: a newcomer that holds back its join until `height` (then behaves like [`joining`]) — so it
+    /// is admitted only after an earlier on-chain event, e.g. a handoff committee has already formed.
+    pub fn joins_at(mut self, height: u64) -> Self {
+        self.joining = true;
+        self.join_at = Some(height);
+        self
+    }
+
     fn me(&self) -> [u8; 32] {
         self.identity.peer_id()
     }
@@ -1835,7 +1862,7 @@ impl Node {
         }
         // A newcomer keeps gossiping its self-signed join op until it is admitted (self-healing: it
         // stops once it appears in the active set).
-        if self.joining && !vset.contains(&self.me()) {
+        if self.joining && !vset.contains(&self.me()) && self.join_at.map_or(true, |h| height >= h) {
             debug!(height, "broadcasting self-signed JOIN op");
             let addr = self.config.listen_addr.clone();
             let op = match &self.admission {
