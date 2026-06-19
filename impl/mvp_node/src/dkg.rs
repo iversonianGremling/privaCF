@@ -403,6 +403,32 @@ pub fn reshare(
     out
 }
 
+/// One qualified old shareholder's **independent** re-share contribution to a new committee — the
+/// distributed counterpart of [`reshare`], which a single caller runs over *all* qualified shares.
+/// Here a holder of `my_share` (its own Shamir share, constant term of a fresh degree-`threshold−1`
+/// polynomial) deals only its share to `n_new` new parties, learning nothing about the others' shares
+/// and never reconstructing the secret. Returns `[(new_index, subshare)]` (1-based new index); the
+/// holder seals `subshare_k` to new party `k` confidentially and discards the rest.
+pub fn reshare_subdeal(threshold: usize, n_new: usize, my_share: &[u8; 32], ikm: &[u8]) -> Vec<(u64, [u8; 32])> {
+    shamir_split(my_share, threshold, n_new, ikm)
+}
+
+/// A new committee member's side of the distributed re-share: combine the sub-shares it received, one
+/// per qualified old holder, into its fresh Shamir share `x'_k = Σ_i λ_i(0)·subshare_{i,k}`. The Lagrange
+/// coefficients are taken over **exactly** the contributing `old_index` set, so every new member MUST
+/// combine over the identical qualified set for the new shares to lie on one consistent polynomial whose
+/// constant term is the unchanged secret (`Σ_i λ_i·x_i = x`). With ≥ `threshold` honest contributors the
+/// fresh shares reconstruct the SAME secret; no party ever holds it. Mirrors the inner sum of [`reshare`].
+pub fn reshare_combine(contributions: &[(u64, [u8; 32])]) -> [u8; 32] {
+    let old_indices: Vec<u64> = contributions.iter().map(|(i, _)| *i).collect();
+    let mut acc = blst_fr::default(); // 0
+    for (idx, subshare) in contributions {
+        let lambda = lagrange_at_zero(*idx, &old_indices);
+        acc = fr_add(&acc, &fr_mul(&lambda, &fr_from_be(subshare)));
+    }
+    fr_to_be(&acc)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -523,5 +549,54 @@ mod tests {
 
         // Fewer than the threshold cannot: 2 shares interpolate to an unrelated value.
         assert_ne!(shamir_recover(&shares[0..2]), secret, "below threshold learns nothing");
+    }
+
+    #[test]
+    fn distributed_reshare_rotates_custody_without_reconstructing_the_secret() {
+        // The arbitration re-handoff: a secret held 3-of-4 by an original committee must be re-shared to
+        // a FRESH committee when an original custodian departs — preserving the threshold split, with NO
+        // single party ever holding the secret. Each survivor sub-deals its OWN share independently.
+        let secret = [0x5Au8; 32];
+        let (t, k_old, k_new) = (3usize, 4usize, 4usize);
+        let old = shamir_split(&secret, t, k_old, b"orig-custody");
+
+        // Three of the four original custodians survive (indices 1,2,3); each independently re-shares its
+        // share to the new committee. None of them — nor anyone — reconstructs `secret`.
+        let survivors: Vec<(u64, [u8; 32])> = old[0..3].to_vec();
+        let subdeals: Vec<(u64, Vec<(u64, [u8; 32])>)> = survivors
+            .iter()
+            .map(|(idx, share)| {
+                let mut ikm = b"rehandoff".to_vec();
+                ikm.extend_from_slice(&idx.to_le_bytes());
+                (*idx, reshare_subdeal(t, k_new, share, &ikm))
+            })
+            .collect();
+
+        // Each NEW member m (1-based) combines the sub-share addressed to it from every survivor.
+        let new_shares: Vec<(u64, [u8; 32])> = (1..=k_new as u64)
+            .map(|m| {
+                let contributions: Vec<(u64, [u8; 32])> =
+                    subdeals.iter().map(|(idx, sd)| (*idx, sd[m as usize - 1].1)).collect();
+                (m, reshare_combine(&contributions))
+            })
+            .collect();
+
+        // The fresh committee holds the SAME secret 3-of-4: any 3 new shares reconstruct it...
+        assert_eq!(shamir_recover(&new_shares[0..3]), secret, "the re-shared committee recovers the original secret");
+        let scattered = [new_shares[0], new_shares[2], new_shares[3]];
+        assert_eq!(shamir_recover(&scattered), secret, "a different new 3-subset recovers the same secret");
+        // ...while fewer than the threshold of the NEW shares learn nothing.
+        assert_ne!(shamir_recover(&new_shares[0..2]), secret, "below threshold on the new committee learns nothing");
+
+        // Only `threshold` survivors re-sharing is required: with just 2 survivors the Lagrange set is the
+        // wrong degree, so the new shares do NOT reconstruct the secret (the re-handoff would stall/slash).
+        let too_few: Vec<(u64, Vec<(u64, [u8; 32])>)> = subdeals[0..2].to_vec();
+        let bad_new: Vec<(u64, [u8; 32])> = (1..=k_new as u64)
+            .map(|m| {
+                let c: Vec<(u64, [u8; 32])> = too_few.iter().map(|(idx, sd)| (*idx, sd[m as usize - 1].1)).collect();
+                (m, reshare_combine(&c))
+            })
+            .collect();
+        assert_ne!(shamir_recover(&bad_new[0..3]), secret, "fewer than threshold survivors cannot re-share the secret");
     }
 }

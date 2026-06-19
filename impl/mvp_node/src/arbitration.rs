@@ -221,6 +221,109 @@ pub fn open_custody(my_mix_sk: &[u8; 32], parcel: &CustodyParcel) -> Option<([u8
     Some((r_old, share))
 }
 
+// ──────────────────────────────── re-handoff (proactive custody re-share) ────────────────────────────────
+
+/// A `subject` nonce for re-handoff `round` (round 0 = the original handoff, round ≥ 1 = a re-handoff
+/// after an original custodian departs). Derived deterministically so every node selects the SAME fresh
+/// committee and binds the SAME receipts. Round 0 returns the original subject unchanged.
+pub fn rehandoff_subject(orig_subject: u64, round: u32) -> u64 {
+    if round == 0 {
+        return orig_subject;
+    }
+    let mut h = blake3::Hasher::new();
+    h.update(b"privacf-arbitration-rehandoff-subject-v1");
+    h.update(&orig_subject.to_le_bytes());
+    h.update(&round.to_le_bytes());
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&h.finalize().as_bytes()[..8]);
+    u64::from_le_bytes(b)
+}
+
+/// A confidential **re-share** parcel one surviving custodian sends to a fresh committee member: the
+/// dealer's distributed re-share sub-share (`dkg::reshare_subdeal`) of its own custody share, plus the
+/// on-chain blinding `r_old` (every original custodian holds it), sealed to the member's `mix_pk`. The
+/// `old_index` is the dealer's 1-based position in the ORIGINAL committee — the new member combines
+/// sub-shares keyed by `old_index` (`dkg::reshare_combine`) into its fresh custody share, and no party
+/// ever reconstructs the secret. Same one-shot ECIES as [`CustodyParcel`], domain-separated per round.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReshareParcel {
+    pub subject: u64, // the ORIGINAL subject (re-handoff round is carried separately)
+    pub round: u32,
+    pub old_index: u64,
+    pub member: [u8; 32],
+    pub eph: [u8; 32],
+    pub ct: Vec<u8>, // (r_old ‖ subshare), XORed with the ECIES keystream
+}
+
+fn reshare_keystream(shared: &RistrettoPoint, subject: u64, round: u32, old_index: u64, member: &[u8; 32], len: usize) -> Vec<u8> {
+    let mut h = blake3::Hasher::new();
+    h.update(b"privacf-arbitration-reshare-ecies-v1");
+    h.update(shared.compress().as_bytes());
+    h.update(&subject.to_le_bytes());
+    h.update(&round.to_le_bytes());
+    h.update(&old_index.to_le_bytes());
+    h.update(member);
+    let mut out = vec![0u8; len];
+    h.finalize_xof().fill(&mut out);
+    out
+}
+
+fn reshare_eph_scalar(eph_seed: &[u8; 32], subject: u64, round: u32, old_index: u64, member: &[u8; 32]) -> Scalar {
+    let mut wide = [0u8; 64];
+    let mut h = blake3::Hasher::new();
+    h.update(b"privacf-arbitration-reshare-eph-v1");
+    h.update(eph_seed);
+    h.update(&subject.to_le_bytes());
+    h.update(&round.to_le_bytes());
+    h.update(&old_index.to_le_bytes());
+    h.update(member);
+    h.finalize_xof().fill(&mut wide);
+    Scalar::from_bytes_mod_order_wide(&wide)
+}
+
+/// Seal `(r_old ‖ subshare)` from old custodian `old_index` to fresh-committee `member`'s `member_mix_pk`
+/// for re-handoff `round`. Deterministic via `eph_seed` (no RNG). `None` if `member_mix_pk` is invalid.
+#[allow(clippy::too_many_arguments)]
+pub fn seal_reshare(
+    member_mix_pk: &[u8; 32],
+    subject: u64,
+    round: u32,
+    old_index: u64,
+    member: &[u8; 32],
+    r_old: &[u8; 32],
+    subshare: &[u8; 32],
+    eph_seed: &[u8; 32],
+) -> Option<ReshareParcel> {
+    let pk = dec(member_mix_pk)?;
+    let e = reshare_eph_scalar(eph_seed, subject, round, old_index, member);
+    let eph = RISTRETTO_BASEPOINT_POINT * e;
+    let shared = pk * e;
+    let mut payload = [0u8; 64];
+    payload[..32].copy_from_slice(r_old);
+    payload[32..].copy_from_slice(subshare);
+    let ks = reshare_keystream(&shared, subject, round, old_index, member, 64);
+    let ct: Vec<u8> = payload.iter().zip(ks).map(|(a, b)| a ^ b).collect();
+    Some(ReshareParcel { subject, round, old_index, member: *member, eph: eph.compress().to_bytes(), ct })
+}
+
+/// Open a re-share parcel addressed to this member, recovering `(r_old, subshare)`. `None` if malformed
+/// or not actually sealed to `my_mix_sk`.
+pub fn open_reshare(my_mix_sk: &[u8; 32], parcel: &ReshareParcel) -> Option<([u8; 32], [u8; 32])> {
+    if parcel.ct.len() != 64 {
+        return None;
+    }
+    let e_pub = dec(&parcel.eph)?;
+    let sk = Scalar::from_bytes_mod_order(*my_mix_sk);
+    let shared = e_pub * sk;
+    let ks = reshare_keystream(&shared, parcel.subject, parcel.round, parcel.old_index, &parcel.member, 64);
+    let pt: Vec<u8> = parcel.ct.iter().zip(ks).map(|(a, b)| a ^ b).collect();
+    let mut r_old = [0u8; 32];
+    let mut subshare = [0u8; 32];
+    r_old.copy_from_slice(&pt[..32]);
+    subshare.copy_from_slice(&pt[32..]);
+    Some((r_old, subshare))
+}
+
 // ──────────────────────────────── handoff receipts + slashing ────────────────────────────────
 
 fn receipt_msg(subject: u64, c_new: &[u8; 32]) -> Vec<u8> {
@@ -427,6 +530,86 @@ mod tests {
         assert_eq!(c_new, pc.commit(&p, &r_new), "homomorphic re-blinding matches a direct re-commit");
         let proof = prove_reencryption(&pc, &c_old, &c_new, &got_r_old, &r_new, &[1u8; 32]);
         assert!(verify_reencryption(&pc, &c_old, &c_new, &proof), "the re-encryption proof verifies");
+    }
+
+    #[test]
+    fn reshare_parcels_rotate_custody_to_a_fresh_committee_in_loop_shape() {
+        // The in-loop re-handoff: an original 3-of-4 custody of a node's `sk_handle` is re-shared to a
+        // fresh committee when an original custodian departs. Each surviving custodian seals its distributed
+        // sub-share + the shared `r_old` to a new member; the new member combines and re-blinds `c_old`.
+        let pc = Pedersen::new(8);
+        let p = [4i64, 0, -2, 7, 1, 0, 3, -1];
+        let r_old = [9u8; 32];
+        let c_old = pc.commit(&p, &r_old);
+        let sk_handle = [0x42u8; 32];
+        let subject = 0xC0FFEEu64;
+        let round = 1u32;
+
+        // Original committee held sk_handle 3-of-4 (custody[i] addressed to original member at position i).
+        let custody = dkg::shamir_split(&sk_handle, 3, 4, b"handoff-custody");
+        // Survivors = original indices 1,2,3 (member at position 0 departed). Each independently sub-deals.
+        let survivors = [1u64, 2, 3];
+        let new_members: Vec<NodeIdentity> = (20..24u64).map(NodeIdentity::from_seed).collect();
+        let new_ids: Vec<[u8; 32]> = new_members.iter().map(|m| m.peer_id()).collect();
+
+        // Each survivor seals (r_old ‖ subshare_k) to every new member k.
+        let mut parcels: Vec<ReshareParcel> = Vec::new();
+        for &oi in &survivors {
+            let subdeal = dkg::reshare_subdeal(3, new_ids.len(), &custody[oi as usize - 1].1, &oi.to_le_bytes());
+            for (k, member) in new_ids.iter().enumerate() {
+                let eph_seed = blake3::hash(&[&oi.to_le_bytes()[..], member].concat());
+                let parcel = seal_reshare(
+                    &new_members[k].mix_pk(),
+                    subject,
+                    round,
+                    oi,
+                    member,
+                    &r_old,
+                    &subdeal[k].1,
+                    eph_seed.as_bytes(),
+                )
+                .expect("valid member key");
+                parcels.push(parcel);
+            }
+        }
+
+        // New member 0 opens its three parcels, recovers r_old + a sub-share per survivor, and combines.
+        let target = &new_members[0];
+        let mine: Vec<&ReshareParcel> = parcels.iter().filter(|p| p.member == target.peer_id()).collect();
+        assert_eq!(mine.len(), 3, "one parcel per surviving custodian");
+        let mut contributions: Vec<(u64, [u8; 32])> = Vec::new();
+        let mut got_r_old = None;
+        for parcel in &mine {
+            let (ro, sub) = open_reshare(&target.mix_sk(), parcel).expect("opens");
+            got_r_old = Some(ro);
+            contributions.push((parcel.old_index, sub));
+        }
+        assert_eq!(got_r_old, Some(r_old), "the new member recovers the on-chain blinding");
+        let fresh_share = dkg::reshare_combine(&contributions);
+
+        // Reconstruct the fresh-committee shares for all four new members and confirm the SAME sk_handle is
+        // preserved 3-of-4 — without any party ever reconstructing it during the re-share.
+        let new_shares: Vec<(u64, [u8; 32])> = (0..new_ids.len())
+            .map(|ki| {
+                let contribs: Vec<(u64, [u8; 32])> = survivors
+                    .iter()
+                    .map(|&oi| {
+                        let subdeal = dkg::reshare_subdeal(3, new_ids.len(), &custody[oi as usize - 1].1, &oi.to_le_bytes());
+                        (oi, subdeal[ki].1)
+                    })
+                    .collect();
+                (ki as u64 + 1, dkg::reshare_combine(&contribs))
+            })
+            .collect();
+        assert_eq!(new_shares[0].1, fresh_share, "the opened-parcel combine matches the canonical fresh share");
+        assert_eq!(dkg::shamir_recover(&new_shares[0..3]), sk_handle, "the fresh committee holds the same sk_handle 3-of-4");
+
+        // The new member re-blinds the SAME on-chain c_old under a fresh blinding it controls, never seeing p.
+        let r_new = [0x77u8; 32];
+        let c_new = reencrypt(&pc, &c_old, &got_r_old.unwrap(), &r_new).expect("reencrypt");
+        assert_eq!(c_new, pc.commit(&p, &r_new), "the re-handoff re-commits the same vector");
+        let proof = prove_reencryption(&pc, &c_old, &c_new, &r_old, &r_new, &[5u8; 32]);
+        assert!(verify_reencryption(&pc, &c_old, &c_new, &proof), "the re-handoff re-encryption proof verifies");
     }
 
     #[test]
