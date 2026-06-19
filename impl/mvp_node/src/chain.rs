@@ -62,6 +62,12 @@ pub struct BlockHeader {
     /// from which any node deterministically derives the oversight trigger.
     pub verdict_commits: Vec<crate::verdict::VerdictCommit>,
     pub watchdog_signals: Vec<crate::watchdog::WatchdogSignal>,
+    /// §6.6 Class-3 / rewind evidence. The signed `rewind_signals` (`rewind.rs`) that recommendation
+    /// participants raise when an on-chain gossip cohort spikes a foreign item into their
+    /// recommendations (a coordinated, individually-valid push the objective verdict path can't flag).
+    /// Header-covered and re-validated by every validator; a quorum of distinct signers spanning ≥2
+    /// interest clusters, all naming the same cohort epoch, deterministically triggers a Class-3 audit.
+    pub rewind_signals: Vec<crate::rewind::RewindSignal>,
 }
 
 /// A validator's BLS vote over a slot — the unit aggregated into the quorum certificate. The signed
@@ -237,6 +243,7 @@ impl BlockHeader {
             audit_reports: Vec::new(),
             verdict_commits: Vec::new(),
             watchdog_signals: Vec::new(),
+            rewind_signals: Vec::new(),
         }
     }
 }
@@ -275,6 +282,7 @@ impl Chain {
             audit_reports: Vec::new(),
             verdict_commits: Vec::new(),
             watchdog_signals: Vec::new(),
+            rewind_signals: Vec::new(),
         };
         Chain {
             blocks: vec![Block {
