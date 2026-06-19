@@ -21,6 +21,7 @@ use crate::admission::VdfAdmission;
 use crate::audit::FirstObservation;
 use crate::beacon::{next_beacon, next_beacon_vdf};
 use crate::bls;
+use crate::arbitration::{CustodyParcel, HandoffReceipt};
 use crate::rewind::RewindSignal;
 use crate::verdict::VerdictCommit;
 use crate::watchdog::WatchdogSignal;
@@ -175,6 +176,7 @@ pub fn genesis_validator_set(nodes: u64, base_port: u16) -> Vec<ValidatorRecord>
                 addr: format!("127.0.0.1:{}", base_port + i as u16),
                 bls_pk: id.bls_pk(),
                 vrf_pk: id.vrf_pk(),
+                mix_pk: id.mix_pk(),
             }
         })
         .collect()
@@ -235,6 +237,21 @@ pub struct NodeOutcome {
     /// Count of rewind signals recorded across this node's finalized chain — evidence the in-loop
     /// recommendation participants (`with_rewind_authority`) actually attested to the poisoning cohort.
     pub rewind_signals_recorded: usize,
+    /// Count of §4.1/§6.4 arbitration handoff receipts recorded across this node's finalized chain.
+    pub handoff_receipts_recorded: usize,
+    /// Whether every departed node with a live handoff reached a custody threshold of valid recorded
+    /// receipts — the §4.1 handoff completed under the new committee's custody. A pure function of the
+    /// chain, so all honest nodes agree (see `handoff_completed_count` / `arbitration.rs`).
+    pub handoff_complete: bool,
+}
+
+/// The public, chain-derived context of one arbitration handoff (`handoff_context`).
+struct HandoffCtx {
+    subject_peer: [u8; 32],
+    height: u64,
+    c_old: [u8; 32],
+    width: usize,
+    committee: Vec<[u8; 32]>,
 }
 
 /// Per-height consensus state.
@@ -358,6 +375,10 @@ pub struct Node {
     /// `BlockHeader::rewind_signals`. A quorum of distinct signers across ≥2 clusters triggers a Class-3
     /// audit. Every node then derives the trigger from the on-chain signals. Honest default `false`.
     rewind_authority: bool,
+    /// If true, this node serves on §4.1/§6.4 arbitration committees: when it is beacon-selected for a
+    /// departing node's handoff and receives its custody parcel, it re-encrypts the subject's on-chain
+    /// `C_p` under a fresh blinding it holds and files a signed `HandoffReceipt`. Honest default `false`.
+    arbitration_authority: bool,
     /// Fault injection: if `Some((item, weight, from_epoch))`, this node is part of a coordinated push
     /// cohort — from epoch `from_epoch` it overwrites its obfuscated gossip with a single, within-bound
     /// concentration on `item` (weight `weight`). Several such nodes spike `item`'s on-chain gossip
@@ -393,6 +414,7 @@ impl Node {
             watchdog_authority: false,
             rogue_commit_targets: Vec::new(),
             rewind_authority: false,
+            arbitration_authority: false,
             push_item: None,
         }
     }
@@ -420,6 +442,14 @@ impl Node {
     /// preferences (`with_preferences`) so the node has a dominant interest to judge foreignness against.
     pub fn with_rewind_authority(mut self) -> Self {
         self.rewind_authority = true;
+        self
+    }
+
+    /// Builder: let this node serve on §4.1/§6.4 arbitration committees (`drive`/`on_msg` custody +
+    /// handoff). When beacon-selected for a departing node it re-encrypts the subject's on-chain `C_p`
+    /// under a fresh blinding and files a signed `HandoffReceipt` the next leader records.
+    pub fn with_arbitration_authority(mut self) -> Self {
+        self.arbitration_authority = true;
         self
     }
 
@@ -1165,6 +1195,210 @@ impl Node {
         mixer.publish(peers, beacon, Message::Rewind(signal));
     }
 
+    // ───────────────────────────────── §4.1/§6.4 arbitration handoff ─────────────────────────────────
+
+    /// Every `(member, subject)` handoff receipt already finalized on `blocks` — the recording dedup.
+    fn recorded_handoff_keys(&self, blocks: &[Block]) -> HashSet<([u8; 32], u64)> {
+        blocks
+            .iter()
+            .flat_map(|b| b.header.handoff_receipts.iter())
+            .map(|r| (r.member, r.subject))
+            .collect()
+    }
+
+    /// The public context of a `subject`'s handoff, re-derived identically by every node from the chain:
+    /// the departed node's peer, the height/beacon it last committed at, its on-chain `c_old` and vector
+    /// width, and the beacon-selected committee (the subject itself excluded). `None` until the subject's
+    /// preference-carrying transaction is finalized.
+    fn handoff_context(&self, blocks: &[Block], subject: u64) -> Option<HandoffCtx> {
+        let (subject_peer, height, beacon, c_old, width) = blocks.iter().find_map(|b| {
+            b.txs.iter().find(|t| t.epoch_id == subject && t.pref.is_some()).map(|t| {
+                let p = t.pref.as_ref().unwrap();
+                (t.submitter, b.header.height, b.header.beacon_t, p.c_p, p.gossip.len())
+            })
+        })?;
+        let pool: Vec<[u8; 32]> =
+            self.active_set_at(blocks, height).peers.into_iter().filter(|p| *p != subject_peer).collect();
+        let committee = crate::arbitration::select_committee(&pool, beacon, subject, crate::arbitration::COMMITTEE_SIZE);
+        Some(HandoffCtx { subject_peer, height, c_old, width, committee })
+    }
+
+    /// This member's deterministic fresh blinding `r_new` for `subject`'s re-encrypted commitment — bound
+    /// to its own `sk` and the subject, so it is reproducible (no stored per-handoff state) and the
+    /// committee never shares a blinding.
+    fn handoff_r_new(&self, subject: u64) -> [u8; 32] {
+        let mut h = blake3::Hasher::new();
+        h.update(b"privacf-arbitration-r-new-v1");
+        h.update(&to_u64(self.identity.sk).to_le_bytes());
+        h.update(&subject.to_le_bytes());
+        *h.finalize().as_bytes()
+    }
+
+    /// How many committee members have a valid recorded receipt for `subject` (`arbitration::settle` over
+    /// the on-chain receipts). A pure function of the finalized chain, so all nodes agree.
+    fn handoff_completed_count(&self, blocks: &[Block], subject: u64) -> usize {
+        let Some(ctx) = self.handoff_context(blocks, subject) else { return 0 };
+        let pc = crate::pedersen::Pedersen::new(ctx.width.max(1));
+        let receipts: Vec<HandoffReceipt> =
+            blocks.iter().flat_map(|b| b.header.handoff_receipts.iter().cloned()).collect();
+        let (completed, _) = crate::arbitration::settle(&pc, &ctx.c_old, &ctx.committee, subject, &receipts);
+        completed.len()
+    }
+
+    /// Independently validate a handoff receipt against public chain data: its subject has a finalized
+    /// `c_old`, the member is in the beacon-selected committee, and the signed re-encryption proof binds
+    /// `c_new` to `c_old`. Self-contained, so a proposer cannot inject a forged handoff.
+    fn validate_handoff_receipt(&self, blocks: &[Block], r: &HandoffReceipt) -> bool {
+        let Some(ctx) = self.handoff_context(blocks, r.subject) else { return false };
+        let pc = crate::pedersen::Pedersen::new(ctx.width.max(1));
+        r.verify(&pc, &ctx.c_old, &ctx.committee)
+    }
+
+    /// The subjects with a live handoff on `blocks`: each departed node (a finalized `Remove`) contributes
+    /// exactly the preference epoch_id of its **profile at departure** — the latest preference transaction
+    /// at or before the height its `Remove` was recorded (so a removed node's post-departure gossip can't
+    /// move the subject). A pure function of the chain, so every node derives the same subject set with no
+    /// off-chain signal.
+    fn handoff_subjects(&self, blocks: &[Block]) -> Vec<u64> {
+        // earliest height each departed peer's Remove was recorded at
+        let mut remove_h: HashMap<[u8; 32], u64> = HashMap::new();
+        for b in blocks {
+            for op in &b.header.membership_ops {
+                if let MembershipOp::Remove { peer_id, .. } = op {
+                    remove_h.entry(*peer_id).or_insert(b.header.height);
+                }
+            }
+        }
+        // per departed peer, its preference epoch_id at the greatest height ≤ its remove height
+        let mut best: HashMap<[u8; 32], (u64, u64)> = HashMap::new();
+        for b in blocks {
+            for t in &b.txs {
+                if !t.pref.is_some() {
+                    continue;
+                }
+                if let Some(&rh) = remove_h.get(&t.submitter) {
+                    if b.header.height <= rh {
+                        let e = best.entry(t.submitter).or_insert((0, 0));
+                        if b.header.height >= e.0 {
+                            *e = (b.header.height, t.epoch_id);
+                        }
+                    }
+                }
+            }
+        }
+        let mut out: Vec<u64> = best.values().map(|(_, e)| *e).collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Leaver-side custody dispatch (§4.1/§6.4). Once this node's departure is finalized, it Shamir-splits
+    /// its custody secret across its beacon-selected committee and seals each share + the on-chain
+    /// commitment blinding `r_old` to that member's `mix_pk` (`arbitration::seal_custody`), gossiping one
+    /// confidential parcel per member. Re-dispatched at most once per height (`last_height`) until a
+    /// threshold of custodians have filed — so a dropped parcel self-heals without flooding.
+    fn drive_custody_dispatch(
+        &self,
+        chain: &Chain,
+        peers: &PeersMap,
+        mixer: &Mixer,
+        beacon: u64,
+        last_height: &mut Option<u64>,
+    ) {
+        if self.leave_at.is_none() || self.preferences.is_none() {
+            return; // only a configured leaver with a profile dispatches custody
+        }
+        let head = chain.head().header.height;
+        if *last_height == Some(head) {
+            return; // at most one dispatch per height (re-dispatch self-heals dropped parcels)
+        }
+        // Our own departure subject — derived from the chain exactly as every other node derives it, so
+        // the committee files for the same subject we dispatch for.
+        let mine: Vec<(u64, HandoffCtx)> = self
+            .handoff_subjects(&chain.blocks)
+            .into_iter()
+            .filter_map(|s| self.handoff_context(&chain.blocks, s).map(|c| (s, c)))
+            .filter(|(_, c)| c.subject_peer == self.me())
+            .collect();
+        if mine.is_empty() {
+            return; // our Remove is not finalized yet
+        }
+        *last_height = Some(head);
+        let sk_handle = self.pref_sk_handle();
+        for (subject, ctx) in mine {
+            if self.handoff_completed_count(&chain.blocks, subject) >= crate::arbitration::CUSTODY_THRESHOLD {
+                continue; // enough custodians already hold this handoff
+            }
+            let r_old = crate::epoch::pref_blinding(&sk_handle, subject);
+            let vset = self.active_set_at(&chain.blocks, ctx.height);
+            let custody = crate::dkg::shamir_split(
+                &sk_handle,
+                crate::arbitration::CUSTODY_THRESHOLD,
+                ctx.committee.len().max(1),
+                b"handoff-custody",
+            );
+            for (i, member) in ctx.committee.iter().enumerate() {
+                let Some(mix_pk) = vset.mix.get(member).copied() else { continue };
+                let mut hs = blake3::Hasher::new();
+                hs.update(b"privacf-arbitration-eph-seed-v1");
+                hs.update(&to_u64(self.identity.sk).to_le_bytes());
+                hs.update(&subject.to_le_bytes());
+                hs.update(member);
+                let eph_seed = *hs.finalize().as_bytes();
+                if let Some(parcel) =
+                    crate::arbitration::seal_custody(&mix_pk, subject, member, &r_old, &custody[i].1, &eph_seed)
+                {
+                    mixer.publish(peers, beacon, Message::CustodyDispatch(parcel));
+                }
+            }
+        }
+    }
+
+    /// Committee-member reaction to a custody parcel addressed to this node: open it, re-blind the
+    /// subject's on-chain `c_old` to a fresh `r_new` it controls (homomorphically, never seeing the
+    /// vector), prove the re-encryption, and file a signed receipt for the next leader to record. Pools
+    /// once per subject (`recorded`/`pool` dedup).
+    fn handle_custody_parcel(
+        &self,
+        chain: &Chain,
+        parcel: &CustodyParcel,
+        handoff_pool: &mut Vec<HandoffReceipt>,
+        peers: &PeersMap,
+        mixer: &Mixer,
+        beacon: u64,
+    ) {
+        if !self.arbitration_authority || parcel.member != self.me() {
+            return;
+        }
+        let subject = parcel.subject;
+        let key = (self.me(), subject);
+        if self.recorded_handoff_keys(&chain.blocks).contains(&key)
+            || handoff_pool.iter().any(|r| (r.member, r.subject) == key)
+        {
+            return;
+        }
+        let Some(ctx) = self.handoff_context(&chain.blocks, subject) else { return };
+        if !ctx.committee.contains(&self.me()) {
+            return;
+        }
+        let Some((r_old, share)) = crate::arbitration::open_custody(&self.identity.mix_sk(), parcel) else { return };
+        let pc = crate::pedersen::Pedersen::new(ctx.width.max(1));
+        let r_new = self.handoff_r_new(subject);
+        let Some(c_new) = crate::arbitration::reencrypt(&pc, &ctx.c_old, &r_old, &r_new) else { return };
+        let mut hs = blake3::Hasher::new();
+        hs.update(b"privacf-arbitration-reenc-seed-v1");
+        hs.update(&to_u64(self.identity.sk).to_le_bytes());
+        hs.update(&subject.to_le_bytes());
+        let seed = *hs.finalize().as_bytes();
+        let proof = crate::arbitration::prove_reencryption(&pc, &ctx.c_old, &c_new, &r_old, &r_new, &seed);
+        let receipt = HandoffReceipt::create(&self.identity, subject, c_new, proof, &share);
+        if !receipt.verify(&pc, &ctx.c_old, &ctx.committee) {
+            return;
+        }
+        handoff_pool.push(receipt.clone());
+        mixer.publish(peers, beacon, Message::Handoff(receipt));
+    }
+
     /// Fault-injection builder: this node will never propose (Byzantine leader that withholds its
     /// block), exercising the other validators' view-change path.
     pub fn byzantine_withhold(mut self) -> Self {
@@ -1347,6 +1581,7 @@ impl Node {
         verdict_commit_pool: &[VerdictCommit],
         watchdog_pool: &[WatchdogSignal],
         rewind_pool: &[RewindSignal],
+        handoff_pool: &[HandoffReceipt],
         alt: bool,
     ) -> Block {
         let prev = chain.head_hash();
@@ -1439,6 +1674,20 @@ impl Node {
                 rewind_signals.push(s.clone());
             }
         }
+        // Include arbitration handoff receipts awaiting inclusion — one per (member, subject),
+        // re-validated against the subject's on-chain c_old + committee, not already recorded.
+        let recorded_ho = self.recorded_handoff_keys(&chain.blocks);
+        let mut ho_keys: HashSet<([u8; 32], u64)> = HashSet::new();
+        let mut handoff_receipts: Vec<HandoffReceipt> = Vec::new();
+        for r in handoff_pool {
+            let key = (r.member, r.subject);
+            if !recorded_ho.contains(&key)
+                && ho_keys.insert(key)
+                && self.validate_handoff_receipt(&chain.blocks, r)
+            {
+                handoff_receipts.push(r.clone());
+            }
+        }
         if alt {
             txs.clear(); // a conflicting variant of the same slot -> a different block id
             ops.clear();
@@ -1448,6 +1697,7 @@ impl Node {
             verdict_commits.clear();
             watchdog_signals.clear();
             rewind_signals.clear();
+            handoff_receipts.clear();
         }
         let mut header = BlockHeader::create(
             &self.identity, r.height, r.view, r.beacon_t, prev, my_epoch_id, &r.my_vrf,
@@ -1459,6 +1709,7 @@ impl Node {
         header.verdict_commits = verdict_commits;
         header.watchdog_signals = watchdog_signals;
         header.rewind_signals = rewind_signals;
+        header.handoff_receipts = handoff_receipts;
         let (susp_root, decr_root) = self.smt_roots_at(&chain.blocks, r.height);
         header.susp_smt_root = susp_root;
         header.decryption_smt_root = decr_root;
@@ -1585,6 +1836,21 @@ impl Node {
                 }
             }
         }
+        // Every arbitration handoff receipt must re-validate against the subject's on-chain c_old +
+        // committee, be unique within the block, and not already be recorded — so no proposer forges one.
+        {
+            let recorded = self.recorded_handoff_keys(&chain.blocks);
+            let mut seen: HashSet<([u8; 32], u64)> = HashSet::new();
+            for r in &b.header.handoff_receipts {
+                let key = (r.member, r.subject);
+                if recorded.contains(&key)
+                    || !seen.insert(key)
+                    || !self.validate_handoff_receipt(&chain.blocks, r)
+                {
+                    return false;
+                }
+            }
+        }
         if !vset.contains(&b.header.proposer_peer) {
             return false;
         }
@@ -1641,6 +1907,7 @@ impl Node {
         verdict_commit_pool: &[VerdictCommit],
         watchdog_pool: &[WatchdogSignal],
         rewind_pool: &[RewindSignal],
+        handoff_pool: &[HandoffReceipt],
         peers: &PeersMap,
         mixer: &Mixer,
         slashed: &HashSet<[u8; 32]>,
@@ -1661,13 +1928,13 @@ impl Node {
                 r.proposed_views.insert(r.view);
                 if self.equivocate {
                     // Byzantine: double-sign two conflicting blocks for this slot.
-                    let a = self.assemble_block(chain, r, pending, pending_membership, pending_suspensions, audit_pool, verdict_commit_pool, watchdog_pool, rewind_pool, false);
-                    let b = self.assemble_block(chain, r, pending, pending_membership, pending_suspensions, audit_pool, verdict_commit_pool, watchdog_pool, rewind_pool, true);
+                    let a = self.assemble_block(chain, r, pending, pending_membership, pending_suspensions, audit_pool, verdict_commit_pool, watchdog_pool, rewind_pool, handoff_pool, false);
+                    let b = self.assemble_block(chain, r, pending, pending_membership, pending_suspensions, audit_pool, verdict_commit_pool, watchdog_pool, rewind_pool, handoff_pool, true);
                     debug!(height = r.height, view = r.view, "EQUIVOCATING (double-signing the slot)");
                     mixer.publish(peers, r.beacon_t, Message::Proposal(a));
                     mixer.publish(peers, r.beacon_t, Message::Proposal(b));
                 } else {
-                    let block = self.assemble_block(chain, r, pending, pending_membership, pending_suspensions, audit_pool, verdict_commit_pool, watchdog_pool, rewind_pool, false);
+                    let block = self.assemble_block(chain, r, pending, pending_membership, pending_suspensions, audit_pool, verdict_commit_pool, watchdog_pool, rewind_pool, handoff_pool, false);
                     let bid = block_id(&block.header, &block.txs);
                     debug!(height = r.height, view = r.view, txs = block.txs.len(), "proposing as VRF leader");
                     r.blocks.insert(bid, block.clone());
@@ -1744,6 +2011,7 @@ impl Node {
         verdict_commit_pool: &mut Vec<VerdictCommit>,
         watchdog_pool: &mut Vec<WatchdogSignal>,
         rewind_pool: &mut Vec<RewindSignal>,
+        handoff_pool: &mut Vec<HandoffReceipt>,
         peers: &PeersMap,
         mixer: &Mixer,
         slashed: &mut HashSet<[u8; 32]>,
@@ -1854,6 +2122,25 @@ impl Node {
                 }
                 rewind_pool.push(s.clone());
                 mixer.publish(peers, beacon_hint, Message::Rewind(s));
+            }
+            Message::CustodyDispatch(parcel) => {
+                // A confidential arbitration custody parcel: if it is addressed to us and we serve on the
+                // committee, open it and file our handoff receipt (consumed here, never re-gossiped or
+                // recorded — it carries the subject's secret blinding, sealed to us alone).
+                self.handle_custody_parcel(chain, &parcel, handoff_pool, peers, mixer, beacon_hint);
+            }
+            Message::Handoff(r) => {
+                // A committee member's handoff receipt: pool it (dedup by member/subject) only if it
+                // re-validates against the subject's on-chain c_old + committee, then re-gossip once.
+                let key = (r.member, r.subject);
+                if self.recorded_handoff_keys(&chain.blocks).contains(&key)
+                    || handoff_pool.iter().any(|x| (x.member, x.subject) == key)
+                    || !self.validate_handoff_receipt(&chain.blocks, &r)
+                {
+                    return;
+                }
+                handoff_pool.push(r.clone());
+                mixer.publish(peers, beacon_hint, Message::Handoff(r));
             }
             Message::Membership(op) => {
                 // Pool self-authorized membership ops for the next leader to record on-chain, and
@@ -2092,6 +2379,8 @@ impl Node {
         let mut watchdog_pool: Vec<WatchdogSignal> = Vec::new();
         let mut rewind_raised = false;
         let mut rewind_pool: Vec<RewindSignal> = Vec::new();
+        let mut handoff_pool: Vec<HandoffReceipt> = Vec::new();
+        let mut custody_dispatch_height: Option<u64> = None;
         let mut epoch_ids: Vec<(u64, u64)> = Vec::new();
         let mut beacons: Vec<(u64, u64)> = Vec::new();
         let mut split_ok = true;
@@ -2168,6 +2457,8 @@ impl Node {
                     watchdog_pool.retain(|s| !recorded_wd.contains(&(s.epoch_id, s.epoch_t)));
                     let recorded_rw = self.recorded_rewind_keys(&chain.blocks);
                     rewind_pool.retain(|s| !recorded_rw.contains(&(s.epoch_id, s.cohort_epoch)));
+                    let recorded_ho = self.recorded_handoff_keys(&chain.blocks);
+                    handoff_pool.retain(|r| !recorded_ho.contains(&(r.member, r.subject)));
                     // Learn the dial addresses of all current members so the dial task can reach a
                     // newly-admitted validator.
                     {
@@ -2191,12 +2482,13 @@ impl Node {
                     self.drive_rogue_commits(&chain, &peers, &mixer, beacon_hint, &mut rogue_committed, &mut verdict_commit_pool);
                     self.drive_watchdog(&chain, &peers, &mixer, beacon_hint, &mut watchdog_raised, &mut watchdog_pool);
                     self.drive_rewind(&chain, &peers, &mixer, beacon_hint, &mut rewind_raised, &mut rewind_pool);
+                    self.drive_custody_dispatch(&chain, &peers, &mixer, beacon_hint, &mut custody_dispatch_height);
                     if let Some(r) = round.as_mut() {
-                        self.on_tick(r, &mut chain, &pending, &pending_membership, &pending_suspensions, &audit_pool, &verdict_commit_pool, &watchdog_pool, &rewind_pool, &peers, &mixer, &slashed);
+                        self.on_tick(r, &mut chain, &pending, &pending_membership, &pending_suspensions, &audit_pool, &verdict_commit_pool, &watchdog_pool, &rewind_pool, &handoff_pool, &peers, &mixer, &slashed);
                     }
                 }
                 Some(msg) = inbox_rx.recv() => {
-                    self.on_msg(msg, round.as_mut(), &mut chain, &mut pending, &mut pending_membership, &mut pending_suspensions, &mut verdict_partials, &mut audit_pool, &mut verdict_commit_pool, &mut watchdog_pool, &mut rewind_pool, &peers, &mixer, &mut slashed);
+                    self.on_msg(msg, round.as_mut(), &mut chain, &mut pending, &mut pending_membership, &mut pending_suspensions, &mut verdict_partials, &mut audit_pool, &mut verdict_commit_pool, &mut watchdog_pool, &mut rewind_pool, &mut handoff_pool, &peers, &mixer, &mut slashed);
                 }
             }
         }
@@ -2222,7 +2514,14 @@ impl Node {
         let class3_triggered = self.class3_triggered(&chain.blocks);
         let rewind_signals_recorded =
             chain.blocks.iter().map(|b| b.header.rewind_signals.len()).sum::<usize>();
-        info!(peer = %hex::encode(&my_id[..4]), blocks = chain.blocks.len(), head = %hex::encode(&chain.head_hash()[..4]), all_qc_valid, max_view, slashed = slashed_vec.len(), active = final_active.len(), suspended = suspended_targets.len(), flagged = flagged_cohort.len(), audit_reports = audit_reports_recorded, oversight = oversight_triggered, wd_signals = watchdog_signals_recorded, commits = verdict_commits_recorded, class3 = class3_triggered, rewind_signals = rewind_signals_recorded, "node done");
+        let handoff_receipts_recorded =
+            chain.blocks.iter().map(|b| b.header.handoff_receipts.len()).sum::<usize>();
+        let handoff_subjects = self.handoff_subjects(&chain.blocks);
+        let handoff_complete = !handoff_subjects.is_empty()
+            && handoff_subjects.iter().all(|&s| {
+                self.handoff_completed_count(&chain.blocks, s) >= crate::arbitration::CUSTODY_THRESHOLD
+            });
+        info!(peer = %hex::encode(&my_id[..4]), blocks = chain.blocks.len(), head = %hex::encode(&chain.head_hash()[..4]), all_qc_valid, max_view, slashed = slashed_vec.len(), active = final_active.len(), suspended = suspended_targets.len(), flagged = flagged_cohort.len(), audit_reports = audit_reports_recorded, oversight = oversight_triggered, wd_signals = watchdog_signals_recorded, commits = verdict_commits_recorded, class3 = class3_triggered, rewind_signals = rewind_signals_recorded, handoffs = handoff_receipts_recorded, handoff_complete, "node done");
         NodeOutcome {
             peer_id: my_id,
             head_hash: chain.head_hash(),
@@ -2242,6 +2541,8 @@ impl Node {
             verdict_commits_recorded,
             class3_triggered,
             rewind_signals_recorded,
+            handoff_receipts_recorded,
+            handoff_complete,
         }
     }
 }
@@ -2377,6 +2678,12 @@ mod tests {
             preferred_t: 0,
             cohort_epoch: 0,
             sig: Vec::new(),
+        })));
+        assert!(Mixer::is_routable(&Message::CustodyDispatch(crate::arbitration::CustodyParcel {
+            subject: 0,
+            member: [0u8; 32],
+            eph: [0u8; 32],
+            ct: Vec::new(),
         })));
         assert!(!Mixer::is_routable(&Message::Hello {
             peer_id: [0u8; 32],
