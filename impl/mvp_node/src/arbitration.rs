@@ -27,12 +27,19 @@
 //! (the *when* — triggering on a verdict/rotation and carrying receipts in blocks) is the tracked
 //! refinement, mirroring `verdict.rs`.
 
+use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
 use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
 use curve25519_dalek::scalar::Scalar;
 use serde::{Deserialize, Serialize};
 
 use crate::identity::{verify as verify_ed25519, NodeIdentity};
 use crate::pedersen::Pedersen;
+
+/// Arbitration committee size — the `size` of [`select_committee`] for an in-loop handoff.
+pub const COMMITTEE_SIZE: usize = 4;
+/// Shamir custody threshold — any `CUSTODY_THRESHOLD` committee members reconstruct the custody secret
+/// (`dkg::shamir_recover`); fewer learn nothing.
+pub const CUSTODY_THRESHOLD: usize = 3;
 
 // ───────────────────────────────── committee selection ─────────────────────────────────
 
@@ -121,6 +128,93 @@ pub fn verify_reencryption(pc: &Pedersen, c_old: &[u8; 32], c_new: &[u8; 32], pr
     let Some(z) = Option::<Scalar>::from(Scalar::from_canonical_bytes(proof.z)) else { return false };
     let e = reenc_challenge(&cold, &cnew, &t);
     pc.h() * z == t + (cnew - cold) * e
+}
+
+/// Homomorphically re-blind `c_old` from `r_old` to `r_new` WITHOUT the preference vector:
+/// `c_new = c_old + (r_new − r_old)·H`. A committee member computes the freshly-blinded commitment it
+/// will custody knowing only the public `c_old` and the two blindings — never the underlying vector.
+pub fn reencrypt(pc: &Pedersen, c_old: &[u8; 32], r_old: &[u8; 32], r_new: &[u8; 32]) -> Option<[u8; 32]> {
+    let cold = dec(c_old)?;
+    let dr = Scalar::from_bytes_mod_order(*r_new) - Scalar::from_bytes_mod_order(*r_old);
+    Some((cold + pc.h() * dr).compress().to_bytes())
+}
+
+// ──────────────────────────────── confidential custody delivery ────────────────────────────────
+
+/// A confidential custody parcel a departing node sends to one committee member: the member's Shamir
+/// custody share **and** the on-chain commitment's blinding `r_old` (needed to compute the re-blinded
+/// `c_new = c_old + Δr·H`), sealed to the member's Ristretto `mix_pk` by a one-shot ECIES so only that
+/// member can open it. `r_old` is confidential — revealing it would strip the Pedersen commitment's
+/// hiding — so it never travels in the clear.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CustodyParcel {
+    pub subject: u64,
+    pub member: [u8; 32],
+    pub eph: [u8; 32], // ephemeral Ristretto public key
+    pub ct: Vec<u8>,   // (r_old ‖ share), XORed with the ECIES keystream
+}
+
+/// ECIES keystream over the DH shared point, domain-separated and bound to `(subject, member)`.
+fn custody_keystream(shared: &RistrettoPoint, subject: u64, member: &[u8; 32], len: usize) -> Vec<u8> {
+    let mut h = blake3::Hasher::new();
+    h.update(b"privacf-arbitration-custody-ecies-v1");
+    h.update(shared.compress().as_bytes());
+    h.update(&subject.to_le_bytes());
+    h.update(member);
+    let mut out = vec![0u8; len];
+    h.finalize_xof().fill(&mut out);
+    out
+}
+
+fn eph_scalar(eph_seed: &[u8; 32], subject: u64, member: &[u8; 32]) -> Scalar {
+    let mut wide = [0u8; 64];
+    let mut h = blake3::Hasher::new();
+    h.update(b"privacf-arbitration-custody-eph-v1");
+    h.update(eph_seed);
+    h.update(&subject.to_le_bytes());
+    h.update(member);
+    h.finalize_xof().fill(&mut wide);
+    Scalar::from_bytes_mod_order_wide(&wide)
+}
+
+/// Seal `(r_old ‖ share)` to committee `member`'s `member_mix_pk`. `eph_seed` makes the ephemeral key
+/// deterministic (no RNG). Returns `None` if `member_mix_pk` is not a valid point.
+pub fn seal_custody(
+    member_mix_pk: &[u8; 32],
+    subject: u64,
+    member: &[u8; 32],
+    r_old: &[u8; 32],
+    share: &[u8; 32],
+    eph_seed: &[u8; 32],
+) -> Option<CustodyParcel> {
+    let pk = dec(member_mix_pk)?;
+    let e = eph_scalar(eph_seed, subject, member);
+    let eph = RISTRETTO_BASEPOINT_POINT * e;
+    let shared = pk * e;
+    let mut payload = [0u8; 64];
+    payload[..32].copy_from_slice(r_old);
+    payload[32..].copy_from_slice(share);
+    let ks = custody_keystream(&shared, subject, member, 64);
+    let ct: Vec<u8> = payload.iter().zip(ks).map(|(a, b)| a ^ b).collect();
+    Some(CustodyParcel { subject, member: *member, eph: eph.compress().to_bytes(), ct })
+}
+
+/// Open a parcel addressed to this member, recovering `(r_old, share)`. `None` if malformed or not
+/// actually sealed to `my_mix_sk`.
+pub fn open_custody(my_mix_sk: &[u8; 32], parcel: &CustodyParcel) -> Option<([u8; 32], [u8; 32])> {
+    if parcel.ct.len() != 64 {
+        return None;
+    }
+    let e_pub = dec(&parcel.eph)?;
+    let sk = Scalar::from_bytes_mod_order(*my_mix_sk);
+    let shared = e_pub * sk;
+    let ks = custody_keystream(&shared, parcel.subject, &parcel.member, 64);
+    let pt: Vec<u8> = parcel.ct.iter().zip(ks).map(|(a, b)| a ^ b).collect();
+    let mut r_old = [0u8; 32];
+    let mut share = [0u8; 32];
+    r_old.copy_from_slice(&pt[..32]);
+    share.copy_from_slice(&pt[32..]);
+    Some((r_old, share))
 }
 
 // ──────────────────────────────── handoff receipts + slashing ────────────────────────────────
@@ -292,6 +386,43 @@ mod tests {
         // recoverable without the departed node.
         let quorum: Vec<(u64, [u8; 32])> = (0..3).map(|i| custody[i]).collect();
         assert_eq!(dkg::shamir_recover(&quorum), r_old, "the filing quorum recovers the custody secret");
+    }
+
+    #[test]
+    fn custody_parcel_seals_to_one_member_and_reencrypt_is_homomorphic() {
+        let pc = Pedersen::new(8);
+        let p = [4i64, 0, -2, 7, 1, 0, 3, -1];
+        let r_old = [9u8; 32];
+        let c_old = pc.commit(&p, &r_old);
+
+        // The departing node Shamir-splits its custody secret and seals (r_old ‖ share) to a member.
+        let member = NodeIdentity::from_seed(3);
+        let interloper = NodeIdentity::from_seed(99);
+        let custody = dkg::shamir_split(&r_old, 3, 4, b"handoff-custody");
+        let parcel = seal_custody(
+            &member.mix_pk(),
+            0xC0FFEE,
+            &member.peer_id(),
+            &r_old,
+            &custody[0].1,
+            &[7u8; 32],
+        )
+        .expect("valid member key");
+
+        // Only the addressed member opens it; a different key recovers garbage, not r_old.
+        let (got_r_old, got_share) = open_custody(&member.mix_sk(), &parcel).expect("opens");
+        assert_eq!(got_r_old, r_old, "the member recovers the true blinding");
+        assert_eq!(got_share, custody[0].1, "the member recovers its custody share");
+        let (bad_r_old, _) = open_custody(&interloper.mix_sk(), &parcel).expect("decodes bytes");
+        assert_ne!(bad_r_old, r_old, "a non-addressed key cannot recover the custody secret");
+
+        // The member re-blinds c_old to a fresh r_new homomorphically — never seeing the vector — and
+        // the result equals a direct commitment of the SAME vector under r_new, and the proof binds it.
+        let r_new = [21u8; 32];
+        let c_new = reencrypt(&pc, &c_old, &got_r_old, &r_new).expect("reencrypt");
+        assert_eq!(c_new, pc.commit(&p, &r_new), "homomorphic re-blinding matches a direct re-commit");
+        let proof = prove_reencryption(&pc, &c_old, &c_new, &got_r_old, &r_new, &[1u8; 32]);
+        assert!(verify_reencryption(&pc, &c_old, &c_new, &proof), "the re-encryption proof verifies");
     }
 
     #[test]

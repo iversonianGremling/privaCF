@@ -60,6 +60,14 @@ pub enum Message {
     /// one that re-derives true against the on-chain item-velocity spike; a quorum of distinct signers
     /// spanning ≥2 interest clusters, all naming the same cohort epoch, triggers a Class-3 audit.
     Rewind(crate::rewind::RewindSignal),
+    /// A confidential §4.1/§6.4 arbitration custody parcel (`arbitration.rs`): a departing node seals its
+    /// custody share + commitment blinding to one committee member's `mix_pk`. Routed to the mesh; only
+    /// the addressed member can open it and act on it. Transient — consumed, not recorded on-chain.
+    CustodyDispatch(crate::arbitration::CustodyParcel),
+    /// A committee member's signed arbitration handoff receipt (`arbitration.rs`): the re-encrypted
+    /// commitment it now custodies + the ZK proof binding it to the subject's on-chain `c_old`. A node
+    /// pools / records one that verifies; the next leader records it in `BlockHeader::handoff_receipts`.
+    Handoff(crate::arbitration::HandoffReceipt),
     /// A fixed-size Sphinx mix packet to peel and forward/deliver (the Loopix layer, `loopix.rs`).
     Sphinx(SphinxPacket),
     /// Request all finalized blocks at height ≥ `from_height`.

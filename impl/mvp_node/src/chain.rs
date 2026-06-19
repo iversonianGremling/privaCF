@@ -68,6 +68,12 @@ pub struct BlockHeader {
     /// Header-covered and re-validated by every validator; a quorum of distinct signers spanning ≥2
     /// interest clusters, all naming the same cohort epoch, deterministically triggers a Class-3 audit.
     pub rewind_signals: Vec<crate::rewind::RewindSignal>,
+    /// §4.1/§6.4 arbitration handoff. Receipts (`arbitration.rs`) filed by the beacon-selected committee
+    /// for a departing node: each re-commits the subject's on-chain `C_p` under a fresh committee-held
+    /// blinding and carries the ZK proof that `c_new` re-encrypts the SAME vector. Header-covered and
+    /// re-validated by every validator; `arbitration::settle` over them credits filers and defaults
+    /// non-filers (slashable). The handoff preserves a departing node's profile under new custody.
+    pub handoff_receipts: Vec<crate::arbitration::HandoffReceipt>,
 }
 
 /// A validator's BLS vote over a slot — the unit aggregated into the quorum certificate. The signed
@@ -244,6 +250,7 @@ impl BlockHeader {
             verdict_commits: Vec::new(),
             watchdog_signals: Vec::new(),
             rewind_signals: Vec::new(),
+            handoff_receipts: Vec::new(),
         }
     }
 }
@@ -283,6 +290,7 @@ impl Chain {
             verdict_commits: Vec::new(),
             watchdog_signals: Vec::new(),
             rewind_signals: Vec::new(),
+            handoff_receipts: Vec::new(),
         };
         Chain {
             blocks: vec![Block {

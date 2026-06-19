@@ -32,11 +32,14 @@ pub struct ValidatorRecord {
     #[serde(with = "BigArray")]
     pub bls_pk: [u8; 48],
     pub vrf_pk: [u8; 32],
+    /// The validator's Ristretto mix public key (`identity.mix_pk()`) — peers seal confidential
+    /// committee messages (e.g. arbitration custody parcels, `arbitration.rs`) to it.
+    pub mix_pk: [u8; 32],
 }
 
 /// Bytes a joining validator signs to authorize its own admission (binds the keys, not the address).
 fn join_sig_bytes(r: &ValidatorRecord) -> Vec<u8> {
-    bincode::serialize(&("join", r.peer_id, &r.bls_pk[..], r.vrf_pk)).expect("join serialize")
+    bincode::serialize(&("join", r.peer_id, &r.bls_pk[..], r.vrf_pk, r.mix_pk)).expect("join serialize")
 }
 
 /// Bytes a leaving validator signs to authorize its own departure.
@@ -77,6 +80,7 @@ impl MembershipOp {
             addr,
             bls_pk: identity.bls_pk(),
             vrf_pk: identity.vrf_pk(),
+            mix_pk: identity.mix_pk(),
         };
         let sig = identity.sign(&join_sig_bytes(&record)).to_bytes().to_vec();
         MembershipOp::Add { record, sig, vdf }
@@ -124,6 +128,8 @@ pub struct ValidatorSet {
     pub bls: HashMap<[u8; 32], [u8; 48]>,
     pub vrf: HashMap<[u8; 32], [u8; 32]>,
     pub addr: HashMap<[u8; 32], String>,
+    /// Per-member Ristretto mix public key — peers seal confidential committee messages to it.
+    pub mix: HashMap<[u8; 32], [u8; 32]>,
 }
 
 impl ValidatorSet {
@@ -144,6 +150,7 @@ impl ValidatorSet {
         self.bls.insert(r.peer_id, r.bls_pk);
         self.vrf.insert(r.peer_id, r.vrf_pk);
         self.addr.insert(r.peer_id, r.addr);
+        self.mix.insert(r.peer_id, r.mix_pk);
     }
 
     fn remove(&mut self, peer: &[u8; 32]) {
@@ -151,6 +158,7 @@ impl ValidatorSet {
         self.bls.remove(peer);
         self.vrf.remove(peer);
         self.addr.remove(peer);
+        self.mix.remove(peer);
     }
 
     /// Apply one finalized membership op (deterministic: idempotent for already-applied effects).
@@ -188,6 +196,7 @@ mod tests {
             addr: "a".into(),
             bls_pk: a.bls_pk(),
             vrf_pk: a.vrf_pk(),
+            mix_pk: a.mix_pk(),
         };
         let mut set = ValidatorSet::from_records(&[rec_a]);
         assert_eq!(set.len(), 1);
