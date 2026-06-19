@@ -55,6 +55,11 @@ pub enum Message {
     /// named oversight round. A node pools / records one that re-derives true against the on-chain
     /// commit burst; a quorum of distinct signers triggers recursive oversight network-wide.
     Watchdog(crate::watchdog::WatchdogSignal),
+    /// A signed §6.6 rewind / Class-3 signal (`rewind.rs`): the signer's recommendations were degraded
+    /// by an on-chain gossip cohort that spiked a *foreign* item at `cohort_epoch`. A node pools / records
+    /// one that re-derives true against the on-chain item-velocity spike; a quorum of distinct signers
+    /// spanning ≥2 interest clusters, all naming the same cohort epoch, triggers a Class-3 audit.
+    Rewind(crate::rewind::RewindSignal),
     /// A fixed-size Sphinx mix packet to peel and forward/deliver (the Loopix layer, `loopix.rs`).
     Sphinx(SphinxPacket),
     /// Request all finalized blocks at height ≥ `from_height`.

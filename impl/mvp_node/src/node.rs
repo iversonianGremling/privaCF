@@ -21,6 +21,7 @@ use crate::admission::VdfAdmission;
 use crate::audit::FirstObservation;
 use crate::beacon::{next_beacon, next_beacon_vdf};
 use crate::bls;
+use crate::rewind::RewindSignal;
 use crate::verdict::VerdictCommit;
 use crate::watchdog::WatchdogSignal;
 use crate::chain::{
@@ -226,6 +227,14 @@ pub struct NodeOutcome {
     /// watchers attested), and of public verdict-commits (the burst they flagged).
     pub watchdog_signals_recorded: usize,
     pub verdict_commits_recorded: usize,
+    /// Whether the in-loop §6.6 rewind path reached a Class-3 trigger on this node's finalized chain: a
+    /// quorum of distinct rewind signals spanning ≥2 interest clusters, all naming the on-chain
+    /// item-velocity spike epoch. A pure function of the chain, so all honest nodes converge (see
+    /// `class3_triggered` / `rewind.rs`).
+    pub class3_triggered: bool,
+    /// Count of rewind signals recorded across this node's finalized chain — evidence the in-loop
+    /// recommendation participants (`with_rewind_authority`) actually attested to the poisoning cohort.
+    pub rewind_signals_recorded: usize,
 }
 
 /// Per-height consensus state.
@@ -343,6 +352,17 @@ pub struct Node {
     /// is decryptable, so the burst (with no behavioral justification) is what the watchdog catches.
     /// Honest default empty.
     rogue_commit_targets: Vec<u64>,
+    /// If true, this node is an in-loop §6.6 rewind participant: each tick it scans the on-chain gossip
+    /// columns for an item-velocity spike (`rewind.rs`); when a *foreign* item (not its own dominant
+    /// interest) spikes, it raises a signed `RewindSignal` for the next leader to record in
+    /// `BlockHeader::rewind_signals`. A quorum of distinct signers across ≥2 clusters triggers a Class-3
+    /// audit. Every node then derives the trigger from the on-chain signals. Honest default `false`.
+    rewind_authority: bool,
+    /// Fault injection: if `Some((item, weight, from_epoch))`, this node is part of a coordinated push
+    /// cohort — from epoch `from_epoch` it overwrites its obfuscated gossip with a single, within-bound
+    /// concentration on `item` (weight `weight`). Several such nodes spike `item`'s on-chain gossip
+    /// velocity — an individually-valid but coordinated push the rewind path catches. Honest default `None`.
+    push_item: Option<(usize, f32, u64)>,
 }
 
 impl Node {
@@ -372,6 +392,8 @@ impl Node {
             audit_authority: false,
             watchdog_authority: false,
             rogue_commit_targets: Vec::new(),
+            rewind_authority: false,
+            push_item: None,
         }
     }
 
@@ -388,6 +410,25 @@ impl Node {
     /// record. A quorum of distinct signers triggers recursive oversight network-wide.
     pub fn with_watchdog_authority(mut self) -> Self {
         self.watchdog_authority = true;
+        self
+    }
+
+    /// Builder: let this node act as an in-loop §6.6 rewind participant (`drive_rewind`) — raising a
+    /// signed `RewindSignal` when an on-chain gossip cohort spikes a *foreign* item into its
+    /// recommendations, for the next leader to record. A quorum of distinct signers across ≥2 interest
+    /// clusters, all naming the same cohort epoch, triggers a Class-3 audit network-wide. Requires
+    /// preferences (`with_preferences`) so the node has a dominant interest to judge foreignness against.
+    pub fn with_rewind_authority(mut self) -> Self {
+        self.rewind_authority = true;
+        self
+    }
+
+    /// Fault-injection builder: from epoch `from_epoch`, concentrate this node's obfuscated gossip on a
+    /// single `item` at `weight` (within the public `[0, B]` bound, so the tx stays objectively valid and
+    /// the verdict path cannot suspend it). A cohort of such nodes spikes the item's gossip velocity — a
+    /// coordinated push that only the §6.6 rewind / Class-3 path catches.
+    pub fn byzantine_push_item(mut self, item: usize, weight: f32, from_epoch: u64) -> Self {
+        self.push_item = Some((item, weight, from_epoch));
         self
     }
 
@@ -965,6 +1006,165 @@ impl Node {
         mixer.publish(peers, beacon, Message::Watchdog(signal));
     }
 
+    // ───────────────────────────────── §6.6 rewind / Class-3 trigger ─────────────────────────────────
+
+    /// Every `(signer, cohort_epoch)` rewind signal already finalized on `blocks` — the recording dedup.
+    fn recorded_rewind_keys(&self, blocks: &[Block]) -> HashSet<([u8; 32], u64)> {
+        blocks
+            .iter()
+            .flat_map(|b| b.header.rewind_signals.iter())
+            .map(|s| (s.epoch_id, s.cohort_epoch))
+            .collect()
+    }
+
+    /// Per-epoch on-chain gossip column sums: `height → Σ gossip` over every preference-carrying epoch
+    /// tx finalized at that height. The aggregate the item-velocity detector differences across epochs.
+    fn gossip_column_sums(&self, blocks: &[Block]) -> std::collections::BTreeMap<u64, Vec<f64>> {
+        let mut by_h: std::collections::BTreeMap<u64, Vec<f64>> = std::collections::BTreeMap::new();
+        for b in blocks {
+            for tx in &b.txs {
+                if let Some(p) = tx.pref.as_ref() {
+                    let row = by_h.entry(b.header.height).or_default();
+                    if row.len() < p.gossip.len() {
+                        row.resize(p.gossip.len(), 0.0);
+                    }
+                    for (j, &v) in p.gossip.iter().enumerate() {
+                        row[j] += v as f64;
+                    }
+                }
+            }
+        }
+        by_h
+    }
+
+    /// The chain's canonical item-velocity spike (§6.6 / §7.1a T.8): the earliest epoch at which some
+    /// item's total on-chain gossip weight jumps by more than `VELOCITY_THRESHOLD` over the previous
+    /// epoch, and the item with the largest such jump there. The public signature of a coordinated push
+    /// cohort — a pure function of the finalized chain, so every node agrees on `(cohort_epoch, item)`.
+    fn velocity_spike(&self, blocks: &[Block]) -> Option<(u64, usize)> {
+        let sums = self.gossip_column_sums(blocks);
+        let epochs: Vec<u64> = sums.keys().copied().collect();
+        for w in epochs.windows(2) {
+            let (prev, cur) = (w[0], w[1]);
+            let (pv, cv) = (&sums[&prev], &sums[&cur]);
+            let mut best: Option<(usize, f64)> = None;
+            for j in 0..cv.len() {
+                let vel = cv[j] - pv.get(j).copied().unwrap_or(0.0);
+                if vel > crate::rewind::VELOCITY_THRESHOLD && best.map_or(true, |(_, bv)| vel > bv) {
+                    best = Some((j, vel));
+                }
+            }
+            if let Some((item, _)) = best {
+                return Some((cur, item));
+            }
+        }
+        None
+    }
+
+    /// This node's own dominant interest — the argmax of its clean preference vector. `None` if it has no
+    /// preferences (then it cannot judge an item's foreignness and never raises a rewind signal).
+    fn my_dominant_item(&self) -> Option<usize> {
+        let prefs = self.preferences.as_ref()?;
+        prefs.iter().enumerate().max_by(|(_, a), (_, b)| a.cmp(b)).map(|(i, _)| i)
+    }
+
+    /// The interest cluster of `signer`, derived deterministically from public chain data: the dominant
+    /// item (argmax) of its most recent on-chain gossip row. Every node reads the same finalized gossip,
+    /// so all agree on each signer's cluster (the cross-cluster correlation `class3_trigger` needs).
+    fn signaler_cluster(&self, blocks: &[Block], signer: &[u8; 32]) -> Option<usize> {
+        let gossip = blocks
+            .iter()
+            .rev()
+            .flat_map(|b| b.txs.iter().rev())
+            .find(|tx| &tx.submitter == signer && tx.pref.is_some())
+            .and_then(|tx| tx.pref.as_ref())
+            .map(|p| &p.gossip)?;
+        gossip.iter().enumerate().max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)).map(|(i, _)| i)
+    }
+
+    /// Independently validate a rewind signal against public chain data: the signature checks, the named
+    /// `cohort_epoch` is the chain's canonical item-velocity spike, `preferred_t` is the epoch before it,
+    /// the signer was a participant at that epoch, and the signer's own interest cluster differs from the
+    /// pushed item (it is a cross-niche victim, the §6.6 structural requirement). Self-contained, so a
+    /// proposer cannot inject a false Class-3 trigger and every node agrees on the recorded signals.
+    fn validate_rewind_signal(&self, blocks: &[Block], s: &RewindSignal) -> bool {
+        if !s.verify() {
+            return false;
+        }
+        let Some((cohort_epoch, item)) = self.velocity_spike(blocks) else { return false };
+        if s.cohort_epoch != cohort_epoch || cohort_epoch == 0 || s.preferred_t != cohort_epoch - 1 {
+            return false;
+        }
+        if !self.active_set_at(blocks, cohort_epoch).contains(&s.epoch_id) {
+            return false;
+        }
+        self.signaler_cluster(blocks, &s.epoch_id).map_or(false, |c| c != item)
+    }
+
+    /// Whether the in-loop rewind path has reached a §6.6 Class-3 trigger on `blocks`: a quorum of
+    /// distinct recorded rewind signals spanning ≥2 interest clusters, all naming the canonical
+    /// item-velocity spike epoch. A pure function of the finalized chain (signals and clusters both live
+    /// on-chain), so all honest nodes converge.
+    fn class3_triggered(&self, blocks: &[Block]) -> bool {
+        let Some((cohort_epoch, _item)) = self.velocity_spike(blocks) else { return false };
+        let signals: Vec<RewindSignal> =
+            blocks.iter().flat_map(|b| b.header.rewind_signals.iter().cloned()).collect();
+        let mut clusters: Vec<([u8; 32], u64)> = Vec::new();
+        let mut seen: HashSet<[u8; 32]> = HashSet::new();
+        for s in &signals {
+            if seen.insert(s.epoch_id) {
+                if let Some(c) = self.signaler_cluster(blocks, &s.epoch_id) {
+                    clusters.push((s.epoch_id, c as u64));
+                }
+            }
+        }
+        crate::rewind::class3_trigger(&signals, &clusters, crate::rewind::REWIND_Q, crate::rewind::MIN_CLUSTERS)
+            .iter()
+            .any(|t| t.cohort_epoch == cohort_epoch)
+    }
+
+    /// Autonomous §6.6 rewind driver. Once the on-chain gossip shows an item-velocity spike in an item
+    /// *foreign* to this node's own interest, a rewind-authority node raises its signed `RewindSignal`
+    /// **once** (`raised`), pools it, and gossips it for the next leader to record. `REWIND_Q` distinct
+    /// signers across `MIN_CLUSTERS` clusters then trigger a Class-3 audit — all from public chain data.
+    fn drive_rewind(
+        &self,
+        chain: &Chain,
+        peers: &PeersMap,
+        mixer: &Mixer,
+        beacon: u64,
+        raised: &mut bool,
+        rewind_pool: &mut Vec<RewindSignal>,
+    ) {
+        if !self.rewind_authority || *raised {
+            return;
+        }
+        let Some((cohort_epoch, item)) = self.velocity_spike(&chain.blocks) else { return };
+        if cohort_epoch == 0 {
+            return;
+        }
+        // Only a *foreign* spike (not our own dominant interest) implicates a poisoning cohort.
+        match self.my_dominant_item() {
+            Some(d) if d != item => {}
+            _ => return,
+        }
+        let current_t = chain.head().header.height;
+        let preferred_t = cohort_epoch - 1;
+        if preferred_t >= current_t {
+            return;
+        }
+        *raised = true;
+        let signal = RewindSignal::raise(&self.identity, current_t, preferred_t, cohort_epoch);
+        let key = (signal.epoch_id, signal.cohort_epoch);
+        if self.recorded_rewind_keys(&chain.blocks).contains(&key)
+            || rewind_pool.iter().any(|s| (s.epoch_id, s.cohort_epoch) == key)
+        {
+            return;
+        }
+        rewind_pool.push(signal.clone());
+        mixer.publish(peers, beacon, Message::Rewind(signal));
+    }
+
     /// Fault-injection builder: this node will never propose (Byzantine leader that withholds its
     /// block), exercising the other validators' view-change path.
     pub fn byzantine_withhold(mut self) -> Self {
@@ -1075,6 +1275,16 @@ impl Node {
                 // amplify CF weight — objectively malformed, so verdict authorities suspend us.
                 p.gossip = vec![crate::verdict_policy::GOSSIP_BOUND * 8.0; prefs.len().max(1)];
             }
+            if let Some((item, weight, from_epoch)) = self.push_item {
+                if height >= from_epoch {
+                    // Byzantine push cohort (§6.6): from `from_epoch`, concentrate within-bound gossip on
+                    // `item`. Individually valid (no malformation), but the cohort's correlated weight
+                    // spikes `item`'s on-chain velocity — the signature the rewind path catches.
+                    let mut row = vec![0.0f32; prefs.len().max(item + 1)];
+                    row[item] = weight;
+                    p.gossip = row;
+                }
+            }
             p
         });
         let tx = EpochTransaction::create_with_pref(&self.identity, height, epoch_id, commit, pref);
@@ -1136,6 +1346,7 @@ impl Node {
         audit_pool: &[FirstObservation],
         verdict_commit_pool: &[VerdictCommit],
         watchdog_pool: &[WatchdogSignal],
+        rewind_pool: &[RewindSignal],
         alt: bool,
     ) -> Block {
         let prev = chain.head_hash();
@@ -1213,6 +1424,21 @@ impl Node {
                 watchdog_signals.push(s.clone());
             }
         }
+        // Include rewind signals awaiting inclusion — one per (signer, cohort_epoch), re-validated
+        // against the on-chain velocity spike, not already recorded (a cross-cluster quorum triggers
+        // the Class-3 audit).
+        let recorded_rw = self.recorded_rewind_keys(&chain.blocks);
+        let mut rw_keys: HashSet<([u8; 32], u64)> = HashSet::new();
+        let mut rewind_signals: Vec<RewindSignal> = Vec::new();
+        for s in rewind_pool {
+            let key = (s.epoch_id, s.cohort_epoch);
+            if !recorded_rw.contains(&key)
+                && rw_keys.insert(key)
+                && self.validate_rewind_signal(&chain.blocks, s)
+            {
+                rewind_signals.push(s.clone());
+            }
+        }
         if alt {
             txs.clear(); // a conflicting variant of the same slot -> a different block id
             ops.clear();
@@ -1221,6 +1447,7 @@ impl Node {
             audit_reports.clear();
             verdict_commits.clear();
             watchdog_signals.clear();
+            rewind_signals.clear();
         }
         let mut header = BlockHeader::create(
             &self.identity, r.height, r.view, r.beacon_t, prev, my_epoch_id, &r.my_vrf,
@@ -1231,6 +1458,7 @@ impl Node {
         header.audit_reports = audit_reports;
         header.verdict_commits = verdict_commits;
         header.watchdog_signals = watchdog_signals;
+        header.rewind_signals = rewind_signals;
         let (susp_root, decr_root) = self.smt_roots_at(&chain.blocks, r.height);
         header.susp_smt_root = susp_root;
         header.decryption_smt_root = decr_root;
@@ -1341,6 +1569,22 @@ impl Node {
                 }
             }
         }
+        // Every rewind signal must re-validate against the on-chain velocity spike (canonical cohort
+        // epoch, cross-niche signer), be unique within the block, and not already be recorded — so no
+        // proposer injects a false Class-3 trigger.
+        {
+            let recorded = self.recorded_rewind_keys(&chain.blocks);
+            let mut seen: HashSet<([u8; 32], u64)> = HashSet::new();
+            for s in &b.header.rewind_signals {
+                let key = (s.epoch_id, s.cohort_epoch);
+                if recorded.contains(&key)
+                    || !seen.insert(key)
+                    || !self.validate_rewind_signal(&chain.blocks, s)
+                {
+                    return false;
+                }
+            }
+        }
         if !vset.contains(&b.header.proposer_peer) {
             return false;
         }
@@ -1396,6 +1640,7 @@ impl Node {
         audit_pool: &[FirstObservation],
         verdict_commit_pool: &[VerdictCommit],
         watchdog_pool: &[WatchdogSignal],
+        rewind_pool: &[RewindSignal],
         peers: &PeersMap,
         mixer: &Mixer,
         slashed: &HashSet<[u8; 32]>,
@@ -1416,13 +1661,13 @@ impl Node {
                 r.proposed_views.insert(r.view);
                 if self.equivocate {
                     // Byzantine: double-sign two conflicting blocks for this slot.
-                    let a = self.assemble_block(chain, r, pending, pending_membership, pending_suspensions, audit_pool, verdict_commit_pool, watchdog_pool, false);
-                    let b = self.assemble_block(chain, r, pending, pending_membership, pending_suspensions, audit_pool, verdict_commit_pool, watchdog_pool, true);
+                    let a = self.assemble_block(chain, r, pending, pending_membership, pending_suspensions, audit_pool, verdict_commit_pool, watchdog_pool, rewind_pool, false);
+                    let b = self.assemble_block(chain, r, pending, pending_membership, pending_suspensions, audit_pool, verdict_commit_pool, watchdog_pool, rewind_pool, true);
                     debug!(height = r.height, view = r.view, "EQUIVOCATING (double-signing the slot)");
                     mixer.publish(peers, r.beacon_t, Message::Proposal(a));
                     mixer.publish(peers, r.beacon_t, Message::Proposal(b));
                 } else {
-                    let block = self.assemble_block(chain, r, pending, pending_membership, pending_suspensions, audit_pool, verdict_commit_pool, watchdog_pool, false);
+                    let block = self.assemble_block(chain, r, pending, pending_membership, pending_suspensions, audit_pool, verdict_commit_pool, watchdog_pool, rewind_pool, false);
                     let bid = block_id(&block.header, &block.txs);
                     debug!(height = r.height, view = r.view, txs = block.txs.len(), "proposing as VRF leader");
                     r.blocks.insert(bid, block.clone());
@@ -1498,6 +1743,7 @@ impl Node {
         audit_pool: &mut Vec<FirstObservation>,
         verdict_commit_pool: &mut Vec<VerdictCommit>,
         watchdog_pool: &mut Vec<WatchdogSignal>,
+        rewind_pool: &mut Vec<RewindSignal>,
         peers: &PeersMap,
         mixer: &Mixer,
         slashed: &mut HashSet<[u8; 32]>,
@@ -1593,6 +1839,21 @@ impl Node {
                 }
                 watchdog_pool.push(s.clone());
                 mixer.publish(peers, beacon_hint, Message::Watchdog(s));
+            }
+            Message::Rewind(s) => {
+                // A rewind / Class-3 signal: pool it (dedup by signer/cohort_epoch) only if it
+                // re-validates against the on-chain velocity spike (canonical cohort, cross-niche signer),
+                // then re-gossip once. Low volume (one per affected participant), so the single relay aids
+                // propagation without starving votes.
+                let key = (s.epoch_id, s.cohort_epoch);
+                if self.recorded_rewind_keys(&chain.blocks).contains(&key)
+                    || rewind_pool.iter().any(|x| (x.epoch_id, x.cohort_epoch) == key)
+                    || !self.validate_rewind_signal(&chain.blocks, &s)
+                {
+                    return;
+                }
+                rewind_pool.push(s.clone());
+                mixer.publish(peers, beacon_hint, Message::Rewind(s));
             }
             Message::Membership(op) => {
                 // Pool self-authorized membership ops for the next leader to record on-chain, and
@@ -1829,6 +2090,8 @@ impl Node {
         let mut verdict_commit_pool: Vec<VerdictCommit> = Vec::new();
         let mut watchdog_raised = false;
         let mut watchdog_pool: Vec<WatchdogSignal> = Vec::new();
+        let mut rewind_raised = false;
+        let mut rewind_pool: Vec<RewindSignal> = Vec::new();
         let mut epoch_ids: Vec<(u64, u64)> = Vec::new();
         let mut beacons: Vec<(u64, u64)> = Vec::new();
         let mut split_ok = true;
@@ -1903,6 +2166,8 @@ impl Node {
                         .retain(|c| !recorded_commits.contains(&(c.member, c.target_epoch_id, c.commit_hash)));
                     let recorded_wd = self.recorded_watchdog_keys(&chain.blocks);
                     watchdog_pool.retain(|s| !recorded_wd.contains(&(s.epoch_id, s.epoch_t)));
+                    let recorded_rw = self.recorded_rewind_keys(&chain.blocks);
+                    rewind_pool.retain(|s| !recorded_rw.contains(&(s.epoch_id, s.cohort_epoch)));
                     // Learn the dial addresses of all current members so the dial task can reach a
                     // newly-admitted validator.
                     {
@@ -1925,12 +2190,13 @@ impl Node {
                     // Rogue-commit burst (no-op unless rogue) and watchdog driver (no-op unless authority).
                     self.drive_rogue_commits(&chain, &peers, &mixer, beacon_hint, &mut rogue_committed, &mut verdict_commit_pool);
                     self.drive_watchdog(&chain, &peers, &mixer, beacon_hint, &mut watchdog_raised, &mut watchdog_pool);
+                    self.drive_rewind(&chain, &peers, &mixer, beacon_hint, &mut rewind_raised, &mut rewind_pool);
                     if let Some(r) = round.as_mut() {
-                        self.on_tick(r, &mut chain, &pending, &pending_membership, &pending_suspensions, &audit_pool, &verdict_commit_pool, &watchdog_pool, &peers, &mixer, &slashed);
+                        self.on_tick(r, &mut chain, &pending, &pending_membership, &pending_suspensions, &audit_pool, &verdict_commit_pool, &watchdog_pool, &rewind_pool, &peers, &mixer, &slashed);
                     }
                 }
                 Some(msg) = inbox_rx.recv() => {
-                    self.on_msg(msg, round.as_mut(), &mut chain, &mut pending, &mut pending_membership, &mut pending_suspensions, &mut verdict_partials, &mut audit_pool, &mut verdict_commit_pool, &mut watchdog_pool, &peers, &mixer, &mut slashed);
+                    self.on_msg(msg, round.as_mut(), &mut chain, &mut pending, &mut pending_membership, &mut pending_suspensions, &mut verdict_partials, &mut audit_pool, &mut verdict_commit_pool, &mut watchdog_pool, &mut rewind_pool, &peers, &mixer, &mut slashed);
                 }
             }
         }
@@ -1953,7 +2219,10 @@ impl Node {
             chain.blocks.iter().map(|b| b.header.watchdog_signals.len()).sum::<usize>();
         let verdict_commits_recorded =
             chain.blocks.iter().map(|b| b.header.verdict_commits.len()).sum::<usize>();
-        info!(peer = %hex::encode(&my_id[..4]), blocks = chain.blocks.len(), head = %hex::encode(&chain.head_hash()[..4]), all_qc_valid, max_view, slashed = slashed_vec.len(), active = final_active.len(), suspended = suspended_targets.len(), flagged = flagged_cohort.len(), audit_reports = audit_reports_recorded, oversight = oversight_triggered, wd_signals = watchdog_signals_recorded, commits = verdict_commits_recorded, "node done");
+        let class3_triggered = self.class3_triggered(&chain.blocks);
+        let rewind_signals_recorded =
+            chain.blocks.iter().map(|b| b.header.rewind_signals.len()).sum::<usize>();
+        info!(peer = %hex::encode(&my_id[..4]), blocks = chain.blocks.len(), head = %hex::encode(&chain.head_hash()[..4]), all_qc_valid, max_view, slashed = slashed_vec.len(), active = final_active.len(), suspended = suspended_targets.len(), flagged = flagged_cohort.len(), audit_reports = audit_reports_recorded, oversight = oversight_triggered, wd_signals = watchdog_signals_recorded, commits = verdict_commits_recorded, class3 = class3_triggered, rewind_signals = rewind_signals_recorded, "node done");
         NodeOutcome {
             peer_id: my_id,
             head_hash: chain.head_hash(),
@@ -1971,6 +2240,8 @@ impl Node {
             oversight_triggered,
             watchdog_signals_recorded,
             verdict_commits_recorded,
+            class3_triggered,
+            rewind_signals_recorded,
         }
     }
 }
@@ -2098,6 +2369,13 @@ mod tests {
             epoch_t: 0,
             observed_commits: 0,
             expected_rate_milli: 0,
+            sig: Vec::new(),
+        })));
+        assert!(Mixer::is_routable(&Message::Rewind(crate::rewind::RewindSignal {
+            epoch_id: [0u8; 32],
+            current_t: 0,
+            preferred_t: 0,
+            cohort_epoch: 0,
             sig: Vec::new(),
         })));
         assert!(!Mixer::is_routable(&Message::Hello {

@@ -28,6 +28,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::identity::{verify as verify_ed25519, NodeIdentity};
 
+// ─────────────────────────────── in-loop Class-3 trigger params ───────────────────────────────
+
+/// Minimum jump in an item's total on-chain gossip weight between consecutive epochs for the in-loop
+/// driver (`node.rs`) to treat it as an anomalous **item-velocity spike** — the public signature of a
+/// coordinated cohort pushing that item. Set above the per-epoch noise floor of the honest gossip (the
+/// honest §4.5 pipeline renormalises each row's L1 to ~1, so a steady niche contributes a near-constant
+/// column) so a genuine multi-node cohort separates cleanly from background variation.
+pub const VELOCITY_THRESHOLD: f64 = 1.5;
+
+/// Distinct signers a cohort epoch needs (the `q` of `class3_trigger`) for the in-loop Class-3 trigger.
+pub const REWIND_Q: usize = 3;
+
+/// Distinct interest clusters a cohort epoch must span (`≥ 2`, §6.6) — the cross-cluster correlation
+/// that distinguishes a coordinated push from a single niche's organic churn.
+pub const MIN_CLUSTERS: usize = 2;
+
 // ──────────────────────────────────── HNSW snapshots ────────────────────────────────────
 
 /// A bounded ring of per-epoch index snapshots. `S` is the local index state (e.g. the gossip
