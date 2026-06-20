@@ -252,6 +252,10 @@ pub struct NodeOutcome {
     /// committee — the departed-custodian rotation completed without the subject's profile ever losing
     /// threshold custody. A pure function of the chain (`rehandoff_complete`); `false` if none was triggered.
     pub rehandoff_complete: bool,
+    /// The §5.3/§5.4 PSI-discovered interest-peers (sorted): peers this node privately found to share at
+    /// least `PSI_THRESHOLD` liked items, via DH-PSI over the mesh. Local, off-chain discovery — empty
+    /// unless this node ran `with_psi_discovery`. Distinct nodes legitimately discover different sets.
+    pub interest_peers: Vec<[u8; 32]>,
 }
 
 /// The public, chain-derived context of one arbitration handoff (`handoff_context`).
@@ -410,6 +414,12 @@ pub struct Node {
     /// Fault injection: a committee member that opens its custody parcel but files NO handoff receipt —
     /// the non-completion the §6.4 slashing path defaults and slashes. Honest default `false`.
     withhold_handoff: bool,
+    /// If true, this node runs §5.3/§5.4 PSI interest-peer discovery as an additive logical overlay: each
+    /// tick it offers its blinded liked-item set to one not-yet-probed peer (`psi.rs` DH-PSI); on the
+    /// response it learns only the intersection SIZE and records the peer as an interest-peer when the
+    /// overlap meets `PSI_THRESHOLD`. Purely local (never on-chain), fully decoupled from consensus — it
+    /// does NOT gate validator dialing (that would partition the BFT mesh). Honest default `false`.
+    psi_discovery: bool,
     /// Fault injection: if `Some((item, weight, from_epoch))`, this node is part of a coordinated push
     /// cohort — from epoch `from_epoch` it overwrites its obfuscated gossip with a single, within-bound
     /// concentration on `item` (weight `weight`). Several such nodes spike `item`'s on-chain gossip
@@ -448,6 +458,7 @@ impl Node {
             rewind_authority: false,
             arbitration_authority: false,
             withhold_handoff: false,
+            psi_discovery: false,
             push_item: None,
         }
     }
@@ -491,6 +502,15 @@ impl Node {
     pub fn byzantine_withhold_handoff(mut self) -> Self {
         self.arbitration_authority = true;
         self.withhold_handoff = true;
+        self
+    }
+
+    /// Builder: run §5.3/§5.4 PSI interest-peer discovery (`drive_psi`) as an additive logical overlay over
+    /// the existing mesh. Discovers, privately, which peers share enough liked items to be cluster peers —
+    /// purely local, never on-chain, and decoupled from consensus connectivity. Requires `with_preferences`
+    /// (the node's clean liked items are the PSI input; only blinded points and the overlap size leave it).
+    pub fn with_psi_discovery(mut self) -> Self {
+        self.psi_discovery = true;
         self
     }
 
@@ -1773,6 +1793,95 @@ impl Node {
         mixer.publish(peers, beacon, Message::Handoff(receipt));
     }
 
+    // ─────────────────────────────── §5.3/§5.4 PSI interest-peer discovery ───────────────────────────────
+
+    /// Overlap of shared liked items at/above which two nodes are cluster peers (`psi::should_connect`).
+    const PSI_THRESHOLD: usize = 2;
+
+    /// This node's stable private PSI exponent, bound to its identity (never leaves the node).
+    fn psi_secret(&self) -> [u8; 32] {
+        crate::psi::secret(&to_u64(self.identity.sk).to_le_bytes())
+    }
+
+    /// This node's clean liked items as PSI inputs: a stable 32-byte id per preference dimension it likes
+    /// (positive clean preference). The clean vector never leaves the node — only blinded points do.
+    fn psi_items(&self) -> Vec<[u8; 32]> {
+        let Some(prefs) = &self.preferences else { return Vec::new() };
+        prefs
+            .iter()
+            .enumerate()
+            .filter(|(_, &p)| p > 0)
+            .map(|(i, _)| {
+                let mut h = blake3::Hasher::new();
+                h.update(b"privacf-psi-item-id-v1");
+                h.update(&(i as u64).to_le_bytes());
+                *h.finalize().as_bytes()
+            })
+            .collect()
+    }
+
+    /// PSI initiator driver: once consensus is warm, offer this node's blinded liked-item set to ONE
+    /// not-yet-probed current validator per tick (`psi_initiated` dedup), so discovery never floods the
+    /// consensus inbox. Purely additive — gated on `with_psi_discovery`, no effect on the chain.
+    fn drive_psi(
+        &self,
+        chain: &Chain,
+        peers: &PeersMap,
+        mixer: &Mixer,
+        beacon: u64,
+        psi_initiated: &mut HashSet<[u8; 32]>,
+    ) {
+        if !self.psi_discovery {
+            return;
+        }
+        let items = self.psi_items();
+        if items.is_empty() {
+            return;
+        }
+        // Probe current validators (excluding ourselves) we have not offered to yet — one per tick.
+        let active = self.active_set_at(&chain.blocks, chain.head().header.height).peers;
+        let Some(target) = active.into_iter().find(|p| *p != self.me() && !psi_initiated.contains(p)) else {
+            return;
+        };
+        psi_initiated.insert(target);
+        let u = crate::psi::blind(&items, &self.psi_secret());
+        mixer.publish(peers, beacon, Message::PsiOffer { from: self.me(), to: target, u });
+    }
+
+    /// PSI responder: on an offer addressed to us, reply with our own blinded set `v` and the initiator's
+    /// set re-blinded `w` — revealing only the eventual intersection SIZE to the initiator, never our items.
+    fn handle_psi_offer(&self, from: [u8; 32], to: [u8; 32], u: &[[u8; 32]], peers: &PeersMap, mixer: &Mixer, beacon: u64) {
+        if !self.psi_discovery || to != self.me() {
+            return;
+        }
+        let secret = self.psi_secret();
+        let v = crate::psi::blind(&self.psi_items(), &secret);
+        let w = crate::psi::reblind(u, &secret);
+        mixer.publish(peers, beacon, Message::PsiResponse { from: self.me(), to: from, v, w });
+    }
+
+    /// PSI initiator response handler: re-blind the responder's set, count the double-blinded overlap, and
+    /// record the responder as an interest-peer when it meets `PSI_THRESHOLD`. Only acts on a response to an
+    /// offer we actually sent (`psi_initiated`), once per peer.
+    fn handle_psi_response(
+        &self,
+        from: [u8; 32],
+        to: [u8; 32],
+        v: &[[u8; 32]],
+        w: &[[u8; 32]],
+        psi_initiated: &HashSet<[u8; 32]>,
+        interest_peers: &mut HashSet<[u8; 32]>,
+    ) {
+        if !self.psi_discovery || to != self.me() || !psi_initiated.contains(&from) {
+            return;
+        }
+        let z = crate::psi::reblind(v, &self.psi_secret());
+        let overlap = crate::psi::intersection_size(w, &z);
+        if crate::psi::should_connect(overlap, Self::PSI_THRESHOLD) {
+            interest_peers.insert(from);
+        }
+    }
+
     /// Fault-injection builder: this node will never propose (Byzantine leader that withholds its
     /// block), exercising the other validators' view-change path.
     pub fn byzantine_withhold(mut self) -> Self {
@@ -2396,6 +2505,8 @@ impl Node {
         handoff_pool: &mut Vec<HandoffReceipt>,
         custody_held: &mut HashMap<u64, ([u8; 32], [u8; 32])>,
         reshare_held: &mut HashMap<u64, Vec<(u64, [u8; 32], [u8; 32])>>,
+        psi_initiated: &mut HashSet<[u8; 32]>,
+        interest_peers: &mut HashSet<[u8; 32]>,
         peers: &PeersMap,
         mixer: &Mixer,
         slashed: &mut HashSet<[u8; 32]>,
@@ -2518,6 +2629,14 @@ impl Node {
                 // and, once the canonical dealer set is complete, file a round-1 handoff receipt. Consumed
                 // here, never re-gossiped (it carries a custody sub-share sealed to us alone).
                 self.handle_reshare_parcel(chain, &parcel, reshare_held, handoff_pool, peers, mixer, beacon_hint);
+            }
+            Message::PsiOffer { from, to, u } => {
+                // §5.3/§5.4 PSI offer addressed to us: respond with our blinded set + the re-blinded offer.
+                self.handle_psi_offer(from, to, &u, peers, mixer, beacon_hint);
+            }
+            Message::PsiResponse { from, to, v, w } => {
+                // §5.3/§5.4 PSI response to an offer we sent: learn the overlap size, record an interest-peer.
+                self.handle_psi_response(from, to, &v, &w, psi_initiated, interest_peers);
             }
             Message::Handoff(r) => {
                 // A committee member's handoff receipt: pool it (dedup by member/subject) only if it
@@ -2777,6 +2896,9 @@ impl Node {
         let mut custody_held: HashMap<u64, ([u8; 32], [u8; 32])> = HashMap::new();
         let mut reshare_held: HashMap<u64, Vec<(u64, [u8; 32], [u8; 32])>> = HashMap::new();
         let mut rehandoff_dispatch_height: Option<u64> = None;
+        // §5.3/§5.4 PSI discovery: peers we have offered to (dedup), and the interest-peers we discovered.
+        let mut psi_initiated: HashSet<[u8; 32]> = HashSet::new();
+        let mut interest_peers: HashSet<[u8; 32]> = HashSet::new();
         let mut epoch_ids: Vec<(u64, u64)> = Vec::new();
         let mut beacons: Vec<(u64, u64)> = Vec::new();
         let mut split_ok = true;
@@ -2882,6 +3004,9 @@ impl Node {
                     // Re-handoff driver: a surviving custodian proactively re-shares to a fresh committee
                     // once an original custodian departs (no-op unless triggered + we are a canonical dealer).
                     self.drive_rehandoff(&chain, &custody_held, &mut reshare_held, &mut handoff_pool, &peers, &mixer, beacon_hint, &mut rehandoff_dispatch_height);
+                    // §5.3/§5.4 PSI interest-peer discovery (no-op unless with_psi_discovery): additive,
+                    // off-chain, one probe per tick — never affects consensus.
+                    self.drive_psi(&chain, &peers, &mixer, beacon_hint, &mut psi_initiated);
                     // §6.4 slashing: a committee member that defaulted on a handoff (no valid receipt by
                     // the deadline) is excluded from leadership, exactly like an equivocator — derived
                     // identically from the finalized chain on every node, so no evidence message is needed.
@@ -2895,7 +3020,7 @@ impl Node {
                     }
                 }
                 Some(msg) = inbox_rx.recv() => {
-                    self.on_msg(msg, round.as_mut(), &mut chain, &mut pending, &mut pending_membership, &mut pending_suspensions, &mut verdict_partials, &mut audit_pool, &mut verdict_commit_pool, &mut watchdog_pool, &mut rewind_pool, &mut handoff_pool, &mut custody_held, &mut reshare_held, &peers, &mixer, &mut slashed);
+                    self.on_msg(msg, round.as_mut(), &mut chain, &mut pending, &mut pending_membership, &mut pending_suspensions, &mut verdict_partials, &mut audit_pool, &mut verdict_commit_pool, &mut watchdog_pool, &mut rewind_pool, &mut handoff_pool, &mut custody_held, &mut reshare_held, &mut psi_initiated, &mut interest_peers, &peers, &mixer, &mut slashed);
                 }
             }
         }
@@ -2930,6 +3055,8 @@ impl Node {
             });
         let handoff_defaults = self.handoff_defaults(&chain.blocks);
         let rehandoff_complete = self.rehandoff_complete(&chain.blocks);
+        let mut interest_peers: Vec<[u8; 32]> = interest_peers.into_iter().collect();
+        interest_peers.sort_unstable();
         info!(peer = %hex::encode(&my_id[..4]), blocks = chain.blocks.len(), head = %hex::encode(&chain.head_hash()[..4]), all_qc_valid, max_view, slashed = slashed_vec.len(), active = final_active.len(), suspended = suspended_targets.len(), flagged = flagged_cohort.len(), audit_reports = audit_reports_recorded, oversight = oversight_triggered, wd_signals = watchdog_signals_recorded, commits = verdict_commits_recorded, class3 = class3_triggered, rewind_signals = rewind_signals_recorded, handoffs = handoff_receipts_recorded, handoff_complete, rehandoff_complete, "node done");
         NodeOutcome {
             peer_id: my_id,
@@ -2954,6 +3081,7 @@ impl Node {
             handoff_complete,
             handoff_defaults,
             rehandoff_complete,
+            interest_peers,
         }
     }
 }
@@ -3104,6 +3232,7 @@ mod tests {
             eph: [0u8; 32],
             ct: Vec::new(),
         })));
+        assert!(Mixer::is_routable(&Message::PsiOffer { from: [0u8; 32], to: [1u8; 32], u: Vec::new() }));
         assert!(!Mixer::is_routable(&Message::Hello {
             peer_id: [0u8; 32],
             listen_addr: String::new(),
