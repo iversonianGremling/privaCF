@@ -69,6 +69,12 @@ pub enum Message {
     /// one fresh-committee member's `mix_pk`. Routed to the mesh; only the addressed member opens it.
     /// Transient — consumed, not recorded on-chain (the resulting round-1 handoff receipt is what's recorded).
     Reshare(crate::arbitration::ReshareParcel),
+    /// §4.1 proactive re-share of the standing `VA_pub` threshold key (`dkg::reshare_subdeal`): when the
+    /// validator set rotates, a current shareholder confidentially seals a sub-share of its VA_pub share to
+    /// one new-set member's `mix_pk`. The member combines a threshold of these into a FRESH share of the
+    /// SAME `VA_pub` (the group key is preserved, custody follows the active set). Reuses the
+    /// `ReshareParcel` envelope (the `r_old` slot is unused here); addressed point-to-point, never recorded.
+    VaReshare(crate::arbitration::ReshareParcel),
     /// A committee member's signed arbitration handoff receipt (`arbitration.rs`): the re-encrypted
     /// commitment it now custodies + the ZK proof binding it to the subject's on-chain `c_old`. A node
     /// pools / records one that verifies; the next leader records it in `BlockHeader::handoff_receipts`.

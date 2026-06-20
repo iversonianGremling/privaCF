@@ -243,6 +243,13 @@ pub struct NodeOutcome {
     /// Count of §6.4 handoff-package ZK proofs (departing nodes' verified composite Statements 1–3)
     /// recorded across this node's finalized chain.
     pub handoff_proofs_recorded: usize,
+    /// This node's live §4.1 `VA_pub` share index after any proactive re-share — its 1-based position in
+    /// the (post-rotation) validator set. `None` if it holds no threshold-key share.
+    pub va_share_index: Option<u64>,
+    /// A partial signature over a canonical tag with this node's LIVE `VA_pub` share — `None` without a
+    /// share. A threshold subset of the post-rotation set combines these into a signature verifiable under
+    /// the UNCHANGED `VA_pub`, the proof the re-share produced valid shares of the same group key.
+    pub va_proof_partial: Option<Vec<u8>>,
     /// Whether every departed node with a live handoff reached a custody threshold of valid recorded
     /// receipts — the §4.1 handoff completed under the new committee's custody. A pure function of the
     /// chain, so all honest nodes agree (see `handoff_completed_count` / `arbitration.rs`).
@@ -348,6 +355,9 @@ pub struct Node {
     verenc: Box<dyn VerEnc>,
     /// This validator's genesis threshold-key share (`None` ⇒ no real sealing; `StubVerEnc`).
     threshold_key: Option<ThresholdKey>,
+    /// The VA_pub threshold `t`, known to every participant (genesis shareholders via their key, joiners
+    /// via `with_va_reshare`) — needed to combine a re-share and to threshold-sign after a rotation.
+    va_threshold: Option<usize>,
     /// The genesis validator records — the base the active set is folded forward from.
     genesis: Vec<ValidatorRecord>,
     /// Test fault injection: participate in VRF + voting but never propose when elected leader,
@@ -454,6 +464,7 @@ impl Node {
             config,
             verenc: Box::new(StubVerEnc),
             threshold_key: None,
+            va_threshold: None,
             genesis,
             withhold_proposals: false,
             equivocate: false,
@@ -579,7 +590,17 @@ impl Node {
     /// threshold-signing (P1.4). Without it the node uses `StubVerEnc`.
     pub fn with_threshold_key(mut self, tk: ThresholdKey) -> Self {
         self.verenc = Box::new(NativeGroupVerEnc { va_pub: tk.va_pub });
+        self.va_threshold = Some(tk.threshold);
         self.threshold_key = Some(tk);
+        self
+    }
+
+    /// Builder: a NON-genesis node (a joiner) that participates in §4.1 `VA_pub` re-sharing. It holds no
+    /// genesis share, but knows the threshold `t`; once the validator set rotates, the current shareholders
+    /// re-share `VA_pub` to the new set and this node combines a fresh share (`drive_va_reshare` /
+    /// `handle_va_reshare`), so threshold custody follows the active set.
+    pub fn with_va_reshare(mut self, threshold: usize) -> Self {
+        self.va_threshold = Some(threshold);
         self
     }
 
@@ -759,6 +780,7 @@ impl Node {
     fn drive_verdicts(
         &self,
         chain: &Chain,
+        current_share: &Option<(u64, [u8; 32])>,
         peers: &PeersMap,
         mixer: &Mixer,
         beacon: u64,
@@ -766,7 +788,9 @@ impl Node {
         partials: &mut HashMap<u64, HashMap<u64, [u8; 96]>>,
         pending_suspensions: &mut Vec<(crate::verdict::SuspendRecord, [u8; 96])>,
     ) {
-        if !self.verdict_authority || self.threshold_key.is_none() {
+        // Sign with the LIVE share — the genesis share, or the fresh one after a §4.1 VA_pub re-share.
+        let Some((index, share)) = current_share else { return };
+        if !self.verdict_authority {
             return;
         }
         let suspended = self.suspended_targets(&chain.blocks);
@@ -786,7 +810,9 @@ impl Node {
             if suspended.contains(&target) || emitted.contains(&target) {
                 continue;
             }
-            if let Some((index, partial)) = self.verdict_partial(target) {
+            {
+                let partial = crate::bls::sign_dst(share, &crate::verenc::verdict_id(target), crate::verenc::VERENC_DST);
+                let index = *index;
                 emitted.insert(target);
                 partials.entry(target).or_default().insert(index, partial);
                 mixer.publish(
@@ -815,8 +841,8 @@ impl Node {
         mixer: &Mixer,
         beacon: u64,
     ) {
-        let threshold = match &self.threshold_key {
-            Some(tk) => tk.threshold,
+        let threshold = match self.va_threshold {
+            Some(t) => t,
             None => return,
         };
         let Some(parts) = partials.get(&target) else { return };
@@ -847,6 +873,150 @@ impl Node {
                 );
             }
         }
+    }
+
+    // ─────────────────────────── §4.1 VA_pub proactive re-share (validator rotation) ───────────────────────────
+
+    /// A fixed `subject` tag for the `ReshareParcel` envelope when it carries a `VA_pub` sub-share.
+    const VA_RESHARE_TAG: u64 = u64::MAX;
+    /// A canonical message every node signs with its current `VA_pub` share so a threshold subset of the
+    /// post-rotation set reconstructs a signature verifiable under the unchanged `VA_pub` — the on-the-wire
+    /// proof the re-share produced valid shares of the same group key.
+    pub const VA_PROOF_TAG: &'static [u8] = b"privacf-va-reshare-proof-v1";
+
+    /// Genesis shareholders sorted (their `VA_pub` share index = 1-based position), from the genesis set —
+    /// known to every node, so the dealer indices used in the re-share Lagrange are agreed network-wide.
+    fn va_genesis_order(&self) -> Vec<[u8; 32]> {
+        let mut g: Vec<[u8; 32]> = self.genesis.iter().map(|r| r.peer_id).collect();
+        g.sort_unstable();
+        g
+    }
+
+    /// The re-share target, or `None` until the validator set first rotates: `(new_set_sorted)` = the
+    /// active validators just after the FIRST finalized membership change. A single re-share round (MVP);
+    /// generalising to per-rotation re-shares is mechanical. Pure function of the chain.
+    fn va_reshare_target(&self, blocks: &[Block]) -> Option<Vec<[u8; 32]>> {
+        let trigger_h = blocks.iter().find_map(|b| {
+            (!b.header.membership_ops.is_empty()).then_some(b.header.height)
+        })?;
+        let mut new_set = self.active_set_at(blocks, trigger_h + 1).peers;
+        new_set.sort_unstable();
+        Some(new_set)
+    }
+
+    /// The canonical dealer set for the re-share: the `threshold` lowest-index genesis shareholders that are
+    /// still in the new set, each paired with its genesis share index. Every node derives the same set.
+    fn va_canonical_dealers(&self, new_set: &[[u8; 32]]) -> Option<Vec<(u64, [u8; 32])>> {
+        let t = self.va_threshold?;
+        let in_new: HashSet<[u8; 32]> = new_set.iter().copied().collect();
+        let dealers: Vec<(u64, [u8; 32])> = self
+            .va_genesis_order()
+            .into_iter()
+            .enumerate()
+            .filter(|(_, p)| in_new.contains(p))
+            .map(|(i, p)| (i as u64 + 1, p))
+            .take(t)
+            .collect();
+        (dealers.len() >= t).then_some(dealers)
+    }
+
+    /// This node's 1-based index in the new (post-rotation) sorted set, if it is a member.
+    fn va_new_index(&self, new_set: &[[u8; 32]]) -> Option<u64> {
+        new_set.iter().position(|p| *p == self.me()).map(|i| i as u64 + 1)
+    }
+
+    /// Dealer side: once the validator set has rotated, a canonical current shareholder re-shares its
+    /// `VA_pub` share to the new set — `dkg::reshare_subdeal` of its share, each sub-share sealed to a new
+    /// member's `mix_pk` (`arbitration::seal_reshare`, `r_old` slot unused). Self-delivers its own
+    /// sub-share when it is itself in the new set. Published once (`sent`).
+    #[allow(clippy::too_many_arguments)]
+    fn drive_va_reshare(
+        &self,
+        chain: &Chain,
+        current_share: &mut Option<(u64, [u8; 32])>,
+        va_held: &mut HashMap<u64, [u8; 32]>,
+        peers: &PeersMap,
+        mixer: &Mixer,
+        beacon: u64,
+        last_h: &mut Option<u64>,
+    ) {
+        let head = chain.head().header.height;
+        if *last_h == Some(head) {
+            return; // at most one dispatch per height (re-dispatch self-heals a dropped parcel)
+        }
+        let Some(t) = self.va_threshold else { return };
+        let Some(new_set) = self.va_reshare_target(&chain.blocks) else { return };
+        let Some(dealers) = self.va_canonical_dealers(&new_set) else { return };
+        // Am I a canonical dealer, and do I hold my genesis share?
+        let Some(&(my_idx, _)) = dealers.iter().find(|(_, p)| *p == self.me()) else { return };
+        let Some(gk) = self.threshold_key.as_ref() else { return };
+        *last_h = Some(head);
+        let subdeal = crate::dkg::reshare_subdeal(t, new_set.len(), &gk.share, &my_idx.to_le_bytes());
+        let vset = {
+            let h = chain.head().header.height;
+            self.active_set_at(&chain.blocks, h)
+        };
+        for (k, member) in new_set.iter().enumerate() {
+            if *member == self.me() {
+                va_held.insert(my_idx, subdeal[k].1); // self-delivery (no network loopback)
+                continue;
+            }
+            let Some(mix_pk) = vset.mix.get(member).copied() else { continue };
+            let mut hs = blake3::Hasher::new();
+            hs.update(b"privacf-va-reshare-eph-seed-v1");
+            hs.update(&to_u64(self.identity.sk).to_le_bytes());
+            hs.update(&my_idx.to_le_bytes());
+            hs.update(member);
+            let eph_seed = *hs.finalize().as_bytes();
+            if let Some(parcel) = crate::arbitration::seal_reshare(
+                &mix_pk, Self::VA_RESHARE_TAG, 1, my_idx, member, &[0u8; 32], &subdeal[k].1, &eph_seed,
+            ) {
+                mixer.publish(peers, beacon, Message::VaReshare(parcel));
+            }
+        }
+        if let Some(ns) = self.try_combine_va_reshare(&new_set, va_held) {
+            *current_share = Some(ns);
+        }
+    }
+
+    /// New-member side: open a `VA_pub` re-share parcel addressed to us, accumulate the dealer's sub-share,
+    /// and once the canonical dealer set is complete, combine them into our fresh `VA_pub` share.
+    fn handle_va_reshare(
+        &self,
+        blocks: &[Block],
+        parcel: &crate::arbitration::ReshareParcel,
+        current_share: &mut Option<(u64, [u8; 32])>,
+        va_held: &mut HashMap<u64, [u8; 32]>,
+    ) {
+        if parcel.member != self.me() || parcel.subject != Self::VA_RESHARE_TAG {
+            return;
+        }
+        let Some(new_set) = self.va_reshare_target(blocks) else { return };
+        if self.va_new_index(&new_set).is_none() {
+            return; // not a member of the new set
+        }
+        let Some(dealers) = self.va_canonical_dealers(&new_set) else { return };
+        if !dealers.iter().any(|(idx, _)| *idx == parcel.old_index) {
+            return; // not a canonical dealer
+        }
+        let Some((_, subshare)) = crate::arbitration::open_reshare(&self.identity.mix_sk(), parcel) else { return };
+        va_held.entry(parcel.old_index).or_insert(subshare);
+        if let Some(ns) = self.try_combine_va_reshare(&new_set, va_held) {
+            *current_share = Some(ns);
+        }
+    }
+
+    /// Combine the accumulated canonical sub-shares into this node's fresh `VA_pub` share once the full
+    /// canonical dealer set is held. Returns the new `(index, share)`, or `None` if not yet complete.
+    fn try_combine_va_reshare(&self, new_set: &[[u8; 32]], va_held: &HashMap<u64, [u8; 32]>) -> Option<(u64, [u8; 32])> {
+        let dealers = self.va_canonical_dealers(new_set)?;
+        if dealers.iter().any(|(idx, _)| !va_held.contains_key(idx)) {
+            return None; // missing a canonical dealer's sub-share
+        }
+        let contributions: Vec<(u64, [u8; 32])> = dealers.iter().map(|(idx, _)| (*idx, va_held[idx])).collect();
+        let new_share = crate::dkg::reshare_combine(&contributions);
+        let new_index = self.va_new_index(new_set)?;
+        Some((new_index, new_share))
     }
 
     /// Post-genesis admission events on-chain: `subject_id` → (peer_id, admission height, admission
@@ -2769,6 +2939,8 @@ impl Node {
         reshare_held: &mut HashMap<u64, Vec<(u64, [u8; 32], [u8; 32])>>,
         psi_initiated: &mut HashSet<[u8; 32]>,
         interest_peers: &mut HashSet<[u8; 32]>,
+        current_share: &mut Option<(u64, [u8; 32])>,
+        va_held: &mut HashMap<u64, [u8; 32]>,
         peers: &PeersMap,
         mixer: &Mixer,
         slashed: &mut HashSet<[u8; 32]>,
@@ -2891,6 +3063,11 @@ impl Node {
                 // and, once the canonical dealer set is complete, file a round-1 handoff receipt. Consumed
                 // here, never re-gossiped (it carries a custody sub-share sealed to us alone).
                 self.handle_reshare_parcel(chain, &parcel, reshare_held, handoff_pool, peers, mixer, beacon_hint);
+            }
+            Message::VaReshare(parcel) => {
+                // A §4.1 VA_pub re-share sub-share addressed to us: accumulate it and, once the canonical
+                // dealer set is complete, combine into our fresh VA_pub share. Consumed here, not re-gossiped.
+                self.handle_va_reshare(&chain.blocks, &parcel, current_share, va_held);
             }
             Message::PsiOffer { from, to, u } => {
                 // §5.3/§5.4 PSI offer addressed to us: respond with our blinded set + the re-blinded offer.
@@ -3149,6 +3326,12 @@ impl Node {
         // the pool of received partials per target (signer-index -> partial) awaiting a threshold.
         let mut emitted_partials: HashSet<u64> = HashSet::new();
         let mut verdict_partials: HashMap<u64, HashMap<u64, [u8; 96]>> = HashMap::new();
+        // §4.1 VA_pub threshold key: the LIVE (index, share) — the genesis share, replaced by a fresh one
+        // after a proactive re-share on validator rotation. Plus the sub-shares collected and a once-flag.
+        let mut current_share: Option<(u64, [u8; 32])> =
+            self.threshold_key.as_ref().map(|tk| (tk.index, tk.share));
+        let mut va_held: HashMap<u64, [u8; 32]> = HashMap::new();
+        let mut va_reshare_last_h: Option<u64> = None;
         // Autonomous-audit state: subjects we have already considered for observation (observe-once),
         // and the pool of first-observation reports awaiting inclusion by the next leader.
         let mut audited: HashSet<u64> = HashSet::new();
@@ -3276,7 +3459,10 @@ impl Node {
                     // Autonomous objective-verdict driver: scan finalized txs and emit/combine partials
                     // (no-op unless this node is a verdict authority with a threshold key).
                     let beacon_hint = round.as_ref().map(|r| r.beacon_t).unwrap_or_else(|| chain.head().header.beacon_t);
-                    self.drive_verdicts(&chain, &peers, &mixer, beacon_hint, &mut emitted_partials, &mut verdict_partials, &mut pending_suspensions);
+                    // §4.1 VA_pub re-share on validator rotation (no-op until the set rotates / unless we
+                    // hold a share or are a joiner). Updates current_share to the fresh post-rotation share.
+                    self.drive_va_reshare(&chain, &mut current_share, &mut va_held, &peers, &mixer, beacon_hint, &mut va_reshare_last_h);
+                    self.drive_verdicts(&chain, &current_share, &peers, &mixer, beacon_hint, &mut emitted_partials, &mut verdict_partials, &mut pending_suspensions);
                     // Autonomous audit-observer driver (no-op unless this node is an audit authority).
                     self.drive_audit(&chain, &peers, &mixer, beacon_hint, &mut audited, &mut audit_pool);
                     // Rogue-commit burst (no-op unless rogue) and watchdog driver (no-op unless authority).
@@ -3317,7 +3503,7 @@ impl Node {
                     }
                 }
                 Some(msg) = inbox_rx.recv() => {
-                    self.on_msg(msg, round.as_mut(), &mut chain, &mut pending, &mut pending_membership, &mut pending_suspensions, &mut verdict_partials, &mut audit_pool, &mut verdict_commit_pool, &mut watchdog_pool, &mut rewind_pool, &mut handoff_pool, &mut handoff_proof_pool, &mut custody_held, &mut reshare_held, &mut psi_initiated, &mut interest_peers, &peers, &mixer, &mut slashed);
+                    self.on_msg(msg, round.as_mut(), &mut chain, &mut pending, &mut pending_membership, &mut pending_suspensions, &mut verdict_partials, &mut audit_pool, &mut verdict_commit_pool, &mut watchdog_pool, &mut rewind_pool, &mut handoff_pool, &mut handoff_proof_pool, &mut custody_held, &mut reshare_held, &mut psi_initiated, &mut interest_peers, &mut current_share, &mut va_held, &peers, &mixer, &mut slashed);
                 }
             }
         }
@@ -3347,6 +3533,10 @@ impl Node {
             chain.blocks.iter().map(|b| b.header.handoff_receipts.len()).sum::<usize>();
         let handoff_proofs_recorded =
             chain.blocks.iter().map(|b| b.header.handoff_proofs.len()).sum::<usize>();
+        let (va_share_index, va_proof_partial) = match &current_share {
+            Some((idx, share)) => (Some(*idx), Some(crate::dkg::sign_share(share, Self::VA_PROOF_TAG).to_vec())),
+            None => (None, None),
+        };
         let handoff_subjects = self.handoff_subjects(&chain.blocks);
         let handoff_complete = !handoff_subjects.is_empty()
             && handoff_subjects.iter().all(|&s| {
@@ -3379,6 +3569,8 @@ impl Node {
             rewind_signals_recorded,
             handoff_receipts_recorded,
             handoff_proofs_recorded,
+            va_share_index,
+            va_proof_partial,
             handoff_complete,
             handoff_defaults,
             rehandoff_complete,
