@@ -190,6 +190,43 @@ impl Vote {
     }
 }
 
+/// A signed view-change announcement: validator `signer` declares it has advanced to `view` at
+/// `height` (its leader for the previous view timed out). Used by the quorum-gated pacemaker — a node
+/// advances to `view` only once a quorum of distinct members have announced it, so all validators
+/// move through views together instead of drifting (the divergence that livelocks finalization after
+/// a validator-set change). BLS-signed over `(height, view)` so a non-member's announcement can't
+/// inflate the view.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ViewChange {
+    pub height: u64,
+    pub view: u64,
+    pub signer: [u8; 32],
+    pub bls_sig: Vec<u8>,
+}
+
+fn viewchange_sig_bytes(height: u64, view: u64) -> Vec<u8> {
+    let mut v = b"privacf-viewchange-v1".to_vec();
+    v.extend_from_slice(&height.to_le_bytes());
+    v.extend_from_slice(&view.to_le_bytes());
+    v
+}
+
+impl ViewChange {
+    pub fn create(signer: &NodeIdentity, height: u64, view: u64) -> Self {
+        let bls_sig = signer.bls_sign(&viewchange_sig_bytes(height, view)).to_vec();
+        Self { height, view, signer: signer.peer_id(), bls_sig }
+    }
+
+    /// Verify the announcement's BLS signature over `(height, view)`, given the signer's BLS key.
+    pub fn verify(&self, bls_pk: &[u8; 48]) -> bool {
+        let msg = viewchange_sig_bytes(self.height, self.view);
+        match <[u8; 96]>::try_from(self.bls_sig.as_slice()) {
+            Ok(sig) => bls::verify(bls_pk, &msg, &sig),
+            Err(_) => false,
+        }
+    }
+}
+
 /// Non-repudiable proof that `voter` cast two votes for different block ids at the same
 /// `(height, view)` — the vote-side analogue of `EquivocationProof`. Unlike proposer equivocation
 /// (ed25519, key embedded in the block), votes are BLS-signed, so verification needs the voter's
