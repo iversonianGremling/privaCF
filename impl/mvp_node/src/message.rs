@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::chain::{Block, EquivocationProof, Vote, VoteEquivocationProof};
+use crate::chain::{Block, EquivocationProof, ViewChange, Vote, VoteEquivocationProof};
 use crate::epoch::EpochTransaction;
 use crate::membership::MembershipOp;
 use crate::sphinx::SphinxPacket;
@@ -22,6 +22,8 @@ pub enum Message {
     Proposal(Block),
     /// A validator's vote for a proposed block.
     Vote(Vote),
+    /// A validator's signed view-change announcement (quorum-gated pacemaker view synchronization).
+    ViewChange(ViewChange),
     /// A block that reached a quorum certificate (finalized) — lets laggards adopt it directly.
     Finalized(Block),
     /// Proof that a proposer double-signed a slot — slashes the offender network-wide.

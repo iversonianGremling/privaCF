@@ -77,12 +77,12 @@ async fn view_change_recovers_from_a_withholding_leader() {
 
     let validators = genesis_validator_set(nodes, base_port);
 
-    // Deterministically pick the height-1 view-0 leader (lowest VRF output) as the faulty node,
+    // Deterministically pick the height-1 view-0 leader (beacon-seeded election) as the faulty node,
     // guaranteeing at least one view-change.
     let beacon1 = next_beacon(GENESIS_BEACON, &GENESIS_VRF_OUTPUT, 1);
-    let faulty = (0..nodes)
-        .min_by_key(|&i| VrfClaim::create(&NodeIdentity::from_seed(i), 1, beacon1).output)
-        .unwrap();
+    let peer_ids: Vec<[u8; 32]> = (0..nodes).map(|i| NodeIdentity::from_seed(i).peer_id()).collect();
+    let leader = mvp_node::consensus::leader_by_beacon(&peer_ids, beacon1, 0).unwrap();
+    let faulty = (0..nodes).find(|&i| NodeIdentity::from_seed(i).peer_id() == leader).unwrap();
 
     let mut handles = Vec::new();
     for i in 0..nodes {
@@ -129,9 +129,9 @@ async fn slashing_detects_and_punishes_an_equivocating_leader() {
 
     let validators = genesis_validator_set(nodes, base_port);
     let beacon1 = next_beacon(GENESIS_BEACON, &GENESIS_VRF_OUTPUT, 1);
-    let faulty = (0..nodes)
-        .min_by_key(|&i| VrfClaim::create(&NodeIdentity::from_seed(i), 1, beacon1).output)
-        .unwrap();
+    let peer_ids: Vec<[u8; 32]> = (0..nodes).map(|i| NodeIdentity::from_seed(i).peer_id()).collect();
+    let leader = mvp_node::consensus::leader_by_beacon(&peer_ids, beacon1, 0).unwrap();
+    let faulty = (0..nodes).find(|&i| NodeIdentity::from_seed(i).peer_id() == leader).unwrap();
     let faulty_peer = NodeIdentity::from_seed(faulty).peer_id();
 
     let mut handles = Vec::new();

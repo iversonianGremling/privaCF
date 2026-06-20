@@ -31,7 +31,7 @@ use crate::chain::{
     QuorumCert, Vote, VoteEquivocationProof,
 };
 use crate::commit::{CommitT, NativeGroupVerEnc, StubVerEnc, VerEnc};
-use crate::consensus::{leader_for, quorum};
+use crate::consensus::quorum;
 use crate::dkg;
 use crate::epoch::EpochTransaction;
 use crate::field::{add_mod, from_u64, random_field, sub_mod, to_u64};
@@ -323,7 +323,9 @@ struct Round {
     seen_proposals: HashMap<([u8; 32], u64), ([u8; 32], Vec<u8>)>, // (proposer,view) -> (id, sig)
     seen_votes: HashMap<([u8; 32], u64), ([u8; 32], Vec<u8>)>, // (voter,view) -> (block_id, bls_sig)
     vrf_deadline: Instant,                             // when claim collection ends
-    view_deadline: Instant,                            // when to advance to the next view
+    view_deadline: Instant,                            // when to broadcast the next view-change
+    vc_votes: HashMap<u64, HashSet<[u8; 32]>>,         // view -> members who announced advancing to it
+    vc_announced: HashSet<u64>,                        // views we have already broadcast a ViewChange for
 }
 
 /// This validator's share of the genesis DKG threshold key `VA_pub` — a presupposed-good-genesis
@@ -2611,24 +2613,20 @@ impl Node {
             seen_votes: HashMap::new(),
             vrf_deadline,
             view_deadline,
+            vc_votes: HashMap::new(),
+            vc_announced: HashSet::new(),
         }
     }
 
     /// The elected leader for `(view)`, considering only active (non-slashed) validators. A VRF
     /// claim from a non-member (e.g. a just-departed validator) cannot win the lottery.
-    fn elected_leader(
-        &self,
-        claims: &HashMap<[u8; 32], [u8; 32]>,
-        view: u64,
-        slashed: &HashSet<[u8; 32]>,
-        vset: &ValidatorSet,
-    ) -> Option<[u8; 32]> {
-        let live: HashMap<[u8; 32], [u8; 32]> = claims
-            .iter()
-            .filter(|(p, _)| !slashed.contains(*p) && vset.contains(p))
-            .map(|(p, o)| (*p, *o))
-            .collect();
-        leader_for(&live, view)
+    /// The leader for `(beacon, view)` over the active set, minus slashed members. Claims-independent
+    /// and chain-derived, so every node agrees regardless of which VRF claims it has collected (see
+    /// [`crate::consensus::leader_by_beacon`] for why the old claim-set election livelocked after a
+    /// validator-set change).
+    fn elected_leader(&self, view: u64, slashed: &HashSet<[u8; 32]>, vset: &ValidatorSet, beacon: u64) -> Option<[u8; 32]> {
+        let live: Vec<[u8; 32]> = vset.peers.iter().filter(|p| !slashed.contains(*p)).copied().collect();
+        crate::consensus::leader_by_beacon(&live, beacon, view)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2970,17 +2968,9 @@ impl Node {
     /// Live-proposal validity (deciding whether to VOTE): structural + VRF + proposer signature +
     /// the proposer is the correct (non-slashed) leader for the block's view, per our claim set and
     /// the round's active validator set.
-    fn valid_proposal(
-        &self,
-        chain: &Chain,
-        b: &Block,
-        claims: &HashMap<[u8; 32], [u8; 32]>,
-        slashed: &HashSet<[u8; 32]>,
-        vset: &ValidatorSet,
-    ) -> bool {
+    fn valid_proposal(&self, chain: &Chain, b: &Block, slashed: &HashSet<[u8; 32]>, vset: &ValidatorSet) -> bool {
         self.structural_and_vrf_ok(chain, b, vset)
-            && self.elected_leader(claims, b.header.view, slashed, vset)
-                == Some(b.header.proposer_peer)
+            && self.elected_leader(b.header.view, slashed, vset, b.header.beacon_t) == Some(b.header.proposer_peer)
     }
 
     /// Append validity for a finalized/synced block: structural + VRF + a valid quorum certificate
@@ -2990,6 +2980,43 @@ impl Node {
     fn valid_block(&self, chain: &Chain, b: &Block) -> bool {
         let vset = self.active_set_at(&chain.blocks, b.header.height);
         self.structural_and_vrf_ok(chain, b, &vset) && qc_valid(b, &vset.peers, &vset.bls)
+    }
+
+    /// Per-view leader-timeout window with **capped exponential backoff**: view 0 gets the base
+    /// `window_ms`, each subsequent view doubles it up to an 8× cap. When the network is in lock-step
+    /// (the common case — every passing test) views stay at 0 and this is just `window_ms`. When a
+    /// perturbation desynchronizes nodes (e.g. a validator departure shifts who enters a height when),
+    /// the growing window gives the leader's proposal time to propagate and a quorum of same-view
+    /// votes time to gather, so the view climb halts at a low view instead of running away forever
+    /// (the post-departure livelock). Pairs with adopt-higher-view-on-valid-proposal in `on_msg`.
+    fn view_timeout(&self, view: u64) -> Duration {
+        // Mild capped backoff: higher views get a longer window so a struggling, momentarily
+        // desynchronized set has time for a quorum of view-changes to gather before the next one is
+        // announced. The quorum gate (not the timeout) is what bounds the view climb, so the cap stays
+        // low (4×) — enough to aid convergence without ballooning per-height latency.
+        Duration::from_millis(self.config.window_ms * (1u64 << view.min(2)))
+    }
+
+    /// Quorum-gated view advancement: move to the HIGHEST view a quorum of current members has
+    /// announced a view-change to (counting only `vset` members). This keeps all validators in
+    /// lock-step through view-changes — a node advances exactly when a quorum agrees the prior
+    /// leader failed — so they never drift into the permanently-divergent views that livelock
+    /// finalization (a quorum of same-view votes can't form across scattered views). No-op until some
+    /// view beyond the current one has quorum support.
+    fn maybe_advance_view(&self, r: &mut Round) {
+        let q = quorum(r.vset.len());
+        let target = r
+            .vc_votes
+            .iter()
+            .filter(|(v, members)| **v > r.view && members.iter().filter(|m| r.vset.contains(m)).count() >= q)
+            .map(|(v, _)| *v)
+            .max();
+        if let Some(v) = target {
+            r.view = v;
+            r.voted = None;
+            r.view_deadline = Instant::now() + self.view_timeout(v);
+            debug!(height = r.height, view = v, "advanced view (quorum view-change)");
+        }
     }
 
     /// After claim collection: advance the view on leader timeout, the current view's leader
@@ -3016,14 +3043,24 @@ impl Node {
         if now < r.vrf_deadline {
             return; // still collecting VRF claims
         }
-        // view-change: the current leader didn't get us to a quorum certificate in time.
+        // view-change: the current leader didn't reach a quorum certificate in time. Rather than
+        // advancing our view LOCALLY (which lets nodes drift into divergent views that can never
+        // re-converge — the post-departure livelock), BROADCAST a signed view-change for the next
+        // view and advance only once a QUORUM of members announce it, so all validators move through
+        // views in lock-step.
         if now >= r.view_deadline {
-            r.view += 1;
-            r.voted = None;
-            r.view_deadline = now + Duration::from_millis(self.config.window_ms);
-            debug!(height = r.height, view = r.view, "view-change (leader timeout)");
+            let target = r.view + 1;
+            if r.vc_announced.insert(target) {
+                if r.vset.contains(&self.me()) {
+                    r.vc_votes.entry(target).or_default().insert(self.me());
+                }
+                mixer.publish(peers, r.beacon_t, Message::ViewChange(crate::chain::ViewChange::create(&self.identity, r.height, target)));
+                debug!(height = r.height, view = r.view, target, "broadcast view-change");
+            }
+            r.view_deadline = now + self.view_timeout(target); // re-announce the NEXT view only after a grace
+            self.maybe_advance_view(r); // our own announcement may have completed a quorum
         }
-        if let Some(ldr) = self.elected_leader(&r.claims, r.view, slashed, &r.vset) {
+        if let Some(ldr) = self.elected_leader(r.view, slashed, &r.vset, r.beacon_t) {
             if ldr == self.me() && !r.proposed_views.contains(&r.view) && !self.withhold_proposals {
                 r.proposed_views.insert(r.view);
                 if self.equivocate {
@@ -3306,7 +3343,7 @@ impl Node {
             Message::Proposal(b) => {
                 if let Some(r) = round {
                     if b.header.height == r.height
-                        && self.valid_proposal(chain, &b, &r.claims, slashed, &r.vset)
+                        && self.valid_proposal(chain, &b, slashed, &r.vset)
                     {
                         let bview = b.header.view;
                         let bid = block_id(&b.header, &b.txs);
@@ -3334,6 +3371,21 @@ impl Node {
                             r.seen_proposals.insert(key, (bid, b.proposer_sig.clone()));
                         }
                         r.blocks.entry(bid).or_insert(b);
+                        // Pacemaker / view synchronization: a VALID proposal from the legitimate
+                        // elected leader of a HIGHER view is proof the network has advanced past us.
+                        // Adopt that view (refreshing the window, mirroring the local view-change
+                        // reset) so a laggard re-synchronizes instead of drifting. Without this, nodes
+                        // perturbed out of lock-step — e.g. by a validator-set change (a departure) —
+                        // scatter across views and can NEVER gather a same-view quorum, livelocking
+                        // finalization. `valid_proposal` already verified the proposer is the elected
+                        // leader for `bview`, so a node can only pull peers to a view it legitimately
+                        // leads (it cannot forge arbitrary high-view proposals); honest leaders only
+                        // ever propose at their own current view, so steady state is unaffected.
+                        if bview > r.view {
+                            r.view = bview;
+                            r.voted = None;
+                            r.view_deadline = Instant::now() + self.view_timeout(r.view);
+                        }
                         // valid_proposal already confirmed the proposer is the leader for `bview`,
                         // so vote iff it matches our current view and we haven't voted in it yet.
                         if Instant::now() >= r.vrf_deadline && r.voted.is_none() && bview == r.view {
@@ -3378,6 +3430,23 @@ impl Node {
                         }
                         r.votes.entry(v.block_id).or_default().insert(v.voter, v);
                         self.try_finalize(r, chain, peers, mixer);
+                    }
+                }
+            }
+            Message::ViewChange(vc) => {
+                if let Some(r) = round {
+                    // Quorum-gated pacemaker: record a member's signed view-change and advance our own
+                    // view once a quorum has announced the same one (so the whole set moves together).
+                    let ok = vc.height == r.height
+                        && r.vset.contains(&vc.signer)
+                        && r.vset.bls.get(&vc.signer).is_some_and(|pk| vc.verify(pk));
+                    if ok {
+                        let fresh = r.vc_votes.entry(vc.view).or_default().insert(vc.signer);
+                        self.maybe_advance_view(r);
+                        // Re-gossip the first time we see it so a quorum reaches every node.
+                        if fresh {
+                            mixer.publish(peers, r.beacon_t, Message::ViewChange(vc));
+                        }
                     }
                 }
             }
@@ -3549,6 +3618,10 @@ impl Node {
         let mut round: Option<Round> = None;
         let mut slashed: HashSet<[u8; 32]> = HashSet::new();
         let mut done_at: Option<Instant> = None;
+        // Proposals that arrived for a height we had not yet entered (we finalize-enter slightly later
+        // than the leader proposes). Buffer the latest per height and inject it the instant we enter
+        // that round, so we vote at view 0 instead of missing the proposal and forcing a view-change.
+        let mut early_proposals: HashMap<u64, Block> = HashMap::new();
         let mut ticker = interval(Duration::from_millis(10));
 
         // The mixnet router: enabled when `with_mixnet` supplied settings, else a transparent
@@ -3631,6 +3704,26 @@ impl Node {
                             k.insert(*p, a.clone());
                         }
                     }
+                    // Inject a proposal that arrived before we entered this height: vote on it now (at
+                    // view 0) instead of missing it and being forced into a view-change.
+                    early_proposals.retain(|h, _| *h >= need); // drop heights we have already passed
+                    if let Some(b) = early_proposals.remove(&need) {
+                        if let Some(r) = round.as_mut() {
+                            if b.header.height == r.height && self.valid_proposal(&chain, &b, &slashed, &r.vset) {
+                                let bid = block_id(&b.header, &b.txs);
+                                if b.header.view > r.view {
+                                    r.view = b.header.view;
+                                    r.voted = None;
+                                    r.view_deadline = Instant::now() + self.view_timeout(r.view);
+                                }
+                                r.blocks.entry(bid).or_insert(b);
+                                if r.voted.is_none() {
+                                    self.cast_vote(r, bid, &peers, &mixer);
+                                }
+                                self.try_finalize(r, &mut chain, &peers, &mixer);
+                            }
+                        }
+                    }
                 }
             }
 
@@ -3683,6 +3776,14 @@ impl Node {
                     }
                 }
                 Some(msg) = inbox_rx.recv() => {
+                    // Buffer a proposal for a height beyond our current round — we enter it on the next
+                    // loop turn and will inject it then (avoids a missed-proposal view-change).
+                    if let Message::Proposal(b) = &msg {
+                        let cur = round.as_ref().map(|r| r.height).unwrap_or(0);
+                        if b.header.height > cur {
+                            early_proposals.insert(b.header.height, b.clone());
+                        }
+                    }
                     self.on_msg(msg, round.as_mut(), &mut chain, &mut pending, &mut pending_membership, &mut pending_suspensions, &mut verdict_partials, &mut audit_pool, &mut verdict_commit_pool, &mut watchdog_pool, &mut rewind_pool, &mut handoff_pool, &mut handoff_proof_pool, &mut custody_held, &mut reshare_held, &mut psi_initiated, &mut interest_peers, &mut current_share, &mut va_held, &peers, &mixer, &mut slashed);
                 }
             }
