@@ -2992,6 +2992,17 @@ impl Node {
         self.structural_and_vrf_ok(chain, b, &vset) && qc_valid(b, &vset.peers, &vset.bls)
     }
 
+    /// Per-view leader-timeout window with **capped exponential backoff**: view 0 gets the base
+    /// `window_ms`, each subsequent view doubles it up to an 8× cap. When the network is in lock-step
+    /// (the common case — every passing test) views stay at 0 and this is just `window_ms`. When a
+    /// perturbation desynchronizes nodes (e.g. a validator departure shifts who enters a height when),
+    /// the growing window gives the leader's proposal time to propagate and a quorum of same-view
+    /// votes time to gather, so the view climb halts at a low view instead of running away forever
+    /// (the post-departure livelock). Pairs with adopt-higher-view-on-valid-proposal in `on_msg`.
+    fn view_timeout(&self, view: u64) -> Duration {
+        Duration::from_millis(self.config.window_ms * (1u64 << view.min(3)))
+    }
+
     /// After claim collection: advance the view on leader timeout, the current view's leader
     /// proposes, and everyone votes for that leader's block.
     #[allow(clippy::too_many_arguments)]
@@ -3020,7 +3031,7 @@ impl Node {
         if now >= r.view_deadline {
             r.view += 1;
             r.voted = None;
-            r.view_deadline = now + Duration::from_millis(self.config.window_ms);
+            r.view_deadline = now + self.view_timeout(r.view);
             debug!(height = r.height, view = r.view, "view-change (leader timeout)");
         }
         if let Some(ldr) = self.elected_leader(&r.claims, r.view, slashed, &r.vset) {
@@ -3334,6 +3345,21 @@ impl Node {
                             r.seen_proposals.insert(key, (bid, b.proposer_sig.clone()));
                         }
                         r.blocks.entry(bid).or_insert(b);
+                        // Pacemaker / view synchronization: a VALID proposal from the legitimate
+                        // elected leader of a HIGHER view is proof the network has advanced past us.
+                        // Adopt that view (refreshing the window, mirroring the local view-change
+                        // reset) so a laggard re-synchronizes instead of drifting. Without this, nodes
+                        // perturbed out of lock-step — e.g. by a validator-set change (a departure) —
+                        // scatter across views and can NEVER gather a same-view quorum, livelocking
+                        // finalization. `valid_proposal` already verified the proposer is the elected
+                        // leader for `bview`, so a node can only pull peers to a view it legitimately
+                        // leads (it cannot forge arbitrary high-view proposals); honest leaders only
+                        // ever propose at their own current view, so steady state is unaffected.
+                        if bview > r.view {
+                            r.view = bview;
+                            r.voted = None;
+                            r.view_deadline = Instant::now() + self.view_timeout(r.view);
+                        }
                         // valid_proposal already confirmed the proposer is the leader for `bview`,
                         // so vote iff it matches our current view and we haven't voted in it yet.
                         if Instant::now() >= r.vrf_deadline && r.voted.is_none() && bview == r.view {
@@ -3376,7 +3402,19 @@ impl Node {
                         } else {
                             r.seen_votes.insert(key, (v.block_id, v.bls_sig.clone()));
                         }
+                        // Pacemaker: a member voting at a HIGHER view proves the network has advanced
+                        // past us — adopt that view so we re-synchronize. Unlike proposal-adoption this
+                        // also propagates the max view from NON-leader nodes (which never propose), the
+                        // piece needed to actually collapse a post-departure view spread. Safe: votes
+                        // already stored finalize by their own `v.view` in `try_finalize` regardless of
+                        // our current view, so adopting forward never loses an in-flight quorum.
+                        let vview = v.view;
                         r.votes.entry(v.block_id).or_default().insert(v.voter, v);
+                        if vview > r.view {
+                            r.view = vview;
+                            r.voted = None;
+                            r.view_deadline = Instant::now() + self.view_timeout(r.view);
+                        }
                         self.try_finalize(r, chain, peers, mixer);
                     }
                 }
