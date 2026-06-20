@@ -107,7 +107,7 @@ fn dp_obfuscated_gossip_still_recommends_the_honest_co_like() {
 /// node with the given clean preference vector.
 fn tx_with_prefs(seed: u64, prefs: &[i64], epoch_id: u64, epsilon: f64) -> EpochTransaction {
     let id = NodeIdentity::from_seed(seed);
-    let commit = mvp_node::commit::CommitT { s1: 0, d_t: Vec::new() }; // identity split not under test here
+    let commit = mvp_node::commit::CommitT { s1: 0, d_t: Vec::new(), proof: Vec::new() }; // identity split not under test here
     let payload = PreferencePayload::build(prefs, &id.peer_id(), epoch_id, epsilon);
     EpochTransaction::create_with_pref(&id, 1, epoch_id, commit, Some(payload))
 }

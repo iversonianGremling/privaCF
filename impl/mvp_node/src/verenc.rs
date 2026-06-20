@@ -337,6 +337,449 @@ pub fn verdict_signature(x_be: &[u8; 32], id: &[u8]) -> [u8; 96] {
     g2_compress(&g2_mul(&g2_hash(id), &scalar_le_from_be(x_be)))
 }
 
+// ============================ d_T well-formedness proof (DESIGN-f1 §R1–R3, P1.2b) =================
+//
+// A node publishes `d_T = Enc(s₂)` so that a SUSPEND verdict can recover `s₂` (hence `null_v`) with
+// no cooperation from the node. But nothing above forces `d_T` to be a *well-formed* ciphertext of a
+// recoverable value: a malicious node could publish garbage, a ciphertext it cannot open, or one
+// whose limbs lie outside `[0,2¹⁶)` (so `decrypt`'s baby-step/giant-step search silently fails). The
+// breakage is only discovered at verdict time — too late: extraction fails and the node escapes
+// suspension. This module lets **every validator verify, at publish time and without `σ`**, that
+// `d_T` is a real exponential-ElGamal encryption of a 64-bit value whose opening the publisher knows.
+//
+// Per limb `j` the public statement (over the group params `g₁`, `g_T = e(g₁,Q_id)`,
+// `K_pub = e(VA_pub,Q_id)`, all derivable from public `VA_pub`/`id`) is, for `Uⱼ ∈ G₁`, `Wⱼ ∈ G_T`:
+//
+//     ∃ (mⱼ ∈ [0,2¹⁶), ρⱼ ∈ Z_r):  Uⱼ = ρⱼ·g₁   ∧   Wⱼ = g_T^{mⱼ} · K_pub^{ρⱼ}
+//
+// proven in zero knowledge by two standard, **fully BLS12-381-native** Fiat–Shamir sigma protocols
+// (no non-native field emulation — the AMBER part of Statement-5 is *only* the cross-field binding of
+// `s₂` to the Goldilocks `null_v`, which is NOT attempted here and stays a documented residual):
+//
+//   * a **16-bit OR-decomposition range proof** (mirroring `zkstmt.rs`, in `G₁` with a NUMS second
+//     generator `h₁`): the prover publishes hiding bit commitments `Pᵢ = bᵢ·g₁ + tᵢ·h₁` and a
+//     Chaum–Pedersen OR-proof `bᵢ ∈ {0,1}` for each; their `2ⁱ`-weighted sum is the value commitment
+//     `C_m = mⱼ·g₁ + t·h₁` with `mⱼ ∈ [0,2¹⁶)`;
+//   * a **generalized Schnorr** over `(mⱼ, t, ρⱼ)` linking `C_m`, `Uⱼ` and `Wⱼ` through the shared
+//     `mⱼ`/`ρⱼ`, proving the encryption is consistent and the prover knows the plaintext.
+//
+// What this CLOSES: a `d_T` that survives the check is a genuine encryption of a definite, in-range,
+// known `s₂` — extraction is guaranteed to succeed, so a node can no longer escape suspension by
+// publishing an un-openable ciphertext. What it does NOT close: that the recovered `s₂` satisfies
+// `s₁ + s₂ = null_v` for the node's *real* nullifier (a hidden value living in Goldilocks/Poseidon).
+// Binding the BLS-side `s₂` to the Goldilocks `null_v` inside one proof is the irreducible non-native
+// step (`spike_bridge_cost` ~2²¹ rows) and remains the AMBER Phase-1b residual.
+
+/// NUMS second `G₁` generator `h₁` for the Pedersen bit commitments — hash-to-curve of a fixed label,
+/// so nobody knows its discrete log w.r.t. `g₁` (the binding property of the commitments).
+fn h1_generator() -> blst_p1 {
+    const H1_MSG: &[u8] = b"PRIVACF_VERENC_PROOF_H1_v1";
+    const H1_DST: &[u8] = b"PRIVACF_VERENC_PROOF_H1_NUMS_v1";
+    unsafe {
+        let mut p = blst_p1::default();
+        blst_hash_to_g1(&mut p, H1_MSG.as_ptr(), H1_MSG.len(), H1_DST.as_ptr(), H1_DST.len(), std::ptr::null(), 0);
+        p
+    }
+}
+
+// --- scalar (Fr) arithmetic for the sigma responses -----------------------------------------------
+
+fn fr_from_be(be: &[u8; 32]) -> blst_fr {
+    unsafe {
+        let mut s = blst_scalar::default();
+        blst_scalar_from_bendian(&mut s, be.as_ptr());
+        let mut fr = blst_fr::default();
+        blst_fr_from_scalar(&mut fr, &s);
+        fr
+    }
+}
+
+fn fr_to_be(fr: &blst_fr) -> [u8; 32] {
+    unsafe {
+        let mut s = blst_scalar::default();
+        blst_scalar_from_fr(&mut s, fr);
+        let mut out = [0u8; 32];
+        blst_bendian_from_scalar(out.as_mut_ptr(), &s);
+        out
+    }
+}
+
+fn fr_to_le(fr: &blst_fr) -> [u8; 32] {
+    unsafe {
+        let mut s = blst_scalar::default();
+        blst_scalar_from_fr(&mut s, fr);
+        let mut out = [0u8; 32];
+        blst_lendian_from_scalar(out.as_mut_ptr(), &s);
+        out
+    }
+}
+
+fn fr_from_u64(v: u64) -> blst_fr {
+    let mut be = [0u8; 32];
+    be[24..].copy_from_slice(&v.to_be_bytes());
+    fr_from_be(&be)
+}
+
+fn fr_add(a: &blst_fr, b: &blst_fr) -> blst_fr {
+    unsafe {
+        let mut o = blst_fr::default();
+        blst_fr_add(&mut o, a, b);
+        o
+    }
+}
+
+fn fr_sub(a: &blst_fr, b: &blst_fr) -> blst_fr {
+    unsafe {
+        let mut o = blst_fr::default();
+        blst_fr_sub(&mut o, a, b);
+        o
+    }
+}
+
+fn fr_mul(a: &blst_fr, b: &blst_fr) -> blst_fr {
+    unsafe {
+        let mut o = blst_fr::default();
+        blst_fr_mul(&mut o, a, b);
+        o
+    }
+}
+
+/// A Fiat–Shamir scalar from a transcript: BLAKE3 → 32-byte seed → BLS key-gen (which reduces `< r`),
+/// so the result is a uniform `Fr` element deterministically derived from `parts`.
+fn fr_from_hash(parts: &[&[u8]]) -> blst_fr {
+    let mut h = blake3::Hasher::new();
+    h.update(b"privacf-verenc-proof-fs-v1");
+    for p in parts {
+        h.update(p);
+    }
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(h.finalize().as_bytes());
+    fr_from_be(&min_pk::SecretKey::key_gen(&seed, &[]).expect("key_gen").to_bytes())
+}
+
+// --- G₁ point arithmetic --------------------------------------------------------------------------
+
+fn p1_from_affine(a: &blst_p1_affine) -> blst_p1 {
+    unsafe {
+        let mut p = blst_p1::default();
+        blst_p1_from_affine(&mut p, a);
+        p
+    }
+}
+
+fn g1_mul_fr(p: &blst_p1, k: &blst_fr) -> blst_p1 {
+    g1_mul(p, &fr_to_le(k))
+}
+
+fn g1_add(a: &blst_p1, b: &blst_p1) -> blst_p1 {
+    unsafe {
+        let mut o = blst_p1::default();
+        blst_p1_add_or_double(&mut o, a, b);
+        o
+    }
+}
+
+fn g1_neg(p: &blst_p1) -> blst_p1 {
+    let mut o = *p;
+    unsafe { blst_p1_cneg(&mut o, true) };
+    o
+}
+
+fn g1_sub(a: &blst_p1, b: &blst_p1) -> blst_p1 {
+    g1_add(a, &g1_neg(b))
+}
+
+fn g1_eq(a: &blst_p1, b: &blst_p1) -> bool {
+    g1_compress(a) == g1_compress(b)
+}
+
+fn g1_uncompress(b: &[u8; 48]) -> Option<blst_p1> {
+    g1_affine_uncompress(b).map(|a| p1_from_affine(&a))
+}
+
+// --- G_T (Fp12) helpers for the sigma --------------------------------------------------------------
+
+fn fp12_pow_fr(base: &blst_fp12, k: &blst_fr) -> blst_fp12 {
+    fp12_pow_be(base, &fr_to_be(k))
+}
+
+fn fp12_eq(a: &blst_fp12, b: &blst_fp12) -> bool {
+    unsafe { blst_fp12_is_equal(a, b) }
+}
+
+// --- proof wire types ------------------------------------------------------------------------------
+
+/// A Chaum–Pedersen OR-proof that a `G₁` commitment `P = b·g₁ + t·h₁` opens to a bit (`P = t·h₁` OR
+/// `P − g₁ = t·h₁`), in the discrete-log base `h₁`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct BitOr {
+    #[serde(with = "BigArray")]
+    a0: [u8; 48],
+    #[serde(with = "BigArray")]
+    a1: [u8; 48],
+    e0: [u8; 32], // e1 = challenge − e0 recomputed
+    z0: [u8; 32],
+    z1: [u8; 32],
+}
+
+/// The well-formedness proof for one encrypted limb: hiding bit commitments + per-bit OR-proofs
+/// (`mⱼ ∈ [0,2¹⁶)`) and the linking generalized-Schnorr `(R_a, R_b, R_c, z_m, z_t, z_ρ)`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct LimbProof {
+    bits: Vec<Vec<u8>>, // Pᵢ (each a 48-byte compressed G₁ point)
+    ors: Vec<BitOr>,
+    #[serde(with = "BigArray")]
+    r_a: [u8; 48],
+    #[serde(with = "BigArray")]
+    r_b: [u8; 48],
+    r_c: Vec<u8>, // R_c ∈ G_T (raw fp12)
+    z_m: [u8; 32],
+    z_t: [u8; 32],
+    z_rho: [u8; 32],
+}
+
+/// A proof that `d_T` is a well-formed encryption of a known, in-range 64-bit `s₂` — one `LimbProof`
+/// per 16-bit limb. Verified by any validator from public `VA_pub`/`id`/`d_T` alone (no `σ`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WellFormedProof {
+    limbs: Vec<LimbProof>,
+}
+
+impl WellFormedProof {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        bincode::serialize(self).expect("verenc proof serialize")
+    }
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        bincode::deserialize(b).ok()
+    }
+}
+
+/// Deterministic nonce stream for the prover (seeded; never revealed). Each draw is a uniform `Fr`.
+struct FrStream(blake3::OutputReader);
+
+impl FrStream {
+    fn new(seed: &[u8; 32], domain: &[u8]) -> Self {
+        let mut h = blake3::Hasher::new();
+        h.update(b"privacf-verenc-proof-nonce-v1");
+        h.update(seed);
+        h.update(domain);
+        Self(h.finalize_xof())
+    }
+    fn next(&mut self) -> blst_fr {
+        let mut b = [0u8; 32];
+        self.0.fill(&mut b);
+        fr_from_be(&min_pk::SecretKey::key_gen(&b, &[]).expect("key_gen").to_bytes())
+    }
+}
+
+/// The shared group parameters of a `d_T`, derived from public `VA_pub` and verdict `id`.
+struct Params {
+    g1: blst_p1,
+    h1: blst_p1,
+    g_t: blst_fp12,
+    k_pub: blst_fp12,
+}
+
+fn params(va_pub: &[u8; 48], id: &[u8]) -> Option<Params> {
+    let vapub_aff = g1_affine_uncompress(va_pub)?;
+    let q_id_aff = g2_to_affine(&g2_hash(id));
+    let g1_gen_aff = unsafe { *blst_p1_affine_generator() };
+    Some(Params {
+        g1: g1_generator(),
+        h1: h1_generator(),
+        g_t: pairing(&g1_gen_aff, &q_id_aff),
+        k_pub: pairing(&vapub_aff, &q_id_aff),
+    })
+}
+
+/// Fiat–Shamir challenge for the per-limb generalized Schnorr (binds the context, limb index, both
+/// group points and the three sigma commitments).
+#[allow(clippy::too_many_arguments)]
+fn sigma_challenge(va_pub: &[u8; 48], id: &[u8], j: usize, u: &blst_p1, w: &blst_fp12, c_m: &blst_p1, r_a: &blst_p1, r_b: &blst_p1, r_c: &blst_fp12) -> blst_fr {
+    fr_from_hash(&[
+        b"sigma",
+        va_pub,
+        id,
+        &(j as u64).to_le_bytes(),
+        &g1_compress(u),
+        &fp12_to_bytes(w),
+        &g1_compress(c_m),
+        &g1_compress(r_a),
+        &g1_compress(r_b),
+        &fp12_to_bytes(r_c),
+    ])
+}
+
+/// Fiat–Shamir challenge for the per-bit OR-proof.
+fn bit_challenge(va_pub: &[u8; 48], id: &[u8], j: usize, i: usize, p0: &blst_p1, p1: &blst_p1, a0: &blst_p1, a1: &blst_p1) -> blst_fr {
+    fr_from_hash(&[
+        b"bit",
+        va_pub,
+        id,
+        &(j as u64).to_le_bytes(),
+        &(i as u64).to_le_bytes(),
+        &g1_compress(p0),
+        &g1_compress(p1),
+        &g1_compress(a0),
+        &g1_compress(a1),
+    ])
+}
+
+/// Prove `d_T` (=`ct`, encrypting `s2` under `va_pub`/`id`) is well-formed. `seed` drives the prover's
+/// nonces (kept secret). Returns `None` if `ct` is malformed or its limbs do not decode.
+pub fn prove_wellformed(va_pub: &[u8; 48], id: &[u8], ct: &VerEncCt, s2: u64, seed: &[u8; 32]) -> Option<WellFormedProof> {
+    if ct.limbs.len() != N_LIMBS {
+        return None;
+    }
+    let pr = params(va_pub, id)?;
+    let mut stream = FrStream::new(seed, id);
+    let mut out = Vec::with_capacity(N_LIMBS);
+    for (j, limb) in ct.limbs.iter().enumerate() {
+        let u = g1_uncompress(&limb.u)?;
+        let w = fp12_from_bytes(&limb.w)?;
+        let m = (s2 >> (LIMB_BITS * j)) & 0xFFFF;
+        // Re-derive the per-limb randomness ρⱼ exactly as `encrypt` did (deterministic in id/j/s2).
+        let rho_be = random_scalar_be(&[id, b"rho", &(j as u64).to_le_bytes(), &s2.to_le_bytes()].concat());
+        let rho = fr_from_be(&rho_be);
+        out.push(prove_limb(&pr, va_pub, id, j, &u, &w, m, &rho, &mut stream));
+    }
+    Some(WellFormedProof { limbs: out })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_limb(pr: &Params, va_pub: &[u8; 48], id: &[u8], j: usize, u: &blst_p1, w: &blst_fp12, m: u64, rho: &blst_fr, stream: &mut FrStream) -> LimbProof {
+    // ---- bit commitments Pᵢ = bᵢ·g₁ + tᵢ·h₁, with OR-proofs bᵢ∈{0,1}; t = Σ 2ⁱ tᵢ, C_m = Σ 2ⁱ Pᵢ ----
+    let mut bits = Vec::with_capacity(LIMB_BITS);
+    let mut ors = Vec::with_capacity(LIMB_BITS);
+    let mut t = fr_from_u64(0);
+    let mut c_m: Option<blst_p1> = None;
+    for i in 0..LIMB_BITS {
+        let b = (m >> i) & 1;
+        let ti = stream.next();
+        let p_i = g1_add(&g1_mul_fr(&pr.g1, &fr_from_u64(b)), &g1_mul_fr(&pr.h1, &ti));
+        bits.push(g1_compress(&p_i).to_vec());
+
+        // accumulate t and C_m by their 2ⁱ weights.
+        let w_i = fr_from_u64(1u64 << i);
+        t = fr_add(&t, &fr_mul(&w_i, &ti));
+        let term = g1_mul_fr(&p_i, &w_i);
+        c_m = Some(match c_m {
+            Some(acc) => g1_add(&acc, &term),
+            None => term,
+        });
+
+        // OR-proof that P_i opens to a bit, in base h₁ (witness tᵢ on the true branch).
+        let p0 = p_i;
+        let p1 = g1_sub(&p_i, &pr.g1);
+        let d = b as usize; // true branch
+        let e_fake = stream.next();
+        let z_fake = stream.next();
+        let p_fake = if d == 0 { &p1 } else { &p0 };
+        let a_fake = g1_sub(&g1_mul_fr(&pr.h1, &z_fake), &g1_mul_fr(p_fake, &e_fake));
+        let k = stream.next();
+        let a_real = g1_mul_fr(&pr.h1, &k);
+        let (a0, a1) = if d == 0 { (a_real, a_fake) } else { (a_fake, a_real) };
+        let ch = bit_challenge(va_pub, id, j, i, &p0, &p1, &a0, &a1);
+        let e_real = fr_sub(&ch, &e_fake);
+        let z_real = fr_add(&k, &fr_mul(&e_real, &ti));
+        let (e0, z0, z1) = if d == 0 { (e_real, z_real, z_fake) } else { (e_fake, z_fake, z_real) };
+        ors.push(BitOr { a0: g1_compress(&a0), a1: g1_compress(&a1), e0: fr_to_be(&e0), z0: fr_to_be(&z0), z1: fr_to_be(&z1) });
+    }
+    let c_m = c_m.expect("LIMB_BITS ≥ 1");
+
+    // ---- linking generalized Schnorr over (m, t, ρ): C_m, U, W share m/ρ ----
+    let alpha = stream.next();
+    let beta = stream.next();
+    let gamma = stream.next();
+    let r_a = g1_add(&g1_mul_fr(&pr.g1, &alpha), &g1_mul_fr(&pr.h1, &beta));
+    let r_b = g1_mul_fr(&pr.g1, &gamma);
+    let r_c = fp12_mul(&fp12_pow_fr(&pr.g_t, &alpha), &fp12_pow_fr(&pr.k_pub, &gamma));
+    let ch = sigma_challenge(va_pub, id, j, u, w, &c_m, &r_a, &r_b, &r_c);
+    let z_m = fr_add(&alpha, &fr_mul(&ch, &fr_from_u64(m)));
+    let z_t = fr_add(&beta, &fr_mul(&ch, &t));
+    let z_rho = fr_add(&gamma, &fr_mul(&ch, rho));
+
+    LimbProof {
+        bits,
+        ors,
+        r_a: g1_compress(&r_a),
+        r_b: g1_compress(&r_b),
+        r_c: fp12_to_bytes(&r_c),
+        z_m: fr_to_be(&z_m),
+        z_t: fr_to_be(&z_t),
+        z_rho: fr_to_be(&z_rho),
+    }
+}
+
+/// Verify a `WellFormedProof` for `ct` under public `va_pub`/`id`. `true` ⇒ `d_T` is a genuine
+/// encryption of a known 64-bit value with every 16-bit limb in `[0,2¹⁶)` (so extraction will
+/// succeed). Reveals nothing about `s₂`.
+pub fn verify_wellformed(va_pub: &[u8; 48], id: &[u8], ct: &VerEncCt, proof: &WellFormedProof) -> bool {
+    if ct.limbs.len() != N_LIMBS || proof.limbs.len() != N_LIMBS {
+        return false;
+    }
+    let Some(pr) = params(va_pub, id) else { return false };
+    for (j, (limb, lp)) in ct.limbs.iter().zip(proof.limbs.iter()).enumerate() {
+        let (Some(u), Some(w)) = (g1_uncompress(&limb.u), fp12_from_bytes(&limb.w)) else { return false };
+        if !verify_limb(&pr, va_pub, id, j, &u, &w, lp) {
+            return false;
+        }
+    }
+    true
+}
+
+fn verify_limb(pr: &Params, va_pub: &[u8; 48], id: &[u8], j: usize, u: &blst_p1, w: &blst_fp12, lp: &LimbProof) -> bool {
+    if lp.bits.len() != LIMB_BITS || lp.ors.len() != LIMB_BITS {
+        return false;
+    }
+    // Recompute C_m = Σ 2ⁱ Pᵢ and check each bit-commitment opens to a bit.
+    let mut c_m: Option<blst_p1> = None;
+    for (i, (pb, or)) in lp.bits.iter().zip(lp.ors.iter()).enumerate() {
+        let Ok(pb): Result<[u8; 48], _> = pb.as_slice().try_into() else { return false };
+        let Some(p_i) = g1_uncompress(&pb) else { return false };
+        let term = g1_mul_fr(&p_i, &fr_from_u64(1u64 << i));
+        c_m = Some(match c_m {
+            Some(acc) => g1_add(&acc, &term),
+            None => term,
+        });
+        let p0 = p_i;
+        let p1 = g1_sub(&p_i, &pr.g1);
+        let (Some(a0), Some(a1)) = (g1_uncompress(&or.a0), g1_uncompress(&or.a1)) else { return false };
+        let e0 = fr_from_be(&or.e0);
+        let z0 = fr_from_be(&or.z0);
+        let z1 = fr_from_be(&or.z1);
+        let ch = bit_challenge(va_pub, id, j, i, &p0, &p1, &a0, &a1);
+        let e1 = fr_sub(&ch, &e0);
+        // h₁·z0 == a0 + P0·e0   and   h₁·z1 == a1 + P1·e1
+        if !g1_eq(&g1_mul_fr(&pr.h1, &z0), &g1_add(&a0, &g1_mul_fr(&p0, &e0))) {
+            return false;
+        }
+        if !g1_eq(&g1_mul_fr(&pr.h1, &z1), &g1_add(&a1, &g1_mul_fr(&p1, &e1))) {
+            return false;
+        }
+    }
+    let c_m = c_m.expect("LIMB_BITS ≥ 1");
+
+    // Linking generalized Schnorr.
+    let (Some(r_a), Some(r_b), Some(r_c)) = (g1_uncompress(&lp.r_a), g1_uncompress(&lp.r_b), fp12_from_bytes(&lp.r_c)) else {
+        return false;
+    };
+    let z_m = fr_from_be(&lp.z_m);
+    let z_t = fr_from_be(&lp.z_t);
+    let z_rho = fr_from_be(&lp.z_rho);
+    let ch = sigma_challenge(va_pub, id, j, u, w, &c_m, &r_a, &r_b, &r_c);
+    // (a) z_m·g₁ + z_t·h₁ == R_a + c·C_m
+    let lhs_a = g1_add(&g1_mul_fr(&pr.g1, &z_m), &g1_mul_fr(&pr.h1, &z_t));
+    let rhs_a = g1_add(&r_a, &g1_mul_fr(&c_m, &ch));
+    // (b) z_ρ·g₁ == R_b + c·U
+    let lhs_b = g1_mul_fr(&pr.g1, &z_rho);
+    let rhs_b = g1_add(&r_b, &g1_mul_fr(u, &ch));
+    // (c) g_T^{z_m}·K_pub^{z_ρ} == R_c · W^c
+    let lhs_c = fp12_mul(&fp12_pow_fr(&pr.g_t, &z_m), &fp12_pow_fr(&pr.k_pub, &z_rho));
+    let rhs_c = fp12_mul(&r_c, &fp12_pow_fr(w, &ch));
+    g1_eq(&lhs_a, &rhs_a) && g1_eq(&lhs_b, &rhs_b) && fp12_eq(&lhs_c, &rhs_c)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,5 +854,107 @@ mod tests {
         let back = VerEncCt::from_bytes(&bytes).expect("decode");
         let sigma = verdict_signature(&x, &id);
         assert_eq!(decrypt(&back, &sigma, &id), Some(s2));
+    }
+
+    // ---- d_T well-formedness proof (P1.2b) ----
+
+    #[test]
+    fn an_honest_d_t_proves_well_formed_and_verifies() {
+        let (_x, va_pub) = group_keypair(b"validators");
+        let id = verdict_id(0xAB_CDEF);
+        let s2 = 0x1234_5678_9ABC_DEF0u64;
+        let ct = encrypt(&va_pub, &id, s2).expect("encrypt");
+
+        let proof = prove_wellformed(&va_pub, &id, &ct, s2, b"seed-well-formed-proof-32bytes!!").expect("prove");
+        assert!(verify_wellformed(&va_pub, &id, &ct, &proof), "an honest d_T verifies as well-formed");
+    }
+
+    #[test]
+    fn the_well_formed_proof_round_trips_through_bytes() {
+        let (_x, va_pub) = group_keypair(b"validators");
+        let id = verdict_id(42);
+        let s2 = 0x00FF_1200_3400_5600u64;
+        let ct = encrypt(&va_pub, &id, s2).expect("encrypt");
+        let proof = prove_wellformed(&va_pub, &id, &ct, s2, &[7u8; 32]).expect("prove");
+        let back = WellFormedProof::from_bytes(&proof.to_bytes()).expect("decode");
+        assert!(verify_wellformed(&va_pub, &id, &ct, &back), "a round-tripped proof still verifies");
+    }
+
+    #[test]
+    fn a_proof_does_not_verify_against_a_different_ciphertext() {
+        // A proof is bound (via Fiat–Shamir) to the exact U/W of its own d_T: it must not transfer to
+        // a different ciphertext, even one under the same key/identity.
+        let (_x, va_pub) = group_keypair(b"validators");
+        let id = verdict_id(9);
+        let ct_a = encrypt(&va_pub, &id, 0x0101_0101_0101_0101).expect("encrypt a");
+        let ct_b = encrypt(&va_pub, &id, 0x0202_0202_0202_0202).expect("encrypt b");
+        let proof_a = prove_wellformed(&va_pub, &id, &ct_a, 0x0101_0101_0101_0101, &[1u8; 32]).expect("prove a");
+        assert!(verify_wellformed(&va_pub, &id, &ct_a, &proof_a));
+        assert!(!verify_wellformed(&va_pub, &id, &ct_b, &proof_a), "A's proof must not verify against B's d_T");
+    }
+
+    #[test]
+    fn a_proof_does_not_verify_under_a_different_key_or_identity() {
+        let (_x, va_pub) = group_keypair(b"validators");
+        let id = verdict_id(123);
+        let s2 = 0x0033_0044_0055_0066u64;
+        let ct = encrypt(&va_pub, &id, s2).expect("encrypt");
+        let proof = prove_wellformed(&va_pub, &id, &ct, s2, &[3u8; 32]).expect("prove");
+
+        // A different VA_pub changes K_pub, so the linking equation fails.
+        let (_x2, va_pub2) = group_keypair(b"other-validators");
+        assert!(!verify_wellformed(&va_pub2, &id, &ct, &proof), "a wrong VA_pub must reject");
+        // A different verdict identity changes g_T/K_pub likewise.
+        let id2 = verdict_id(124);
+        assert!(!verify_wellformed(&va_pub, &id2, &ct, &proof), "a wrong verdict id must reject");
+    }
+
+    #[test]
+    fn a_tampered_proof_is_rejected() {
+        let (_x, va_pub) = group_keypair(b"validators");
+        let id = verdict_id(77);
+        let s2 = 0x0AA0_0BB0_0CC0_0DD0u64;
+        let ct = encrypt(&va_pub, &id, s2).expect("encrypt");
+        let proof = prove_wellformed(&va_pub, &id, &ct, s2, &[9u8; 32]).expect("prove");
+
+        // Flip a response scalar in the first limb's linking proof: the sigma equations no longer hold.
+        let mut bad = proof.clone();
+        bad.limbs[0].z_m[0] ^= 0x01;
+        assert!(!verify_wellformed(&va_pub, &id, &ct, &bad), "a tampered response must reject");
+
+        // Corrupt a bit commitment: Σ 2ⁱ Pᵢ no longer matches the committed m, OR-proof breaks.
+        let mut bad2 = proof.clone();
+        bad2.limbs[0].bits[0][0] ^= 0x01;
+        assert!(!verify_wellformed(&va_pub, &id, &ct, &bad2), "a tampered bit commitment must reject");
+    }
+
+    #[test]
+    fn an_out_of_range_limb_is_unopenable_and_cannot_be_proven_well_formed() {
+        // The exact threat the well-formedness proof closes: a ciphertext whose limb encodes a value
+        // ≥ 2¹⁶ is *un-openable* — `decrypt`'s baby-step/giant-step search (range [0,2¹⁶)) silently
+        // fails, so at verdict time extraction yields nothing and the node would escape suspension.
+        let (x, va_pub) = group_keypair(b"validators");
+        let id = verdict_id(0xDEAD);
+        let s2 = 0x0000_0000_0000_1111u64; // limb 0 = 0x1111, the rest 0
+        let mut ct = encrypt(&va_pub, &id, s2).expect("encrypt");
+
+        // Push limb 0 out of range: W₀ ← W₀ · g_T^{2¹⁶}, i.e. m₀ becomes 0x1111 + 2¹⁶ ∉ [0,2¹⁶).
+        let q_id_aff = g2_to_affine(&g2_hash(&id));
+        let g1_gen_aff = unsafe { *blst_p1_affine_generator() };
+        let g_t = pairing(&g1_gen_aff, &q_id_aff);
+        let w0 = fp12_from_bytes(&ct.limbs[0].w).expect("decode W0");
+        ct.limbs[0].w = fp12_to_bytes(&fp12_mul(&w0, &fp12_pow_u64(&g_t, 1u64 << LIMB_BITS)));
+
+        // It is now un-openable even with the genuine verdict signature.
+        let sigma = verdict_signature(&x, &id);
+        assert_eq!(decrypt(&ct, &sigma, &id), None, "an out-of-range limb cannot be opened");
+
+        // And no well-formedness proof verifies for it: an honest-looking attempt (proving the masked
+        // 16-bit m₀) fails the linking equation, which uses the genuine out-of-range W₀.
+        let proof = prove_wellformed(&va_pub, &id, &ct, s2, &[2u8; 32]).expect("prove attempt");
+        assert!(
+            !verify_wellformed(&va_pub, &id, &ct, &proof),
+            "an out-of-range ciphertext must NOT pass the well-formedness check"
+        );
     }
 }
