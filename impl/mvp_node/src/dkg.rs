@@ -599,4 +599,58 @@ mod tests {
             .collect();
         assert_ne!(shamir_recover(&bad_new[0..3]), secret, "fewer than threshold survivors cannot re-share the secret");
     }
+
+    #[test]
+    fn distributed_reshare_rotates_va_pub_to_a_new_validator_set_preserving_the_group_key() {
+        use crate::bls;
+        // Genesis 3-of-4 threshold key (VA_pub). The shares are held by the genesis validators at their
+        // 1-based sorted indices.
+        let mut genesis: Vec<([u8; 32], Vec<u8>)> =
+            (0..4u8).map(|i| ([i; 32], format!("g-{i}").into_bytes())).collect();
+        genesis.sort_by_key(|(p, _)| *p);
+        let (va_pub, gshares) = genesis_keys(3, &genesis);
+
+        // A new validator set after rotation: the 4 genesis validators PLUS one joiner (5 total). Indices
+        // are 1-based positions in the sorted new set.
+        let joiner = ([99u8; 32], b"joiner".to_vec());
+        let mut newset: Vec<[u8; 32]> = genesis.iter().map(|(p, _)| *p).chain(std::iter::once(joiner.0)).collect();
+        newset.sort();
+        let k_new = newset.len();
+
+        // The canonical dealers: the 3 lowest-index genesis shareholders (all still active). Each
+        // independently sub-deals its OWN share to the new set — no party reconstructs the secret.
+        let canonical: Vec<(u64, [u8; 32])> = (0..3)
+            .map(|i| (i as u64 + 1, gshares[&genesis[i].0]))
+            .collect();
+        let subdeals: Vec<(u64, Vec<(u64, [u8; 32])>)> = canonical
+            .iter()
+            .map(|(idx, share)| (*idx, reshare_subdeal(3, k_new, share, &idx.to_le_bytes())))
+            .collect();
+
+        // Each new member m (1-based) combines the canonical dealers' sub-shares into its fresh VA_pub share.
+        let new_shares: Vec<(u64, [u8; 32])> = (1..=k_new as u64)
+            .map(|m| {
+                let contribs: Vec<(u64, [u8; 32])> =
+                    subdeals.iter().map(|(idx, sd)| (*idx, sd[m as usize - 1].1)).collect();
+                (m, reshare_combine(&contribs))
+            })
+            .collect();
+
+        // The NEW set threshold-signs under the UNCHANGED VA_pub — two different 3-subsets, including the
+        // joiner (index 5 if it sorts last, else wherever), must reconstruct the SAME group signature.
+        let msg = b"VERDICT_FINALIZED after rotation";
+        let sign_subset = |idxs: &[usize]| -> [u8; 96] {
+            let partials: Vec<(u64, [u8; 96])> =
+                idxs.iter().map(|&i| (new_shares[i].0, sign_share(&new_shares[i].1, msg))).collect();
+            combine_signatures(&partials).expect("combine")
+        };
+        assert!(bls::verify(&va_pub, msg, &sign_subset(&[0, 1, 2])), "the re-shared new set signs under the same VA_pub");
+        assert!(bls::verify(&va_pub, msg, &sign_subset(&[2, 3, 4])), "a different new 3-subset (incl. the joiner) also verifies under VA_pub");
+
+        // A genesis validator that LEFT (its share gone) is irrelevant: the new shares are self-sufficient.
+        // And below threshold cannot sign.
+        let bad: Vec<(u64, [u8; 96])> =
+            [0usize, 1].iter().map(|&i| (new_shares[i].0, sign_share(&new_shares[i].1, msg))).collect();
+        assert!(!bls::verify(&va_pub, msg, &combine_signatures(&bad).unwrap()), "fewer than threshold of the new set cannot sign under VA_pub");
+    }
 }
