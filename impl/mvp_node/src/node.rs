@@ -256,6 +256,13 @@ pub struct NodeOutcome {
     /// least `PSI_THRESHOLD` liked items, via DH-PSI over the mesh. Local, off-chain discovery — empty
     /// unless this node ran `with_psi_discovery`. Distinct nodes legitimately discover different sets.
     pub interest_peers: Vec<[u8; 32]>,
+    /// The Layer-5 PRODUCT computed in-loop from on-chain gossip (`with_recommendations`): the top item
+    /// indices this node recommends for itself after reputation + FoolsGold weighting and suspension
+    /// exclusion. Empty unless the node ran `with_recommendations` and there was on-chain gossip to rank.
+    pub recommendations: Vec<usize>,
+    /// Per-item effective trust (DSybil-capped) from the same in-loop CF fit — lets a caller confirm a
+    /// Sybil-pushed item stayed bounded. Empty unless recommendations were computed.
+    pub reco_item_trust: Vec<f64>,
 }
 
 /// The public, chain-derived context of one arbitration handoff (`handoff_context`).
@@ -420,6 +427,12 @@ pub struct Node {
     /// overlap meets `PSI_THRESHOLD`. Purely local (never on-chain), fully decoupled from consensus — it
     /// does NOT gate validator dialing (that would partition the BFT mesh). Honest default `false`.
     psi_discovery: bool,
+    /// If true, this node computes the Layer-5 PRODUCT in-loop: each new height it reads its on-chain
+    /// gossip, weights each contributor by reputation (`reputation.rs`, presence over epochs) and FoolsGold
+    /// (`detection.rs`, Sybil down-weighting), drops suspended contributors, fits the §3 item-CF
+    /// (`recommend.rs`) and ranks the items it has not yet interacted with. A pure read over the chain
+    /// surfaced in `NodeOutcome.recommendations` — never on-chain, no effect on consensus. Default `false`.
+    recommend: bool,
     /// Fault injection: if `Some((item, weight, from_epoch))`, this node is part of a coordinated push
     /// cohort — from epoch `from_epoch` it overwrites its obfuscated gossip with a single, within-bound
     /// concentration on `item` (weight `weight`). Several such nodes spike `item`'s on-chain gossip
@@ -459,6 +472,7 @@ impl Node {
             arbitration_authority: false,
             withhold_handoff: false,
             psi_discovery: false,
+            recommend: false,
             push_item: None,
         }
     }
@@ -511,6 +525,15 @@ impl Node {
     /// (the node's clean liked items are the PSI input; only blinded points and the overlap size leave it).
     pub fn with_psi_discovery(mut self) -> Self {
         self.psi_discovery = true;
+        self
+    }
+
+    /// Builder: compute the Layer-5 recommendation PRODUCT in-loop (`compute_recommendation`) — the node
+    /// turns its on-chain gossip into reputation-gated, FoolsGold-down-weighted, suspension-excluded item-CF
+    /// rankings each height, surfaced in `NodeOutcome.recommendations`. Requires `with_preferences` (the
+    /// node's own clean preferences are the ranking query). Pure read over the chain; no consensus effect.
+    pub fn with_recommendations(mut self) -> Self {
+        self.recommend = true;
         self
     }
 
@@ -1882,6 +1905,106 @@ impl Node {
         }
     }
 
+    // ─────────────────────────── Layer-5 recommendation PRODUCT (in-loop) ───────────────────────────
+
+    /// How many items the in-loop recommender ranks.
+    const RECO_TOP_K: usize = 3;
+
+    /// Compute this node's recommendation from the finalized chain — the live Layer-5 product. Reads the
+    /// latest on-chain gossip row per contributing peer, **excludes suspended contributors** (their
+    /// `epoch_id` in `suspended_targets`), weights each surviving row by **reputation** (`reputation.rs`,
+    /// from the peer's presence across heights) × **FoolsGold** (`detection.rs`, Sybil down-weighting),
+    /// fits the §3 item-CF (`recommend.rs`) over the weighted gossip, and ranks the items this node has not
+    /// itself interacted with. Returns `(top-k item indices, per-item effective trust)`, or `None` until
+    /// there is on-chain gossip to rank. Pure read; never mutates the chain.
+    fn compute_recommendation(&self, blocks: &[Block]) -> Option<(Vec<usize>, Vec<f64>)> {
+        let prefs = self.preferences.as_ref()?;
+        let suspended = self.suspended_targets(blocks);
+        let heights: Vec<u64> = blocks.iter().map(|b| b.header.height).collect();
+
+        // Per contributing peer: its latest gossip row, the heights it was present, and whether any of its
+        // epoch_ids was suspended (a detected violation).
+        struct Contrib {
+            row: Vec<f32>,
+            last_h: u64,
+            present: HashSet<u64>,
+            violated: bool,
+        }
+        let mut contribs: std::collections::BTreeMap<[u8; 32], Contrib> = std::collections::BTreeMap::new();
+        let mut width = 0usize;
+        for b in blocks {
+            for t in &b.txs {
+                let Some(p) = t.pref.as_ref() else { continue };
+                width = width.max(p.gossip.len());
+                let c = contribs.entry(t.submitter).or_insert(Contrib {
+                    row: Vec::new(),
+                    last_h: 0,
+                    present: HashSet::new(),
+                    violated: false,
+                });
+                c.present.insert(b.header.height);
+                if suspended.contains(&t.epoch_id) {
+                    c.violated = true;
+                }
+                if b.header.height >= c.last_h {
+                    c.last_h = b.header.height;
+                    c.row = p.gossip.clone();
+                }
+            }
+        }
+        if width == 0 {
+            return None;
+        }
+
+        // Build the contributor rows (suspension-excluded) and their reputation weights.
+        let rep_cfg = crate::reputation::RepConfig::default();
+        let mut gossip: crate::recommend::Matrix = Vec::new();
+        let mut rep_weight: Vec<f64> = Vec::new();
+        for c in contribs.values() {
+            if c.violated {
+                continue; // suspension exclusion — a suspended contributor contributes nothing
+            }
+            let mut row = vec![0.0f64; width];
+            for (j, &v) in c.row.iter().enumerate() {
+                row[j] = v as f64;
+            }
+            gossip.push(row);
+            let active: Vec<bool> = heights.iter().map(|h| c.present.contains(h)).collect();
+            let violation = vec![false; active.len()];
+            let rep = crate::reputation::simulate(&active, &violation, rep_cfg)
+                .last()
+                .copied()
+                .unwrap_or(rep_cfg.band_max);
+            rep_weight.push((rep / rep_cfg.band_max).clamp(0.0, 1.0));
+        }
+        if gossip.is_empty() {
+            return None;
+        }
+
+        // FoolsGold down-weights mutually-similar (coordinated) rows; combine with reputation and weight
+        // each contributor's gossip before the CF sees it.
+        let fg = crate::detection::foolsgold(&gossip, 1.0);
+        let weighted: crate::recommend::Matrix = gossip
+            .iter()
+            .enumerate()
+            .map(|(i, row)| {
+                let w = rep_weight[i] * fg.get(i).copied().unwrap_or(1.0);
+                row.iter().map(|x| x * w).collect()
+            })
+            .collect();
+
+        // Fit item-CF and rank for THIS node's own clean preferences (its query). Items already interacted
+        // with (nonzero clean preference) are masked out, so the result is genuinely novel suggestions.
+        let cf = crate::recommend::ItemCF::fit(crate::recommend::CFConfig::default(), &weighted, None, None);
+        let pref_at = |j: usize| -> i64 { prefs.get(j).copied().unwrap_or(0) };
+        let pref_pos: crate::recommend::Matrix = vec![(0..width).map(|j| pref_at(j).max(0) as f64).collect()];
+        let pref_neg: crate::recommend::Matrix = vec![(0..width).map(|j| (-pref_at(j)).max(0) as f64).collect()];
+        let seen: Vec<Vec<bool>> = vec![(0..width).map(|j| pref_at(j) != 0).collect()];
+        let scores = cf.score_all(&pref_pos, &pref_neg, &seen);
+        let top = crate::recommend::top_k(&scores, Self::RECO_TOP_K).into_iter().next().unwrap_or_default();
+        Some((top, cf.effective_trust.clone()))
+    }
+
     /// Fault-injection builder: this node will never propose (Byzantine leader that withholds its
     /// block), exercising the other validators' view-change path.
     pub fn byzantine_withhold(mut self) -> Self {
@@ -2899,6 +3022,9 @@ impl Node {
         // §5.3/§5.4 PSI discovery: peers we have offered to (dedup), and the interest-peers we discovered.
         let mut psi_initiated: HashSet<[u8; 32]> = HashSet::new();
         let mut interest_peers: HashSet<[u8; 32]> = HashSet::new();
+        // Layer-5 recommendation product, recomputed once per new finalized height.
+        let mut last_reco_height: Option<u64> = None;
+        let mut latest_reco: Option<(Vec<usize>, Vec<f64>)> = None;
         let mut epoch_ids: Vec<(u64, u64)> = Vec::new();
         let mut beacons: Vec<(u64, u64)> = Vec::new();
         let mut split_ok = true;
@@ -3007,6 +3133,17 @@ impl Node {
                     // §5.3/§5.4 PSI interest-peer discovery (no-op unless with_psi_discovery): additive,
                     // off-chain, one probe per tick — never affects consensus.
                     self.drive_psi(&chain, &peers, &mixer, beacon_hint, &mut psi_initiated);
+                    // Layer-5 recommendation product: recompute once per new finalized height (no-op unless
+                    // with_recommendations). A pure read over the chain; never affects consensus.
+                    if self.recommend {
+                        let h = chain.head().header.height;
+                        if last_reco_height != Some(h) {
+                            last_reco_height = Some(h);
+                            if let Some(r) = self.compute_recommendation(&chain.blocks) {
+                                latest_reco = Some(r);
+                            }
+                        }
+                    }
                     // §6.4 slashing: a committee member that defaulted on a handoff (no valid receipt by
                     // the deadline) is excluded from leadership, exactly like an equivocator — derived
                     // identically from the finalized chain on every node, so no evidence message is needed.
@@ -3057,6 +3194,7 @@ impl Node {
         let rehandoff_complete = self.rehandoff_complete(&chain.blocks);
         let mut interest_peers: Vec<[u8; 32]> = interest_peers.into_iter().collect();
         interest_peers.sort_unstable();
+        let (recommendations, reco_item_trust) = latest_reco.unwrap_or_default();
         info!(peer = %hex::encode(&my_id[..4]), blocks = chain.blocks.len(), head = %hex::encode(&chain.head_hash()[..4]), all_qc_valid, max_view, slashed = slashed_vec.len(), active = final_active.len(), suspended = suspended_targets.len(), flagged = flagged_cohort.len(), audit_reports = audit_reports_recorded, oversight = oversight_triggered, wd_signals = watchdog_signals_recorded, commits = verdict_commits_recorded, class3 = class3_triggered, rewind_signals = rewind_signals_recorded, handoffs = handoff_receipts_recorded, handoff_complete, rehandoff_complete, "node done");
         NodeOutcome {
             peer_id: my_id,
@@ -3082,6 +3220,8 @@ impl Node {
             handoff_defaults,
             rehandoff_complete,
             interest_peers,
+            recommendations,
+            reco_item_trust,
         }
     }
 }
