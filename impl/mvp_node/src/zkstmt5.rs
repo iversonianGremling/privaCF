@@ -42,6 +42,7 @@ use plonky2::plonk::circuit_builder::CircuitBuilder;
 use plonky2::plonk::circuit_data::{CircuitConfig, CircuitData};
 use plonky2::plonk::config::PoseidonGoldilocksConfig;
 use plonky2::plonk::proof::ProofWithPublicInputs;
+use serde::{Deserialize, Serialize};
 
 use crate::field::{from_u64, to_u64, Fp};
 use crate::hash::{DOM_EPOCH, DOM_NULL};
@@ -52,7 +53,11 @@ type C = PoseidonGoldilocksConfig;
 type F = GoldilocksField;
 
 /// The public statement a rejoin proof attests to: the published `s₁`, the round `beacon`, the
-/// claimed pseudonym `epoch_id`, and the on-chain `susp_root` against which non-membership holds.
+/// claimed pseudonym `epoch_id`, the on-chain `susp_root` against which non-membership holds, and the
+/// joiner's `peer_id`. The `peer_id` is **committed as a circuit public input** so the proof is
+/// non-transferable: a suspended node cannot replay an honest node's proof, because the gate checks
+/// the committed `peer_id` equals the joining op's `peer_id`, and a committed proof's public inputs
+/// cannot be swapped after the fact (FRI binds them).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RejoinPublic {
     pub s1: Fp,
@@ -60,6 +65,8 @@ pub struct RejoinPublic {
     pub epoch_id: Fp,
     /// SUSP_SMT root in block-header form (4 canonical-`u64` LE limbs), exactly `Smt::root()`.
     pub susp_root: [u8; 32],
+    /// The joining validator's stable id, bound into the proof (4 LE-`u64` limbs as public inputs).
+    pub peer_id: [u8; 32],
 }
 
 /// The private witness: the node's secret `sk`, the additive share `s₂` (so `s₁ + s₂ = null_v`), and
@@ -73,6 +80,59 @@ pub struct RejoinWitness {
 /// A serialized Statement-5 proof (plonky2 `ProofWithPublicInputs` bytes). Self-describing; verified
 /// against a freshly-rebuilt (deterministic) circuit.
 pub type RejoinProof = Vec<u8>;
+
+/// The wire form a joining node attaches to its `MembershipOp::Add` under the Statement-5 admission
+/// gate. It carries only the scalars the gate cannot derive on its own — the reference height `h_ref`
+/// (whose finalized SUSP root and beacon the gate looks up), the published split `s1`, the round
+/// `beacon`, the claimed `epoch_id`, and the proof. The gate supplies `susp_root` (from block
+/// `h_ref`) and `peer_id` (from the op) itself, so the joiner cannot lie about either: the proof must
+/// verify against the *chain-derived* root and the *op's* identity.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RejoinPackage {
+    pub h_ref: u64,
+    pub s1: u64,
+    pub beacon: u64,
+    pub epoch_id: u64,
+    pub proof: RejoinProof,
+}
+
+impl RejoinPackage {
+    /// Build a rejoin package for `sk`/`null_v` against the SUSP tree at reference height `h_ref`.
+    /// `siblings` are the node's native `Smt::prove(null_v).siblings` for that tree; `susp_root` is
+    /// that tree's root; `peer_id` is the joining identity. Returns `None` if the node is suspended
+    /// (its `null_v` is in the tree, so non-membership cannot be proven).
+    #[allow(clippy::too_many_arguments)]
+    pub fn build(
+        sk: Fp,
+        s2: Fp,
+        s1: Fp,
+        beacon: Fp,
+        epoch_id: Fp,
+        susp_root: [u8; 32],
+        peer_id: [u8; 32],
+        h_ref: u64,
+        siblings: Vec<[u8; 32]>,
+    ) -> Option<Self> {
+        let publ = RejoinPublic { s1, beacon, epoch_id, susp_root, peer_id };
+        let wit = RejoinWitness { sk, s2, siblings };
+        let proof = prove_rejoin(&wit, &publ)?;
+        Some(Self { h_ref, s1: to_u64(s1), beacon: to_u64(beacon), epoch_id: to_u64(epoch_id), proof })
+    }
+
+    /// Verify this package against the chain-supplied `susp_root` (from block `h_ref`) and the op's
+    /// `peer_id`. The caller separately enforces freshness (`h_ref` finalized, within the staleness
+    /// window) and that `beacon` matches block `h_ref`'s beacon.
+    pub fn verify(&self, susp_root: [u8; 32], peer_id: [u8; 32]) -> bool {
+        let publ = RejoinPublic {
+            s1: from_u64(self.s1),
+            beacon: from_u64(self.beacon),
+            epoch_id: from_u64(self.epoch_id),
+            susp_root,
+            peer_id,
+        };
+        verify_rejoin(&self.proof, &publ)
+    }
+}
 
 /// 32-byte header root → the 4 Goldilocks limbs the circuit's public root target carries.
 fn root_to_fields(root: &[u8; 32]) -> [F; 4] {
@@ -92,6 +152,7 @@ struct Circuit {
     beacon: Target,
     epoch_id: Target,
     susp_root: HashOutTarget,
+    peer_id: [Target; 4],
     siblings: Vec<HashOutTarget>,
 }
 
@@ -115,6 +176,9 @@ fn build() -> Circuit {
     builder.register_public_input(epoch_id);
     let susp_root = builder.add_virtual_hash();
     builder.register_public_inputs(&susp_root.elements);
+    // peer_id as 4 committed public limbs — binds the proof to the joining identity (anti-replay).
+    let peer_id: [Target; 4] = core::array::from_fn(|_| builder.add_virtual_target());
+    builder.register_public_inputs(&peer_id);
 
     // ---- (1) null_v = Poseidon(sk, DOM_NULL)[0] ----
     let dom_null = builder.constant(F::from_canonical_u64(DOM_NULL));
@@ -154,7 +218,7 @@ fn build() -> Circuit {
     builder.connect_hashes(cur, susp_root);
 
     let data = builder.build::<C>();
-    Circuit { data, sk, s2, s1, beacon, epoch_id, susp_root, siblings }
+    Circuit { data, sk, s2, s1, beacon, epoch_id, susp_root, peer_id, siblings }
 }
 
 /// Prove Statement 5: the holder of `w.sk` — whose published `(s₁, epoch_id)` corresponds to
@@ -190,6 +254,10 @@ pub fn prove_rejoin(w: &RejoinWitness, p: &RejoinPublic) -> Option<RejoinProof> 
     pw.set_target(c.beacon, p.beacon);
     pw.set_target(c.epoch_id, p.epoch_id);
     pw.set_hash_target(c.susp_root, HashOut { elements: root_to_fields(&p.susp_root) });
+    let pid = root_to_fields(&p.peer_id);
+    for (t, v) in c.peer_id.iter().zip(pid.iter()) {
+        pw.set_target(*t, *v);
+    }
 
     for (lvl, sib_t) in c.siblings.iter().enumerate() {
         let sib = root_to_fields(&w.siblings[lvl]);
@@ -208,10 +276,10 @@ pub fn verify_rejoin(proof: &RejoinProof, p: &RejoinPublic) -> bool {
         Ok(pi) => pi,
         Err(_) => return false,
     };
-    // Public-input layout: [s1, beacon, epoch_id, root0, root1, root2, root3].
-    let root = root_to_fields(&p.susp_root);
+    // Public-input layout: [s1, beacon, epoch_id, susp_root[4], peer_id[4]].
     let mut expected = vec![p.s1, p.beacon, p.epoch_id];
-    expected.extend_from_slice(&root);
+    expected.extend_from_slice(&root_to_fields(&p.susp_root));
+    expected.extend_from_slice(&root_to_fields(&p.peer_id));
     if pi.public_inputs != expected {
         return false;
     }
@@ -237,7 +305,7 @@ mod tests {
         let epoch_id = id.epoch_id(beacon);
         let proof = susp.prove(nv_u);
         let publ =
-            RejoinPublic { s1, beacon, epoch_id, susp_root: susp.root() };
+            RejoinPublic { s1, beacon, epoch_id, susp_root: susp.root(), peer_id: id.peer_id() };
         let wit = RejoinWitness { sk: id.sk, s2, siblings: proof.siblings };
         (publ, wit)
     }
@@ -310,5 +378,35 @@ mod tests {
         // Sanity: the epoch_ids genuinely differ (so the statements are distinct).
         assert_ne!(pub_a.epoch_id, pub_b.epoch_id);
         let _ = poseidon_scalar(&[a.sk, from_u64(DOM_NULL)]);
+    }
+
+    #[test]
+    fn a_proof_is_bound_to_its_peer_id_and_cannot_be_replayed() {
+        // Anti-replay: an honest node A proves non-membership; a (would-be) suspended node B grabs
+        // A's package and presents it under B's own peer_id. The committed peer_id is A's, so the
+        // gate's check against B's peer_id fails — B gains nothing from the replay.
+        let beacon = from_u64(99);
+        let susp = Smt::from_keys(&[100, 200]);
+        let a = NodeIdentity::from_seed(8);
+        let (pub_a, wit_a) = statement(&a, beacon, &susp);
+        let pkg = RejoinPackage::build(
+            wit_a.sk,
+            wit_a.s2,
+            pub_a.s1,
+            beacon,
+            pub_a.epoch_id,
+            pub_a.susp_root,
+            a.peer_id(),
+            5,
+            wit_a.siblings.clone(),
+        )
+        .expect("honest package builds");
+        // Verifying against A's own peer_id succeeds; against any other peer_id it fails.
+        assert!(pkg.verify(pub_a.susp_root, a.peer_id()), "A's package verifies under A's peer_id");
+        let b = NodeIdentity::from_seed(9);
+        assert!(
+            !pkg.verify(pub_a.susp_root, b.peer_id()),
+            "A's package must NOT verify under B's peer_id — the proof is identity-bound"
+        );
     }
 }
