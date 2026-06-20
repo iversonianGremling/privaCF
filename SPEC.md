@@ -169,6 +169,7 @@ These guarantees are not free-standing: the privacy and Sybil-resistance layers 
 - [Appendix H — Identity and Privacy Relationship Diagram](#appendix-h--identity-and-privacy-relationship-diagram)
 - [Appendix I — PSI Peer Selection Flow](#appendix-i--psi-peer-selection-flow)
 - [Appendix J — Future Directions: Decentralized Learning Profile](#appendix-j--future-directions-decentralized-learning-profile)
+- [Appendix K — Alternative Recommendation Algorithms](#appendix-k--alternative-recommendation-algorithms)
 
 ---
 
@@ -401,7 +402,7 @@ See Appendix G for the full node relationship diagram. In brief: each node maint
 
 Given a node's interaction history and a set of gossip vectors received from peers over many epochs, produce a ranked list of items the node has not interacted with that it is likely to enjoy. The filtering and ranking computation happens entirely on the local device. The network's role is to deliver gossip vectors — it does not participate in the recommendation computation itself.
 
-The CF algorithm is not fixed by the protocol. Item-based collaborative filtering is the default and is specified below, but any algorithm that operates on a matrix of received gossip vectors can be substituted.
+The CF algorithm is not fixed by the protocol. Item-based collaborative filtering is the default and is specified below, but any algorithm that operates on a matrix of received gossip vectors can be substituted. Appendix K surveys the alternatives that land cleanly on the substrate — user-KNN, graph random-walk (RP3β), content-based, trust-aware propagation, and a privacy-preserving decentralized matrix-factorization / two-tower construction — and identifies the boundary beyond which an alternative requires the Appendix J secure-aggregation machinery.
 
 ### 3.2 Computing Recommendations
 
@@ -3704,3 +3705,70 @@ The DL-specific risk added beyond the recommendation case is **gradient inversio
 ### J.4 Status
 
 Stated, not specified. A v0.4 or later revision may define a normative DL profile if the recommendation deployment validates the substrate. The framing here is to make explicit that the substrate's scope is broader than recommendation, and that the project's "post-big-tech" positioning extends naturally to model training — the domain where centralized compute monopolies are most entrenched and decentralized alternatives are most needed.
+
+---
+
+## Appendix K — Alternative Recommendation Algorithms
+
+_Non-normative. §3.1 states that the CF algorithm is not fixed: any algorithm operating on the matrix of received gossip vectors may be substituted. This appendix surveys which alternatives land cleanly on the substrate, the security invariants any substitute must preserve, and the boundary beyond which an alternative stops being a recommendation algorithm and becomes a decentralized-learning workload (Appendix J)._
+
+### K.1 The pluggable surface and its invariants
+
+Every recommender here consumes the same input — the assembled gossip matrix `P` (rows = peers, columns = items; the §4.5-obfuscated positive preferences, plus the negative-preference matrix) — and the security of the recommendation layer rests on three levers wrapped around it, not on the algorithm itself:
+
+1. **Per-peer trust weighting** — `reputation × FoolsGold` (the §6.1 score and the §7.4 Sybil suppression) multiplies each contributing row.
+2. **Bounded per-item influence** — the DSybil cap `c` (§3, §7.2): no single peer (or Sybil cohort) can move any one item's aggregate beyond a bound.
+3. **PSI neighborhood** — the interest-cluster mask (§3.3, §5.4) supplies a user-user neighborhood / the `β`-blend.
+
+A substitute algorithm lands **cleanly** iff it (a) consumes `P` as its only cross-user input, (b) preserves a cap-like bounded-influence step, and (c) is a deterministic function of public chain state (so it composes with the obfuscation layer's post-processing immunity and, where the result is consensus-relevant, with recompute-verification). An algorithm that needs raw un-obfuscated vectors, a central trainer, persistent private cross-epoch state, or an in-circuit proof of the *ranking itself* (which hits the Track-Z / Statement-5 cost gate, see Appendix E / OQ-15) does **not** land cleanly.
+
+A second-order distinction governs how much of the machinery a substitute even touches: **recommendation is a local read-side computation** (§3.1 — "the network does not participate in the recommendation computation itself"). Unless an algorithm publishes a consensus-relevant artifact, each node may run any variant locally with no determinism requirement at all; the invariants above bind only the substrate-level signal the algorithm reads, not the local arithmetic that turns it into a ranking.
+
+### K.2 The landscape
+
+| Algorithm | Fit | Notes |
+|---|---|---|
+| **Item-based CF** (§3) | default | Cosine over item columns; DSybil cap; novelty/IDF. The specified baseline. |
+| **User-based CF (user-KNN)** | drop-in | The transpose of item-CF — cosine over *rows*, neighbors from the PSI cluster, cap maps onto "bound any single neighbor." Trivial ensemble partner. |
+| **Graph random-walk (P3α / RP3β)** | drop-in | Normalized powers of the *same* co-occurrence matrix; RP3β's popularity re-weighting is a softer cap. High value-per-effort; competitive accuracy in benchmarks. |
+| **Co-occurrence / association rules** | drop-in | Counts derive directly from `P`; additive, so Pedersen `C_p` (§4.4) can homomorphically aggregate and even prove counts inside Ristretto (no Goldilocks bridge). |
+| **Content-based / TF-IDF** | clean + plumbing | Recommend by similarity to the user's own liked items; reuses the IDF/novelty machinery. Purely local, needs *zero* cross-user gossip — the most private option and a natural cold-start layer. Requires item feature vectors to exist on-chain or be locally derivable. |
+| **Trust-aware propagation** | clean + plumbing | Promotes the trust graph (reputation + PSI) from a *weight* to the *propagation structure* — random-walk-with-restart over the reputation-weighted PSI graph. Uniquely exploits structure only this substrate has. |
+| **Decentralized matrix factorization / linear two-tower** | clean (see K.3) | Single-shot closed-form when the user factor is local; reuses FoolsGold and the §6.4 bounded proofs in their native roles. |
+| **Neural CF / two-tower with a deep *shared* item tower; SLIM** | does **not** land cleanly | Needs a central (or federated) trainer over raw signal; crosses into the Appendix J DL profile (K.4). |
+
+The cheapest wins are **RP3β + user-KNN**, which slot in beside the item-CF baseline as an ensemble with no new inputs and no new crypto.
+
+### K.3 Privacy-preserving decentralized matrix factorization (the two-tower case)
+
+Classic MF factors `R ≈ P·Qᵀ` (user factors `P`, item factors `Q`) by *jointly* learning both — an alternating optimization that makes `Q` iterative cross-epoch state and makes DP noise compound over rounds. The substrate sidesteps both costs by **fixing the user factor locally**:
+
+- **The user factor `p_u` is computed locally by each node** ("the user describing itself"), over a *public, shared latent schema* (genre / mood / topic / behavioral axes — §3.3 clusters are a natural basis). It is never gossiped; there is no user-side privacy surface, and the local computation is unconstrained — it may itself be a deep model run client-side.
+- With every `p_u` fixed, the joint optimization collapses to the **closed-form ALS item half-step**, solved independently per item:
+
+  ```
+  q_i = (A + λI)⁻¹ · b_i      A   = Σ_u p_u p_uᵀ   (k×k, shared across items)
+                              b_i = Σ_u r_ui · p_u  (k-vector, per item)
+  ```
+
+  Both `A` and `b_i` are **additive over peers**, so the existing per-epoch transaction aggregation (a contributed `r_ui·p_u` term per peer) reduces `Q` to a single small linear solve. The result: **single-shot, stateless, DP-applied-once** (no compounding), BFT-aggregated, and fitted by construction into the same space as the `p_u`'s — i.e. a genuine two-tower with dot-product scoring `p_u · q_i`, where the user tower is private/local (optionally deep) and the item tower is the linear factor `Q`.
+
+**The cost that replaces cross-epoch state** is the **shared-basis requirement**: `b_i = Σ_u r_ui·p_u` is only meaningful if every peer's `p_u` lives in one agreed coordinate system. This is the design commitment the local-`p_u` choice forces, and it is what makes the construction a *linear two-tower with a self-reported user tower* rather than emergent MF. (This refines the §12 / OQ-56 comparison with Hegedűs-style gossip MF: by keeping `p_u` private and local rather than gossiping raw latent factors, this variant recovers MF structure *without* the preference-privacy loss the spec attributes to latent-factor exchange.)
+
+**Item-factor (`Q`) integrity.** `Q` is public derived state, so there is no privacy to protect on `Q` itself — the only adversarial surface is the contributed terms, and the existing levers map onto them one-to-one:
+
+| Attack on `Q` | Existing defense |
+|---|---|
+| Sybil swings `q_i` via extreme `r_ui` / `p_u` (poisons `b_i`) | §6.4 `BoundedProof` clips `‖r_ui·p_u‖ ≤ B` in Ristretto — the DSybil cap as gradient clipping, no bridge |
+| Collinear fake profiles | FoolsGold (§7.4) over the contributed `p_u` — its native federated-learning role |
+| Byzantine outliers | Coordinate-wise median / trimmed-mean aggregation of `b_i`, recompute-deterministic |
+| Low-reputation skew | Reputation-weight each term (§6.1) |
+| Poisoning the shared Gram `A` | Untargeted and tamed by the ridge `λI`; restrictable to reputable contributors |
+
+A **content-augmented item tower** — `q_i = W·x_i` over public item features `x_i`, learning the linear map `W` instead of per-item factors — stays inside the same regime and adds **cold-start** (new items get a `q_i` from features with no interactions). When `x_i` is itself the output of a *public, pretrained* deep encoder run on public item content, the representation is deep while the network still only learns the bounded linear `W` — depth without collective training.
+
+### K.4 The boundary: where a recommender becomes a DL workload
+
+The single construct that does **not** fit is a **deep *shared* item tower trained collectively on private, online-exchanged gradients**. The depth is not the obstacle (local/inference-side deep models are free; a deterministic recompute of a deep model over the *public* gossip matrix is also feasible, gated only by cross-hardware determinism). The obstacle is the conjunction of *training + consensus-shared + private per-round gradient signal*: raw gradients leak training data via gradient-inversion (Geiping et al., NeurIPS 2020), which is exactly the regime that requires the secure-aggregation primitive the recommendation case does not have.
+
+That is precisely the transition described in **Appendix J**: at this boundary the construction stops being a substitutable recommendation algorithm and becomes a decentralized-learning profile, whose one genuinely greenfield requirement (J.2) is Bonawitz-style masked aggregation or homomorphic accumulation layered over the gossip exchange. The recommendation algorithms in K.2–K.3 are exactly those that stay on the near side of that line.
