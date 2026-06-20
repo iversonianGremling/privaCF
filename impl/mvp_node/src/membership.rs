@@ -59,10 +59,13 @@ fn check_sig(peer: &[u8; 32], msg: &[u8], sig: &[u8]) -> bool {
 pub enum MembershipOp {
     /// Admit `record` as a validator (the joiner signs `join_sig_bytes`). `vdf` is an optional
     /// admission proof-of-work (a serialized `vdf::VdfProof` over the joiner's `peer_id`) — empty
-    /// under AcceptAll admission, required and verified under `VdfAdmission`. It is **not** covered by
-    /// `sig` because the VDF already binds the `peer_id` (it is self-authenticating evidence, like the
-    /// quorum certificate), so it needs no separate signature.
-    Add { record: ValidatorRecord, sig: Vec<u8>, vdf: Vec<u8> },
+    /// under AcceptAll admission, required and verified under `VdfAdmission`. `rejoin` is an optional
+    /// serialized `zkstmt5::RejoinPackage` (the Statement-5 forward-secrecy proof) — empty unless the
+    /// network runs the Statement-5 admission gate, where it proves the joiner's `null_v` is NOT in
+    /// the on-chain SUSP set. Neither `vdf` nor `rejoin` is covered by `sig`: both are
+    /// self-authenticating evidence that bind the `peer_id` themselves (the VDF over it, the rejoin
+    /// proof committing it as a public input), like the quorum certificate.
+    Add { record: ValidatorRecord, sig: Vec<u8>, vdf: Vec<u8>, rejoin: Vec<u8> },
     /// Remove `peer_id` from the validator set (the leaver signs `leave_sig_bytes`).
     Remove { peer_id: [u8; 32], sig: Vec<u8> },
 }
@@ -75,6 +78,16 @@ impl MembershipOp {
 
     /// Build a self-signed join op carrying an admission VDF proof (`VdfAdmission`).
     pub fn add_with_vdf(identity: &NodeIdentity, addr: String, vdf: Vec<u8>) -> Self {
+        Self::add_full(identity, addr, vdf, Vec::new())
+    }
+
+    /// Build a self-signed join op carrying a Statement-5 rejoin package (forward-secrecy gate).
+    pub fn add_with_rejoin(identity: &NodeIdentity, addr: String, rejoin: Vec<u8>) -> Self {
+        Self::add_full(identity, addr, Vec::new(), rejoin)
+    }
+
+    /// Build a self-signed join op with both optional admission attachments (`vdf`, `rejoin`).
+    pub fn add_full(identity: &NodeIdentity, addr: String, vdf: Vec<u8>, rejoin: Vec<u8>) -> Self {
         let record = ValidatorRecord {
             peer_id: identity.peer_id(),
             addr,
@@ -83,13 +96,21 @@ impl MembershipOp {
             mix_pk: identity.mix_pk(),
         };
         let sig = identity.sign(&join_sig_bytes(&record)).to_bytes().to_vec();
-        MembershipOp::Add { record, sig, vdf }
+        MembershipOp::Add { record, sig, vdf, rejoin }
     }
 
     /// The serialized admission VDF proof carried by an `Add` op (empty for `Remove`/AcceptAll).
     pub fn vdf_proof(&self) -> &[u8] {
         match self {
             MembershipOp::Add { vdf, .. } => vdf,
+            MembershipOp::Remove { .. } => &[],
+        }
+    }
+
+    /// The serialized Statement-5 rejoin package carried by an `Add` op (empty otherwise).
+    pub fn rejoin_pkg(&self) -> &[u8] {
+        match self {
+            MembershipOp::Add { rejoin, .. } => rejoin,
             MembershipOp::Remove { .. } => &[],
         }
     }
@@ -213,6 +234,7 @@ mod tests {
                 record,
                 sig: a.sign(b"nonsense").to_bytes().to_vec(),
                 vdf: Vec::new(),
+                rejoin: Vec::new(),
             },
             other => other,
         };

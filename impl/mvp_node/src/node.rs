@@ -166,6 +166,13 @@ impl Mixer {
 /// point that block is identical for every node, so all derive the same active set (no split-brain).
 const ACTIVATION_DELAY: u64 = 1;
 
+/// How many heights a Statement-5 rejoin proof's reference height may lag the chain head before the
+/// admission gate rejects it as stale. Generous enough that a proof built at one height survives the
+/// few heights until inclusion, yet bounded so a proof binds to a recent SUSP root. Safe at any value:
+/// once a `null_v` is suspended it is in EVERY subsequent root, so a stale-but-valid proof still
+/// reflects non-suspension at a point the node was already unsuspended.
+const STMT5_STALENESS_WINDOW: u64 = 16;
+
 /// The genesis validator set for a seed-derived demo/test network: node `i` has identity
 /// `from_seed(i)`, listens on `127.0.0.1:(base_port + i)`, and advertises its BLS + VRF public keys.
 pub fn genesis_validator_set(nodes: u64, base_port: u16) -> Vec<ValidatorRecord> {
@@ -387,6 +394,11 @@ pub struct Node {
     admission: Option<VdfAdmission>,
     /// Memoised admission VDF proof for our own join — deterministic in our peer_id, computed once.
     join_vdf: std::sync::OnceLock<Vec<u8>>,
+    /// If true, a join op must carry a valid **Statement-5 rejoin proof** (`zkstmt5`): the joiner
+    /// proves in ZK that its `null_v` is NOT in the on-chain SUSP set, so a suspended (dark) node
+    /// cannot re-admit. Genesis-consistent network-wide (every validator enforces it). The forward-
+    /// secrecy keystone's in-loop gate; composes with (is orthogonal to) the VDF admission gate.
+    stmt5_admission: bool,
     /// If set `(modulus, delay)`, the per-height beacon folds in a VDF output over the previous
     /// beacon (genesis-consistent network-wide), removing the residual last-revealer grinding bias.
     beacon_vdf: Option<(BigUint, u64)>,
@@ -475,6 +487,7 @@ impl Node {
             mix_settings: None,
             admission: None,
             join_vdf: std::sync::OnceLock::new(),
+            stmt5_admission: false,
             beacon_vdf: None,
             preferences: None,
             dp_epsilon: 5.0,
@@ -639,6 +652,15 @@ impl Node {
         self
     }
 
+    /// Builder: gate joins behind a **Statement-5 rejoin proof** (`zkstmt5`) — a joiner must prove in
+    /// ZK that its `null_v` is not in the on-chain SUSP set, blocking suspended dark nodes from
+    /// re-admitting. Must be set network-wide (every validator enforces it) so all nodes agree on
+    /// admissibility. Composes with `with_vdf_admission`.
+    pub fn with_stmt5_admission(mut self) -> Self {
+        self.stmt5_admission = true;
+        self
+    }
+
     /// Builder: fold a VDF (over the previous beacon, `delay` sequential squarings, modulus `n`) into
     /// each height's beacon, removing the residual last-revealer bias. Genesis-consistent network-wide.
     pub fn with_vdf_beacon(mut self, n: BigUint, delay: u64) -> Self {
@@ -662,15 +684,95 @@ impl Node {
         }
     }
 
-    /// A membership op is admissible iff it is self-signed AND (for a join under `VdfAdmission`) it
-    /// carries a valid admission VDF proof. This is the network-wide gate enforced at pooling, block
-    /// assembly, and block validation, so all honest nodes agree.
-    fn op_admissible(&self, op: &MembershipOp) -> bool {
+    /// A membership op is admissible iff it is self-signed AND (under `VdfAdmission`) carries a valid
+    /// admission VDF proof AND (under the Statement-5 gate) carries a valid rejoin proof. Enforced
+    /// network-wide at pooling, block assembly, and block validation, so all honest nodes agree.
+    /// `blocks` is the finalized chain the rejoin proof's SUSP-root reference is resolved against.
+    fn op_admissible(&self, op: &MembershipOp, blocks: &[Block]) -> bool {
         op.verify()
             && match (&self.admission, op) {
                 (Some(adm), MembershipOp::Add { record, vdf, .. }) => adm.admits(&record.peer_id, vdf),
                 _ => true,
             }
+            && self.rejoin_admissible(op, blocks)
+    }
+
+    /// The Statement-5 admission gate: under `with_stmt5_admission`, a JOIN must carry a `zkstmt5`
+    /// rejoin proof showing the joiner's `null_v` is NOT in the on-chain SUSP set, blocking suspended
+    /// dark nodes from re-admitting. The proof is bound to a reference height `h_ref`: the gate looks
+    /// up that finalized block's SUSP root + beacon and verifies the proof against them and the op's
+    /// `peer_id` (the proof commits the `peer_id`, so it cannot be replayed by another identity).
+    /// `h_ref` must be finalized and within `STMT5_STALENESS_WINDOW` of the head — a deterministic
+    /// freshness bound (a once-suspended `null_v` is in EVERY later root, so the window opens no
+    /// attack). All inputs come from the finalized chain, so every validator agrees.
+    fn rejoin_admissible(&self, op: &MembershipOp, blocks: &[Block]) -> bool {
+        if !self.stmt5_admission {
+            return true;
+        }
+        let (record, rejoin) = match op {
+            MembershipOp::Add { record, rejoin, .. } => (record, rejoin),
+            MembershipOp::Remove { .. } => return true, // the gate applies only to joins
+        };
+        let pkg: crate::zkstmt5::RejoinPackage = match bincode::deserialize(rejoin) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        let head_h = blocks.last().map(|b| b.header.height).unwrap_or(0);
+        if pkg.h_ref > head_h || head_h - pkg.h_ref > STMT5_STALENESS_WINDOW {
+            return false;
+        }
+        let refblk = match blocks.iter().find(|b| b.header.height == pkg.h_ref) {
+            Some(b) => b,
+            None => return false,
+        };
+        // Bind the proof to the reference block's beacon (prevents cross-context reuse), then verify
+        // the ZK proof against that block's SUSP root and the op's identity.
+        pkg.beacon == refblk.header.beacon_t
+            && pkg.verify(refblk.header.susp_smt_root, record.peer_id)
+    }
+
+    /// The suspended `null_v` keys folded into the SUSP_SMT in effect AT `height` (the keys behind
+    /// `smt_roots_at(.).0`). A joining node rebuilds this tree to extract its own non-membership
+    /// siblings for the Statement-5 rejoin proof.
+    fn susp_keys_at(&self, blocks: &[Block], height: u64) -> Vec<u64> {
+        let cutoff = height.saturating_sub(ACTIVATION_DELAY - 1);
+        blocks
+            .iter()
+            .filter(|b| b.header.height >= 1 && b.header.height < cutoff)
+            .flat_map(|b| b.header.suspensions.iter().map(|s| s.null_v))
+            .collect()
+    }
+
+    /// Build this node's Statement-5 rejoin package against the current finalized head: prove in ZK
+    /// that our `null_v` is not in the head's SUSP tree. Returns the serialized `RejoinPackage`, or
+    /// `None` if we are suspended (cannot prove non-membership) or our chain view is inconsistent.
+    fn build_rejoin_package(&self, blocks: &[Block]) -> Option<Vec<u8>> {
+        let head = blocks.last()?;
+        let h_ref = head.header.height;
+        let susp_root = head.header.susp_smt_root;
+        let beacon = head.header.beacon_t;
+        let tree = crate::smt::Smt::from_keys(&self.susp_keys_at(blocks, h_ref));
+        if tree.root() != susp_root {
+            return None; // our derived tree disagrees with the header — don't emit a bad proof
+        }
+        let nv = to_u64(self.identity.null_v);
+        let siblings = tree.prove(nv).siblings;
+        // Any consistent additive split s₁ + s₂ = null_v works for the gate proof (s₁ is public).
+        let s1 = from_u64(0x5331_5f73_706c_6974); // "S1_split", an arbitrary fixed public point
+        let s2 = sub_mod(self.identity.null_v, s1);
+        let epoch_id = self.identity.epoch_id(from_u64(beacon));
+        let pkg = crate::zkstmt5::RejoinPackage::build(
+            self.identity.sk,
+            s2,
+            s1,
+            from_u64(beacon),
+            epoch_id,
+            susp_root,
+            self.me(),
+            h_ref,
+            siblings,
+        )?;
+        bincode::serialize(&pkg).ok()
     }
 
     /// Builder: route consensus control messages (VRF claims, votes, txs, membership/slash) through
@@ -2374,15 +2476,28 @@ impl Node {
         if self.joining && !vset.contains(&self.me()) && self.join_at.map_or(true, |h| height >= h) {
             debug!(height, "broadcasting self-signed JOIN op");
             let addr = self.config.listen_addr.clone();
-            let op = match &self.admission {
-                // Attach the (memoised) admission VDF proof over our peer_id.
-                Some(adm) => {
-                    let vdf = self.join_vdf.get_or_init(|| adm.prove(&self.me())).clone();
-                    MembershipOp::add_with_vdf(&self.identity, addr, vdf)
-                }
-                None => MembershipOp::add(&self.identity, addr),
+            // Optional admission attachments: the VDF proof-of-work and/or the Statement-5 rejoin
+            // proof. The rejoin proof is rebuilt each height against the current finalized SUSP root
+            // (cheap, self-healing — a stale proof simply ages out of the window). If we are suspended
+            // it cannot be built, so we emit no usable op and stay out, exactly as intended.
+            let vdf = match &self.admission {
+                Some(adm) => self.join_vdf.get_or_init(|| adm.prove(&self.me())).clone(),
+                None => Vec::new(),
             };
-            mixer.publish(peers, beacon_t, Message::Membership(op));
+            let emit = if self.stmt5_admission {
+                match self.build_rejoin_package(&chain.blocks) {
+                    Some(rejoin) => Some(MembershipOp::add_full(&self.identity, addr, vdf, rejoin)),
+                    None => {
+                        debug!(height, "Statement-5 gate: cannot build a rejoin proof (suspended?)");
+                        None
+                    }
+                }
+            } else {
+                Some(MembershipOp::add_full(&self.identity, addr, vdf, Vec::new()))
+            };
+            if let Some(op) = emit {
+                mixer.publish(peers, beacon_t, Message::Membership(op));
+            }
         }
         // per-epoch commitment (publish-s1)
         let epoch_id_fp = self.identity.epoch_id(from_u64(beacon_t));
@@ -2486,7 +2601,7 @@ impl Node {
         let mut ops: Vec<MembershipOp> = Vec::new();
         let mut subjects: HashSet<[u8; 32]> = HashSet::new();
         for op in pending_membership {
-            if !self.op_admissible(op) || !subjects.insert(op.subject()) {
+            if !self.op_admissible(op, &chain.blocks) || !subjects.insert(op.subject()) {
                 continue;
             }
             let changes = match op {
@@ -2660,8 +2775,9 @@ impl Node {
         if b.header.susp_smt_root != susp_root || b.header.decryption_smt_root != decr_root {
             return false;
         }
-        // Every membership op the block carries must be self-authorized AND admissible (VDF gate).
-        if !b.header.membership_ops.iter().all(|op| self.op_admissible(op)) {
+        // Every membership op the block carries must be self-authorized AND admissible (VDF +
+        // Statement-5 rejoin gates), resolved against this validator's finalized chain.
+        if !b.header.membership_ops.iter().all(|op| self.op_admissible(op, &chain.blocks)) {
             return false;
         }
         // Every suspension the block carries must re-validate against public chain data under its
@@ -3106,7 +3222,7 @@ impl Node {
                 // Pool self-authorized membership ops for the next leader to record on-chain, and
                 // re-gossip the first time we see one so it reaches the full mesh even when the
                 // originator is only partially connected (bounded: dedup by subject stops the flood).
-                if self.op_admissible(&op)
+                if self.op_admissible(&op, &chain.blocks)
                     && !pending_membership.iter().any(|o| o.subject() == op.subject())
                 {
                     pending_membership.push(op.clone());
