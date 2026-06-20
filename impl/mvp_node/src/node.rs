@@ -23,6 +23,7 @@ use crate::beacon::{next_beacon, next_beacon_vdf};
 use crate::bls;
 use crate::arbitration::{CustodyParcel, HandoffReceipt, ReshareParcel};
 use crate::rewind::RewindSignal;
+use crate::zkstmt::HandoffProofRecord;
 use crate::verdict::VerdictCommit;
 use crate::watchdog::WatchdogSignal;
 use crate::chain::{
@@ -239,6 +240,9 @@ pub struct NodeOutcome {
     pub rewind_signals_recorded: usize,
     /// Count of §4.1/§6.4 arbitration handoff receipts recorded across this node's finalized chain.
     pub handoff_receipts_recorded: usize,
+    /// Count of §6.4 handoff-package ZK proofs (departing nodes' verified composite Statements 1–3)
+    /// recorded across this node's finalized chain.
+    pub handoff_proofs_recorded: usize,
     /// Whether every departed node with a live handoff reached a custody threshold of valid recorded
     /// receipts — the §4.1 handoff completed under the new committee's custody. A pure function of the
     /// chain, so all honest nodes agree (see `handoff_completed_count` / `arbitration.rs`).
@@ -1529,6 +1533,109 @@ impl Node {
         custody_held.insert(subject, (r_old, share));
     }
 
+    // ─────────────────────────── §6.4 handoff-package ZK proof (Statements 1–3) ───────────────────────────
+
+    /// The protocol bounds the §6.4 handoff statements enforce: `|p_i| ≤ NORM` (Statement 1) and
+    /// `|Δp_i| ≤ TEMPORAL` per epoch (Statement 3). A recorded proof claiming a looser bound is rejected.
+    const HANDOFF_NORM_BOUND: u64 = 16;
+    const HANDOFF_TEMPORAL_BOUND: u64 = 4;
+
+    /// The on-chain `(C_p, width)` committed by the epoch transaction with this `epoch_id`, if finalized.
+    fn c_p_for(&self, blocks: &[Block], epoch_id: u64) -> Option<([u8; 32], usize)> {
+        blocks.iter().rev().find_map(|b| {
+            b.txs.iter().find(|t| t.epoch_id == epoch_id && t.pref.is_some()).map(|t| {
+                let p = t.pref.as_ref().unwrap();
+                (p.c_p, p.gossip.len())
+            })
+        })
+    }
+
+    /// `(prev_epoch_id, curr_epoch_id, width)` of this departing node's two latest on-chain preference
+    /// commitments at or before its departure — the inputs to its handoff-package proof. `None` unless we
+    /// have departed and published at least two preference transactions.
+    fn handoff_proof_inputs(&self, blocks: &[Block]) -> Option<(u64, u64, usize)> {
+        let rh = self.remove_heights(blocks).get(&self.me()).copied()?;
+        let mut mine: Vec<(u64, u64, usize)> = Vec::new(); // (height, epoch_id, width)
+        for b in blocks {
+            if b.header.height > rh {
+                continue;
+            }
+            for t in &b.txs {
+                if t.submitter == self.me() {
+                    if let Some(p) = t.pref.as_ref() {
+                        mine.push((b.header.height, t.epoch_id, p.gossip.len()));
+                    }
+                }
+            }
+        }
+        mine.sort_by_key(|x| x.0);
+        if mine.len() < 2 {
+            return None;
+        }
+        let curr = mine[mine.len() - 1];
+        let prev = mine[mine.len() - 2];
+        Some((prev.1, curr.1, curr.2.max(prev.2)))
+    }
+
+    /// Independently verify a recorded handoff-package proof against the on-chain commitments it names,
+    /// enforcing the protocol norm/temporal bounds. Self-contained (only a real opening produces a valid
+    /// proof), so a proposer cannot inject a forged one.
+    fn validate_handoff_proof(&self, blocks: &[Block], rec: &HandoffProofRecord) -> bool {
+        let (Some((c_curr, w1)), Some((c_prev, w2))) =
+            (self.c_p_for(blocks, rec.subject), self.c_p_for(blocks, rec.prev_subject))
+        else {
+            return false;
+        };
+        if w1 != w2 || w1 == 0 {
+            return false;
+        }
+        let pc = crate::pedersen::Pedersen::new(w1);
+        crate::zkstmt::verify_handoff(&pc, &c_prev, &c_curr, Self::HANDOFF_NORM_BOUND, Self::HANDOFF_TEMPORAL_BOUND, &rec.stmts)
+    }
+
+    /// Departing-node driver: once our departure is finalized, generate the §6.4 composite handoff proof
+    /// over our two latest on-chain `C_p` (we alone know the vector + per-epoch blindings) and publish it
+    /// once for the next leader to record. The committee and every validator then have a ZK guarantee the
+    /// handed-off profile is well-formed without ever seeing it.
+    fn drive_handoff_proof(&self, chain: &Chain, peers: &PeersMap, mixer: &Mixer, beacon: u64, sent: &mut bool) {
+        if *sent || self.leave_at.is_none() {
+            return;
+        }
+        let Some(prefs) = self.preferences.as_ref() else { return };
+        let Some((prev_e, curr_e, width)) = self.handoff_proof_inputs(&chain.blocks) else { return };
+        let already = chain.blocks.iter().any(|b| b.header.handoff_proofs.iter().any(|r| r.subject == curr_e));
+        if already {
+            *sent = true;
+            return;
+        }
+        let pc = crate::pedersen::Pedersen::new(width);
+        let sk = self.pref_sk_handle();
+        let r_prev = crate::epoch::pref_blinding(&sk, prev_e);
+        let r_curr = crate::epoch::pref_blinding(&sk, curr_e);
+        // The clean vector is fixed across epochs in this build (Δp = 0 ⇒ all directions free); pad to width.
+        let vals: Vec<i64> = (0..width).map(|j| prefs.get(j).copied().unwrap_or(0)).collect();
+        let dirs = vec![0i8; width];
+        let mut hs = blake3::Hasher::new();
+        hs.update(b"privacf-handoff-proof-seed-v1");
+        hs.update(&to_u64(self.identity.sk).to_le_bytes());
+        hs.update(&curr_e.to_le_bytes());
+        let seed = *hs.finalize().as_bytes();
+        let stmts = crate::zkstmt::prove_handoff(
+            &pc, &vals, &r_prev, &vals, &r_curr, &dirs, Self::HANDOFF_NORM_BOUND, Self::HANDOFF_TEMPORAL_BOUND, &seed,
+        );
+        let rec = HandoffProofRecord { subject: curr_e, prev_subject: prev_e, stmts };
+        if !self.validate_handoff_proof(&chain.blocks, &rec) {
+            return; // never publish a proof that won't verify against the chain
+        }
+        *sent = true;
+        mixer.publish(peers, beacon, Message::HandoffProof(rec));
+    }
+
+    /// Every handoff-proof subject already finalized on `blocks` — the recording dedup key.
+    fn recorded_handoff_proof_subjects(&self, blocks: &[Block]) -> HashSet<u64> {
+        blocks.iter().flat_map(|b| b.header.handoff_proofs.iter()).map(|r| r.subject).collect()
+    }
+
     // ─────────────────────────── §4.1/§6.4 re-handoff (proactive custody rotation) ───────────────────────────
 
     /// The single supported re-handoff round (round 1). Generalising to round ≥ 2 (a re-handoff of a
@@ -2196,6 +2303,7 @@ impl Node {
         watchdog_pool: &[WatchdogSignal],
         rewind_pool: &[RewindSignal],
         handoff_pool: &[HandoffReceipt],
+        handoff_proof_pool: &[HandoffProofRecord],
         alt: bool,
     ) -> Block {
         let prev = chain.head_hash();
@@ -2302,6 +2410,19 @@ impl Node {
                 handoff_receipts.push(r.clone());
             }
         }
+        // Include §6.4 handoff-package ZK proofs awaiting inclusion — one per subject, re-verified against
+        // the on-chain commitments and not already recorded.
+        let recorded_hp = self.recorded_handoff_proof_subjects(&chain.blocks);
+        let mut hp_subjects: HashSet<u64> = HashSet::new();
+        let mut handoff_proofs: Vec<HandoffProofRecord> = Vec::new();
+        for r in handoff_proof_pool {
+            if !recorded_hp.contains(&r.subject)
+                && hp_subjects.insert(r.subject)
+                && self.validate_handoff_proof(&chain.blocks, r)
+            {
+                handoff_proofs.push(r.clone());
+            }
+        }
         if alt {
             txs.clear(); // a conflicting variant of the same slot -> a different block id
             ops.clear();
@@ -2312,6 +2433,7 @@ impl Node {
             watchdog_signals.clear();
             rewind_signals.clear();
             handoff_receipts.clear();
+            handoff_proofs.clear();
         }
         let mut header = BlockHeader::create(
             &self.identity, r.height, r.view, r.beacon_t, prev, my_epoch_id, &r.my_vrf,
@@ -2324,6 +2446,7 @@ impl Node {
         header.watchdog_signals = watchdog_signals;
         header.rewind_signals = rewind_signals;
         header.handoff_receipts = handoff_receipts;
+        header.handoff_proofs = handoff_proofs;
         let (susp_root, decr_root) = self.smt_roots_at(&chain.blocks, r.height);
         header.susp_smt_root = susp_root;
         header.decryption_smt_root = decr_root;
@@ -2465,6 +2588,20 @@ impl Node {
                 }
             }
         }
+        // Every §6.4 handoff-package ZK proof must re-verify against the on-chain commitments it names,
+        // be unique within the block, and not already be recorded — so no proposer injects a forged one.
+        {
+            let recorded = self.recorded_handoff_proof_subjects(&chain.blocks);
+            let mut seen: HashSet<u64> = HashSet::new();
+            for r in &b.header.handoff_proofs {
+                if recorded.contains(&r.subject)
+                    || !seen.insert(r.subject)
+                    || !self.validate_handoff_proof(&chain.blocks, r)
+                {
+                    return false;
+                }
+            }
+        }
         if !vset.contains(&b.header.proposer_peer) {
             return false;
         }
@@ -2522,6 +2659,7 @@ impl Node {
         watchdog_pool: &[WatchdogSignal],
         rewind_pool: &[RewindSignal],
         handoff_pool: &[HandoffReceipt],
+        handoff_proof_pool: &[HandoffProofRecord],
         peers: &PeersMap,
         mixer: &Mixer,
         slashed: &HashSet<[u8; 32]>,
@@ -2542,13 +2680,13 @@ impl Node {
                 r.proposed_views.insert(r.view);
                 if self.equivocate {
                     // Byzantine: double-sign two conflicting blocks for this slot.
-                    let a = self.assemble_block(chain, r, pending, pending_membership, pending_suspensions, audit_pool, verdict_commit_pool, watchdog_pool, rewind_pool, handoff_pool, false);
-                    let b = self.assemble_block(chain, r, pending, pending_membership, pending_suspensions, audit_pool, verdict_commit_pool, watchdog_pool, rewind_pool, handoff_pool, true);
+                    let a = self.assemble_block(chain, r, pending, pending_membership, pending_suspensions, audit_pool, verdict_commit_pool, watchdog_pool, rewind_pool, handoff_pool, handoff_proof_pool, false);
+                    let b = self.assemble_block(chain, r, pending, pending_membership, pending_suspensions, audit_pool, verdict_commit_pool, watchdog_pool, rewind_pool, handoff_pool, handoff_proof_pool, true);
                     debug!(height = r.height, view = r.view, "EQUIVOCATING (double-signing the slot)");
                     mixer.publish(peers, r.beacon_t, Message::Proposal(a));
                     mixer.publish(peers, r.beacon_t, Message::Proposal(b));
                 } else {
-                    let block = self.assemble_block(chain, r, pending, pending_membership, pending_suspensions, audit_pool, verdict_commit_pool, watchdog_pool, rewind_pool, handoff_pool, false);
+                    let block = self.assemble_block(chain, r, pending, pending_membership, pending_suspensions, audit_pool, verdict_commit_pool, watchdog_pool, rewind_pool, handoff_pool, handoff_proof_pool, false);
                     let bid = block_id(&block.header, &block.txs);
                     debug!(height = r.height, view = r.view, txs = block.txs.len(), "proposing as VRF leader");
                     r.blocks.insert(bid, block.clone());
@@ -2626,6 +2764,7 @@ impl Node {
         watchdog_pool: &mut Vec<WatchdogSignal>,
         rewind_pool: &mut Vec<RewindSignal>,
         handoff_pool: &mut Vec<HandoffReceipt>,
+        handoff_proof_pool: &mut Vec<HandoffProofRecord>,
         custody_held: &mut HashMap<u64, ([u8; 32], [u8; 32])>,
         reshare_held: &mut HashMap<u64, Vec<(u64, [u8; 32], [u8; 32])>>,
         psi_initiated: &mut HashSet<[u8; 32]>,
@@ -2773,6 +2912,18 @@ impl Node {
                 }
                 handoff_pool.push(r.clone());
                 mixer.publish(peers, beacon_hint, Message::Handoff(r));
+            }
+            Message::HandoffProof(rec) => {
+                // A departing node's §6.4 handoff-package ZK proof: pool it (dedup by subject) only if it
+                // re-verifies against the on-chain commitments, then re-gossip once (low volume).
+                if self.recorded_handoff_proof_subjects(&chain.blocks).contains(&rec.subject)
+                    || handoff_proof_pool.iter().any(|x| x.subject == rec.subject)
+                    || !self.validate_handoff_proof(&chain.blocks, &rec)
+                {
+                    return;
+                }
+                handoff_proof_pool.push(rec.clone());
+                mixer.publish(peers, beacon_hint, Message::HandoffProof(rec));
             }
             Message::Membership(op) => {
                 // Pool self-authorized membership ops for the next leader to record on-chain, and
@@ -3012,6 +3163,10 @@ impl Node {
         let mut rewind_raised = false;
         let mut rewind_pool: Vec<RewindSignal> = Vec::new();
         let mut handoff_pool: Vec<HandoffReceipt> = Vec::new();
+        // §6.4 handoff-package ZK proofs awaiting inclusion, and whether this (departing) node already
+        // published its own.
+        let mut handoff_proof_pool: Vec<HandoffProofRecord> = Vec::new();
+        let mut handoff_proof_sent = false;
         let mut custody_dispatch_height: Option<u64> = None;
         // Custody this node took at round-0 handoff (orig subject → (r_old, our share)), so it can later
         // proactively re-share to a fresh committee; and the sub-shares it accumulates as a fresh-committee
@@ -3103,6 +3258,8 @@ impl Node {
                     rewind_pool.retain(|s| !recorded_rw.contains(&(s.epoch_id, s.cohort_epoch)));
                     let recorded_ho = self.recorded_handoff_keys(&chain.blocks);
                     handoff_pool.retain(|r| !recorded_ho.contains(&(r.member, r.subject)));
+                    let recorded_hp = self.recorded_handoff_proof_subjects(&chain.blocks);
+                    handoff_proof_pool.retain(|r| !recorded_hp.contains(&r.subject));
                     // Learn the dial addresses of all current members so the dial task can reach a
                     // newly-admitted validator.
                     {
@@ -3130,6 +3287,9 @@ impl Node {
                     // Re-handoff driver: a surviving custodian proactively re-shares to a fresh committee
                     // once an original custodian departs (no-op unless triggered + we are a canonical dealer).
                     self.drive_rehandoff(&chain, &custody_held, &mut reshare_held, &mut handoff_pool, &peers, &mixer, beacon_hint, &mut rehandoff_dispatch_height);
+                    // §6.4 handoff-package ZK proof: a departing node publishes its composite Statements
+                    // 1-3 over its on-chain C_p once its departure is finalized (no-op for non-leavers).
+                    self.drive_handoff_proof(&chain, &peers, &mixer, beacon_hint, &mut handoff_proof_sent);
                     // §5.3/§5.4 PSI interest-peer discovery (no-op unless with_psi_discovery): additive,
                     // off-chain, one probe per tick — never affects consensus.
                     self.drive_psi(&chain, &peers, &mixer, beacon_hint, &mut psi_initiated);
@@ -3153,11 +3313,11 @@ impl Node {
                         }
                     }
                     if let Some(r) = round.as_mut() {
-                        self.on_tick(r, &mut chain, &pending, &pending_membership, &pending_suspensions, &audit_pool, &verdict_commit_pool, &watchdog_pool, &rewind_pool, &handoff_pool, &peers, &mixer, &slashed);
+                        self.on_tick(r, &mut chain, &pending, &pending_membership, &pending_suspensions, &audit_pool, &verdict_commit_pool, &watchdog_pool, &rewind_pool, &handoff_pool, &handoff_proof_pool, &peers, &mixer, &slashed);
                     }
                 }
                 Some(msg) = inbox_rx.recv() => {
-                    self.on_msg(msg, round.as_mut(), &mut chain, &mut pending, &mut pending_membership, &mut pending_suspensions, &mut verdict_partials, &mut audit_pool, &mut verdict_commit_pool, &mut watchdog_pool, &mut rewind_pool, &mut handoff_pool, &mut custody_held, &mut reshare_held, &mut psi_initiated, &mut interest_peers, &peers, &mixer, &mut slashed);
+                    self.on_msg(msg, round.as_mut(), &mut chain, &mut pending, &mut pending_membership, &mut pending_suspensions, &mut verdict_partials, &mut audit_pool, &mut verdict_commit_pool, &mut watchdog_pool, &mut rewind_pool, &mut handoff_pool, &mut handoff_proof_pool, &mut custody_held, &mut reshare_held, &mut psi_initiated, &mut interest_peers, &peers, &mixer, &mut slashed);
                 }
             }
         }
@@ -3185,6 +3345,8 @@ impl Node {
             chain.blocks.iter().map(|b| b.header.rewind_signals.len()).sum::<usize>();
         let handoff_receipts_recorded =
             chain.blocks.iter().map(|b| b.header.handoff_receipts.len()).sum::<usize>();
+        let handoff_proofs_recorded =
+            chain.blocks.iter().map(|b| b.header.handoff_proofs.len()).sum::<usize>();
         let handoff_subjects = self.handoff_subjects(&chain.blocks);
         let handoff_complete = !handoff_subjects.is_empty()
             && handoff_subjects.iter().all(|&s| {
@@ -3216,6 +3378,7 @@ impl Node {
             class3_triggered,
             rewind_signals_recorded,
             handoff_receipts_recorded,
+            handoff_proofs_recorded,
             handoff_complete,
             handoff_defaults,
             rehandoff_complete,

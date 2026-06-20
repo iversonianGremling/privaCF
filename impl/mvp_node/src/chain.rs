@@ -74,6 +74,11 @@ pub struct BlockHeader {
     /// re-validated by every validator; `arbitration::settle` over them credits filers and defaults
     /// non-filers (slashable). The handoff preserves a departing node's profile under new custody.
     pub handoff_receipts: Vec<crate::arbitration::HandoffReceipt>,
+    /// §6.4 handoff-package ZK proofs (`zkstmt.rs`): a departing node's composite Statements 1–3 (norm /
+    /// directional / temporal) over its two consecutive on-chain `C_p`, proving the handed-off profile is
+    /// well-formed without revealing it. Header-covered and re-verified by every validator against the
+    /// on-chain commitments before recording.
+    pub handoff_proofs: Vec<crate::zkstmt::HandoffProofRecord>,
 }
 
 /// A validator's BLS vote over a slot — the unit aggregated into the quorum certificate. The signed
@@ -251,6 +256,7 @@ impl BlockHeader {
             watchdog_signals: Vec::new(),
             rewind_signals: Vec::new(),
             handoff_receipts: Vec::new(),
+            handoff_proofs: Vec::new(),
         }
     }
 }
@@ -291,6 +297,7 @@ impl Chain {
             watchdog_signals: Vec::new(),
             rewind_signals: Vec::new(),
             handoff_receipts: Vec::new(),
+            handoff_proofs: Vec::new(),
         };
         Chain {
             blocks: vec![Block {

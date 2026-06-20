@@ -73,6 +73,11 @@ pub enum Message {
     /// commitment it now custodies + the ZK proof binding it to the subject's on-chain `c_old`. A node
     /// pools / records one that verifies; the next leader records it in `BlockHeader::handoff_receipts`.
     Handoff(crate::arbitration::HandoffReceipt),
+    /// A departing node's §6.4 handoff-package ZK proof (`zkstmt.rs`): the composite Statements 1–3 over
+    /// its on-chain `C_p`, proving the profile it is handing off is well-formed without revealing it. A
+    /// node pools / records one that verifies against the on-chain commitments; the next leader records it
+    /// in `BlockHeader::handoff_proofs`. Low volume (one per departure) — re-gossiped once.
+    HandoffProof(crate::zkstmt::HandoffProofRecord),
     /// §5.3/§5.4 PSI peer-discovery **offer** (`psi.rs`): the initiator `from` sends its blinded liked-item
     /// set `u = {H(x)^a}` to `to`. Addressed point-to-point (broadcast, consumed only by `to`); never
     /// recorded on-chain — interest-peer discovery is local, additive, and decoupled from consensus.
