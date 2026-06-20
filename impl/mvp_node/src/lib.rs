@@ -41,6 +41,7 @@ pub mod verenc;
 pub mod vrf;
 pub mod watchdog;
 pub mod zkstmt;
+pub mod zkstmt5;
 
 #[cfg(test)]
 mod tests {
