@@ -73,6 +73,14 @@ pub enum Message {
     /// commitment it now custodies + the ZK proof binding it to the subject's on-chain `c_old`. A node
     /// pools / records one that verifies; the next leader records it in `BlockHeader::handoff_receipts`.
     Handoff(crate::arbitration::HandoffReceipt),
+    /// §5.3/§5.4 PSI peer-discovery **offer** (`psi.rs`): the initiator `from` sends its blinded liked-item
+    /// set `u = {H(x)^a}` to `to`. Addressed point-to-point (broadcast, consumed only by `to`); never
+    /// recorded on-chain — interest-peer discovery is local, additive, and decoupled from consensus.
+    PsiOffer { from: [u8; 32], to: [u8; 32], u: Vec<[u8; 32]> },
+    /// §5.3/§5.4 PSI peer-discovery **response** (`psi.rs`): `from` returns its own blinded set
+    /// `v = {H(y)^b}` and the initiator's set re-blinded `w = {H(x)^{ab}}`; the initiator `to` computes
+    /// `z = {H(y)^{ab}}` and learns only the intersection SIZE, deciding cluster-peer connection on overlap.
+    PsiResponse { from: [u8; 32], to: [u8; 32], v: Vec<[u8; 32]>, w: Vec<[u8; 32]> },
     /// A fixed-size Sphinx mix packet to peel and forward/deliver (the Loopix layer, `loopix.rs`).
     Sphinx(SphinxPacket),
     /// Request all finalized blocks at height ≥ `from_height`.
