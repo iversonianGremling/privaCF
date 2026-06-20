@@ -399,6 +399,11 @@ pub struct Node {
     /// cannot re-admit. Genesis-consistent network-wide (every validator enforces it). The forward-
     /// secrecy keystone's in-loop gate; composes with (is orthogonal to) the VDF admission gate.
     stmt5_admission: bool,
+    /// When set, every epoch transaction must carry a VerEnc well-formedness proof (`verenc.rs`,
+    /// DESIGN-f1 §R1–R3): each validator verifies, at publish time and without `σ`, that the tx's
+    /// `d_T` is a genuine, openable, in-range encryption of `s₂`. Rejects an un-openable ciphertext
+    /// that would silently defeat dark-node extraction at verdict time. Requires `with_threshold_key`.
+    verenc_proof: bool,
     /// If set `(modulus, delay)`, the per-height beacon folds in a VDF output over the previous
     /// beacon (genesis-consistent network-wide), removing the residual last-revealer grinding bias.
     beacon_vdf: Option<(BigUint, u64)>,
@@ -488,6 +493,7 @@ impl Node {
             admission: None,
             join_vdf: std::sync::OnceLock::new(),
             stmt5_admission: false,
+            verenc_proof: false,
             beacon_vdf: None,
             preferences: None,
             dp_epsilon: 5.0,
@@ -661,6 +667,16 @@ impl Node {
         self
     }
 
+    /// Builder: require every epoch transaction to carry a **VerEnc well-formedness proof**
+    /// (`verenc.rs`, DESIGN-f1 §R1–R3). Each validator re-verifies, at publish time and without the
+    /// verdict signature, that the tx's `d_T` is a genuine encryption of a known, in-range `s₂` — so a
+    /// node cannot publish an un-openable ciphertext to escape dark-node extraction at verdict time.
+    /// Must be set network-wide and paired with `with_threshold_key` (the proof binds to `VA_pub`).
+    pub fn with_verenc_proof(mut self) -> Self {
+        self.verenc_proof = true;
+        self
+    }
+
     /// Builder: fold a VDF (over the previous beacon, `delay` sequential squarings, modulus `n`) into
     /// each height's beacon, removing the residual last-revealer bias. Genesis-consistent network-wide.
     pub fn with_vdf_beacon(mut self, n: BigUint, delay: u64) -> Self {
@@ -773,6 +789,42 @@ impl Node {
             siblings,
         )?;
         bincode::serialize(&pkg).ok()
+    }
+
+    /// Build the VerEnc well-formedness proof for our own `d_T` (when the `with_verenc_proof` gate is
+    /// on). Returns the serialized proof, or empty if we hold no threshold key / `d_T` does not decode
+    /// (e.g. a `StubVerEnc` placeholder) — in which case our tx will fail the gate, as intended.
+    fn build_verenc_proof(&self, d_t: &[u8], s2: crate::field::Fp, epoch_id: u64) -> Vec<u8> {
+        let Some(tk) = self.threshold_key.as_ref() else { return Vec::new() };
+        let Some(ct) = crate::verenc::VerEncCt::from_bytes(d_t) else { return Vec::new() };
+        let id = crate::verenc::verdict_id(epoch_id);
+        // Per-epoch nonce seed bound to our secret key (unpredictable to verifiers; the proof is
+        // zero-knowledge regardless of the seed, which only drives the prover's sigma nonces).
+        let mut h = blake3::Hasher::new();
+        h.update(b"privacf-verenc-proof-seed-v1");
+        h.update(&to_u64(self.identity.sk).to_le_bytes());
+        h.update(&epoch_id.to_le_bytes());
+        let seed = *h.finalize().as_bytes();
+        match crate::verenc::prove_wellformed(&tk.va_pub, &id, &ct, to_u64(s2), &seed) {
+            Some(p) => p.to_bytes(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Gate check for one epoch transaction: when `with_verenc_proof` is on, its `d_T` must carry a
+    /// valid well-formedness proof under the standing `VA_pub`. Always `true` when the gate is off.
+    fn tx_verenc_ok(&self, tx: &EpochTransaction) -> bool {
+        if !self.verenc_proof {
+            return true;
+        }
+        let Some(tk) = self.threshold_key.as_ref() else { return false };
+        let (Some(ct), Some(proof)) = (
+            crate::verenc::VerEncCt::from_bytes(&tx.commit.d_t),
+            crate::verenc::WellFormedProof::from_bytes(&tx.commit.proof),
+        ) else {
+            return false;
+        };
+        crate::verenc::verify_wellformed(&tk.va_pub, &crate::verenc::verdict_id(tx.epoch_id), &ct, &proof)
     }
 
     /// Builder: route consensus control messages (VRF claims, votes, txs, membership/slash) through
@@ -2505,7 +2557,11 @@ impl Node {
         let s2 = random_field(rng);
         let s1 = sub_mod(self.identity.null_v, s2);
         *split_ok &= add_mod(s1, s2) == self.identity.null_v;
-        let commit = CommitT { s1: to_u64(s1), d_t: self.verenc.encrypt(s2, epoch_id_fp) };
+        let d_t = self.verenc.encrypt(s2, epoch_id_fp);
+        // VerEnc well-formedness gate (P1.2c): attach a proof that d_T is a genuine, openable, in-range
+        // encryption of s₂ — so every validator can reject an un-openable ciphertext at publish time.
+        let proof = if self.verenc_proof { self.build_verenc_proof(&d_t, s2, epoch_id) } else { Vec::new() };
+        let commit = CommitT { s1: to_u64(s1), d_t, proof };
         // Layer-5: when this node has preferences, attach the obfuscated gossip + C_p + M_v payload,
         // putting real recommendation substrate on-chain (§4.4–§4.6).
         let pref = self.preferences.as_ref().map(|prefs| {
@@ -2888,6 +2944,12 @@ impl Node {
                 }
             }
         }
+        // Under the VerEnc gate, every epoch tx's d_T must carry a valid well-formedness proof — so no
+        // proposer can finalize a tx whose ciphertext is un-openable/out-of-range (which would silently
+        // defeat dark-node extraction at verdict time).
+        if self.verenc_proof && !b.txs.iter().all(|tx| self.tx_verenc_ok(tx)) {
+            return false;
+        }
         if !vset.contains(&b.header.proposer_peer) {
             return false;
         }
@@ -3066,7 +3128,9 @@ impl Node {
             round.as_deref().map(|r| r.beacon_t).unwrap_or_else(|| chain.head().header.beacon_t);
         match msg {
             Message::Tx(tx) => {
-                if tx.verify_sig() {
+                // Self-authenticated AND (under the VerEnc gate) carrying a valid d_T well-formedness
+                // proof — so the next proposer never pools an un-openable ciphertext.
+                if tx.verify_sig() && self.tx_verenc_ok(&tx) {
                     pending.insert((tx.height, tx.epoch_id), tx);
                 }
             }
@@ -3887,7 +3951,7 @@ mod tests {
         let mut chain = Chain::genesis();
         let mut blk = chain.blocks[0].clone();
         blk.header.height = 1;
-        blk.txs = vec![EpochTransaction::create(target, 1, epoch_id, CommitT { s1: to_u64(s1), d_t })];
+        blk.txs = vec![EpochTransaction::create(target, 1, epoch_id, CommitT { s1: to_u64(s1), d_t, proof: Vec::new() })];
         chain.blocks.push(blk);
 
         let cfg = NodeConfig {

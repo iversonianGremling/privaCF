@@ -9,11 +9,16 @@ use crate::field::{to_u64, Fp};
 use crate::verenc;
 
 /// The published per-epoch commitment. `s1` is canonical-`u64` of the public share; `d_t` is the
-/// (stubbed) verifiable encryption of `s2`.
+/// verifiable encryption of `s2`. `proof` is an optional serialized [`verenc::WellFormedProof`]
+/// (DESIGN-f1 §R1–R3) — empty unless the network runs the VerEnc well-formedness gate, where it lets
+/// every validator verify, at publish time and without `σ`, that `d_t` is a genuine encryption of a
+/// known, in-range `s₂` (so a node cannot publish an un-openable ciphertext to escape suspension).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CommitT {
     pub s1: u64,
     pub d_t: Vec<u8>,
+    #[serde(default)]
+    pub proof: Vec<u8>,
 }
 
 /// Verifiable encryption of the secret share `s₂` to `VA_pub`.
