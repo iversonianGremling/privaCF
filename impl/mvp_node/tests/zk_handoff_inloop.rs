@@ -15,7 +15,14 @@ async fn a_departing_nodes_handoff_carries_a_verified_zk_proof_in_loop() {
     let total_n = 6u64;
     let leaver_seed = 5u64;
     let leave_height = 3u64;
-    let epochs = 12u64;
+    // Headroom matters here. The §6.4 proof is only recordable after a multi-step pipeline that all
+    // runs AFTER the leave finalizes: generate the proof, gossip the large (~tens-of-KB) object to the
+    // validators, have one verify+pool it, a proposer include it, and that block finalize. Under the
+    // (now fast) single-round consensus that pipeline needs noticeably more than the handful of rounds
+    // between `leave_height` and `max_height` to land — with too tight a window the chain finalizes its
+    // last block before the proof arrives and there is no slot left to record it (a `max_height` cutoff
+    // is a test artifact; a live node runs forever and always records it eventually). Keep ample margin.
+    let epochs = 24u64;
     let base_port = 9440u16;
     let window_ms = 700u64;
     let epsilon = 6.0;
