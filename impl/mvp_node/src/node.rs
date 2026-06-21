@@ -1923,38 +1923,49 @@ impl Node {
     /// over our two latest on-chain `C_p` (we alone know the vector + per-epoch blindings) and publish it
     /// once for the next leader to record. The committee and every validator then have a ZK guarantee the
     /// handed-off profile is well-formed without ever seeing it.
-    fn drive_handoff_proof(&self, chain: &Chain, peers: &PeersMap, mixer: &Mixer, beacon: u64, sent: &mut bool) {
-        if *sent || self.leave_at.is_none() {
+    fn drive_handoff_proof(&self, chain: &Chain, peers: &PeersMap, mixer: &Mixer, beacon: u64, cache: &mut Option<HandoffProofRecord>, last_pub_h: &mut Option<u64>) {
+        if self.leave_at.is_none() {
             return;
         }
         let Some(prefs) = self.preferences.as_ref() else { return };
         let Some((prev_e, curr_e, width)) = self.handoff_proof_inputs(&chain.blocks) else { return };
-        let already = chain.blocks.iter().any(|b| b.header.handoff_proofs.iter().any(|r| r.subject == curr_e));
-        if already {
-            *sent = true;
+        // Already recorded on-chain — nothing more to do.
+        if chain.blocks.iter().any(|b| b.header.handoff_proofs.iter().any(|r| r.subject == curr_e)) {
             return;
         }
-        let pc = crate::pedersen::Pedersen::new(width);
-        let sk = self.pref_sk_handle();
-        let r_prev = crate::epoch::pref_blinding(&sk, prev_e);
-        let r_curr = crate::epoch::pref_blinding(&sk, curr_e);
-        // The clean vector is fixed across epochs in this build (Δp = 0 ⇒ all directions free); pad to width.
-        let vals: Vec<i64> = (0..width).map(|j| prefs.get(j).copied().unwrap_or(0)).collect();
-        let dirs = vec![0i8; width];
-        let mut hs = blake3::Hasher::new();
-        hs.update(b"privacf-handoff-proof-seed-v1");
-        hs.update(&to_u64(self.identity.sk).to_le_bytes());
-        hs.update(&curr_e.to_le_bytes());
-        let seed = *hs.finalize().as_bytes();
-        let stmts = crate::zkstmt::prove_handoff(
-            &pc, &vals, &r_prev, &vals, &r_curr, &dirs, Self::HANDOFF_NORM_BOUND, Self::HANDOFF_TEMPORAL_BOUND, &seed,
-        );
-        let rec = HandoffProofRecord { subject: curr_e, prev_subject: prev_e, stmts };
-        if !self.validate_handoff_proof(&chain.blocks, &rec) {
-            return; // never publish a proof that won't verify against the chain
+        // Generate the (expensive) ZK proof at most ONCE, then cache it.
+        if cache.as_ref().map(|r| r.subject) != Some(curr_e) {
+            let pc = crate::pedersen::Pedersen::new(width);
+            let sk = self.pref_sk_handle();
+            let r_prev = crate::epoch::pref_blinding(&sk, prev_e);
+            let r_curr = crate::epoch::pref_blinding(&sk, curr_e);
+            // The clean vector is fixed across epochs in this build (Δp = 0 ⇒ all directions free); pad to width.
+            let vals: Vec<i64> = (0..width).map(|j| prefs.get(j).copied().unwrap_or(0)).collect();
+            let dirs = vec![0i8; width];
+            let mut hs = blake3::Hasher::new();
+            hs.update(b"privacf-handoff-proof-seed-v1");
+            hs.update(&to_u64(self.identity.sk).to_le_bytes());
+            hs.update(&curr_e.to_le_bytes());
+            let seed = *hs.finalize().as_bytes();
+            let stmts = crate::zkstmt::prove_handoff(
+                &pc, &vals, &r_prev, &vals, &r_curr, &dirs, Self::HANDOFF_NORM_BOUND, Self::HANDOFF_TEMPORAL_BOUND, &seed,
+            );
+            let rec = HandoffProofRecord { subject: curr_e, prev_subject: prev_e, stmts };
+            if !self.validate_handoff_proof(&chain.blocks, &rec) {
+                return; // never publish a proof that won't verify against the chain
+            }
+            *cache = Some(rec);
         }
-        *sent = true;
-        mixer.publish(peers, beacon, Message::HandoffProof(rec));
+        // Re-gossip the cached proof at most once per height until it is recorded (self-healing: the
+        // departed node is not a proposer, so a single dropped broadcast would otherwise strand it —
+        // mirrors `drive_custody_dispatch`'s per-height re-dispatch).
+        let head = chain.head().header.height;
+        if *last_pub_h != Some(head) {
+            *last_pub_h = Some(head);
+            if let Some(rec) = cache.as_ref() {
+                mixer.publish(peers, beacon, Message::HandoffProof(rec.clone()));
+            }
+        }
     }
 
     /// Every handoff-proof subject already finalized on `blocks` — the recording dedup key.
@@ -2159,9 +2170,13 @@ impl Node {
                 }
             }
         }
-        if dispatched {
-            *last_height = Some(head);
-        }
+        let _ = dispatched;
+        // Run at most once per height (per-height re-dispatch self-heals a dropped parcel, like
+        // `drive_custody_dispatch`). Setting this only on `dispatched` was a bug: in the common case
+        // where no original custodian has departed (so no re-handoff is owed) nothing dispatches, so
+        // `last_height` never advanced and this driver — with its per-subject chain folds — re-ran on
+        // EVERY 10ms tick on every committee node, starving consensus once a handoff exists.
+        *last_height = Some(head);
     }
 
     /// Fresh-committee-member reaction to a re-share parcel: open it, accumulate one sub-share per canonical
@@ -2565,8 +2580,12 @@ impl Node {
         let proof = if self.verenc_proof { self.build_verenc_proof(&d_t, s2, epoch_id) } else { Vec::new() };
         let commit = CommitT { s1: to_u64(s1), d_t, proof };
         // Layer-5: when this node has preferences, attach the obfuscated gossip + C_p + M_v payload,
-        // putting real recommendation substrate on-chain (§4.4–§4.6).
-        let pref = self.preferences.as_ref().map(|prefs| {
+        // putting real recommendation substrate on-chain (§4.4–§4.6). A node that has DEPARTED (a leaver
+        // no longer in the active set) stops publishing — it has no business adding preferences after
+        // leaving, and continuing to do so would keep advancing its "latest C_p" so the §6.4 handoff ZK
+        // proof (taken over the two latest on-chain C_p) could never settle on a finalized pair.
+        let still_member = self.leave_at.is_none() || vset.contains(&self.me());
+        let pref = self.preferences.as_ref().filter(|_| still_member).map(|prefs| {
             let mut p = crate::epoch::PreferencePayload::build(prefs, &self.pref_sk_handle(), epoch_id, self.dp_epsilon);
             if self.malform_pref {
                 // Byzantine: bypass the honest obfuscation pipeline and publish an over-bound row to
@@ -2596,7 +2615,6 @@ impl Node {
         claims.insert(self.me(), my_vrf.output);
         let now = Instant::now();
         let vrf_deadline = now + Duration::from_millis(self.config.window_ms / 3);
-        // view 0 runs from vrf_deadline until one view_timeout (= window) later.
         let view_deadline = vrf_deadline + Duration::from_millis(self.config.window_ms);
         Round {
             height,
@@ -2840,7 +2858,7 @@ impl Node {
         if b.header.suspensions.len() != b.header.verdict_sigs.len() {
             return false;
         }
-        {
+        if !b.header.suspensions.is_empty() {
             let on_chain = self.already_suspended(&chain.blocks);
             let mut seen: HashSet<u64> = HashSet::new();
             for (record, sigma) in b.header.suspensions.iter().zip(b.header.verdict_sigs.iter()) {
@@ -2856,7 +2874,7 @@ impl Node {
         // Every audit report the block carries must re-validate against public chain data (real
         // subject, truthful admission epoch, VRF-selected registered observer), be unique within the
         // block, and not already be recorded — so no proposer injects unauthenticated attestations.
-        {
+        if !b.header.audit_reports.is_empty() {
             let recorded = self.recorded_audit_keys(&chain.blocks);
             let mut seen: HashSet<([u8; 32], u64)> = HashSet::new();
             for rep in &b.header.audit_reports {
@@ -2871,7 +2889,7 @@ impl Node {
         }
         // Every verdict-commit the block carries must be signature-valid, unique within the block, and
         // not already recorded — public pre-commitments the watchdog counts; no proposer fabricates them.
-        {
+        if !b.header.verdict_commits.is_empty() {
             let recorded = self.recorded_commit_keys(&chain.blocks);
             let mut seen: HashSet<([u8; 32], u64, [u8; 32])> = HashSet::new();
             for c in &b.header.verdict_commits {
@@ -2884,7 +2902,7 @@ impl Node {
         // Every watchdog signal must re-validate against the on-chain burst (true anomaly, registered
         // signer, canonical round), be unique within the block, and not already be recorded — so no
         // proposer injects a false oversight trigger.
-        {
+        if !b.header.watchdog_signals.is_empty() {
             let recorded = self.recorded_watchdog_keys(&chain.blocks);
             let mut seen: HashSet<([u8; 32], u64)> = HashSet::new();
             for s in &b.header.watchdog_signals {
@@ -2900,7 +2918,7 @@ impl Node {
         // Every rewind signal must re-validate against the on-chain velocity spike (canonical cohort
         // epoch, cross-niche signer), be unique within the block, and not already be recorded — so no
         // proposer injects a false Class-3 trigger.
-        {
+        if !b.header.rewind_signals.is_empty() {
             let recorded = self.recorded_rewind_keys(&chain.blocks);
             let mut seen: HashSet<([u8; 32], u64)> = HashSet::new();
             for s in &b.header.rewind_signals {
@@ -2915,7 +2933,7 @@ impl Node {
         }
         // Every arbitration handoff receipt must re-validate against the subject's on-chain c_old +
         // committee, be unique within the block, and not already be recorded — so no proposer forges one.
-        {
+        if !b.header.handoff_receipts.is_empty() {
             let recorded = self.recorded_handoff_keys(&chain.blocks);
             let mut seen: HashSet<([u8; 32], u64)> = HashSet::new();
             for r in &b.header.handoff_receipts {
@@ -2930,7 +2948,7 @@ impl Node {
         }
         // Every §6.4 handoff-package ZK proof must re-verify against the on-chain commitments it names,
         // be unique within the block, and not already be recorded — so no proposer injects a forged one.
-        {
+        if !b.header.handoff_proofs.is_empty() {
             let recorded = self.recorded_handoff_proof_subjects(&chain.blocks);
             let mut seen: HashSet<u64> = HashSet::new();
             for r in &b.header.handoff_proofs {
@@ -3598,7 +3616,8 @@ impl Node {
         // §6.4 handoff-package ZK proofs awaiting inclusion, and whether this (departing) node already
         // published its own.
         let mut handoff_proof_pool: Vec<HandoffProofRecord> = Vec::new();
-        let mut handoff_proof_sent = false;
+        let mut handoff_proof_cache: Option<HandoffProofRecord> = None;
+        let mut handoff_proof_pub_h: Option<u64> = None;
         let mut custody_dispatch_height: Option<u64> = None;
         // Custody this node took at round-0 handoff (orig subject → (r_old, our share)), so it can later
         // proactively re-share to a fresh committee; and the sub-shares it accumulates as a fresh-committee
@@ -3611,6 +3630,7 @@ impl Node {
         let mut interest_peers: HashSet<[u8; 32]> = HashSet::new();
         // Layer-5 recommendation product, recomputed once per new finalized height.
         let mut last_reco_height: Option<u64> = None;
+        let mut last_defaults_h: Option<u64> = None;
         let mut latest_reco: Option<(Vec<usize>, Vec<f64>)> = None;
         let mut epoch_ids: Vec<(u64, u64)> = Vec::new();
         let mut beacons: Vec<(u64, u64)> = Vec::new();
@@ -3748,7 +3768,7 @@ impl Node {
                     self.drive_rehandoff(&chain, &custody_held, &mut reshare_held, &mut handoff_pool, &peers, &mixer, beacon_hint, &mut rehandoff_dispatch_height);
                     // §6.4 handoff-package ZK proof: a departing node publishes its composite Statements
                     // 1-3 over its on-chain C_p once its departure is finalized (no-op for non-leavers).
-                    self.drive_handoff_proof(&chain, &peers, &mixer, beacon_hint, &mut handoff_proof_sent);
+                    self.drive_handoff_proof(&chain, &peers, &mixer, beacon_hint, &mut handoff_proof_cache, &mut handoff_proof_pub_h);
                     // §5.3/§5.4 PSI interest-peer discovery (no-op unless with_psi_discovery): additive,
                     // off-chain, one probe per tick — never affects consensus.
                     self.drive_psi(&chain, &peers, &mixer, beacon_hint, &mut psi_initiated);
@@ -3766,9 +3786,16 @@ impl Node {
                     // §6.4 slashing: a committee member that defaulted on a handoff (no valid receipt by
                     // the deadline) is excluded from leadership, exactly like an equivocator — derived
                     // identically from the finalized chain on every node, so no evidence message is needed.
-                    for d in self.handoff_defaults(&chain.blocks) {
-                        if slashed.insert(d) {
-                            info!(slashed = %hex::encode(&d[..4]), "slashed committee member for handoff default");
+                    // A pure function of the finalized chain, so re-derive only when the chain advances —
+                    // NOT every 10ms tick (its per-subject chain folds + committee re-derivation are
+                    // expensive enough to starve consensus once a handoff exists on the chain).
+                    let defaults_h = chain.head().header.height;
+                    if last_defaults_h != Some(defaults_h) {
+                        last_defaults_h = Some(defaults_h);
+                        for d in self.handoff_defaults(&chain.blocks) {
+                            if slashed.insert(d) {
+                                info!(slashed = %hex::encode(&d[..4]), "slashed committee member for handoff default");
+                            }
                         }
                     }
                     if let Some(r) = round.as_mut() {
