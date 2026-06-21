@@ -1758,14 +1758,19 @@ impl Node {
         peers: &PeersMap,
         mixer: &Mixer,
         beacon: u64,
-        last_height: &mut Option<u64>,
+        last_at: &mut Option<Instant>,
     ) {
         if self.leave_at.is_none() || self.preferences.is_none() {
             return; // only a configured leaver with a profile dispatches custody
         }
-        let head = chain.head().header.height;
-        if *last_height == Some(head) {
-            return; // at most one dispatch per height (re-dispatch self-heals dropped parcels)
+        // Re-dispatch on a wall-clock timer, NOT once-per-height: the departing node is no longer a
+        // validator and lags the chain, so a height-gated re-dispatch would freeze whenever its head is
+        // stuck — stranding a custodian whose parcel was dropped until the leaver finally catches up
+        // (often only at the final height, too late for the receipt to be recorded). A timer keeps the
+        // self-heal alive even while the leaver's head is frozen. Idempotent: shares are deterministic
+        // and the receiver dedups, so resends are harmless.
+        if last_at.map_or(false, |t| t.elapsed() < Duration::from_millis(500)) {
+            return;
         }
         // Our own departure subject — derived from the chain exactly as every other node derives it, so
         // the committee files for the same subject we dispatch for.
@@ -1778,7 +1783,7 @@ impl Node {
         if mine.is_empty() {
             return; // our Remove is not finalized yet
         }
-        *last_height = Some(head);
+        *last_at = Some(Instant::now());
         let sk_handle = self.pref_sk_handle();
         for (subject, ctx) in mine {
             if self.handoff_completed_count(&chain.blocks, subject) >= crate::arbitration::CUSTODY_THRESHOLD {
@@ -3174,6 +3179,7 @@ impl Node {
         interest_peers: &mut HashSet<[u8; 32]>,
         current_share: &mut Option<(u64, [u8; 32])>,
         va_held: &mut HashMap<u64, [u8; 32]>,
+        custody_relayed: &mut HashSet<(u64, [u8; 32])>,
         peers: &PeersMap,
         mixer: &Mixer,
         slashed: &mut HashSet<[u8; 32]>,
@@ -3288,10 +3294,20 @@ impl Node {
                 mixer.publish(peers, beacon_hint, Message::Rewind(s));
             }
             Message::CustodyDispatch(parcel) => {
-                // A confidential arbitration custody parcel: if it is addressed to us and we serve on the
-                // committee, open it and file our handoff receipt (consumed here, never re-gossiped or
-                // recorded — it carries the subject's secret blinding, sealed to us alone).
-                self.handle_custody_parcel(chain, &parcel, handoff_pool, custody_held, peers, mixer, beacon_hint);
+                // A confidential arbitration custody parcel. If addressed to us and we serve on the
+                // committee, open it and file our handoff receipt. Otherwise relay the ECIES-sealed parcel
+                // ONCE (it is opaque to us) so it reaches its addressee over the reliable validator mesh:
+                // the dispatcher is a departed node that lags and may have no working path to a given
+                // custodian, so without a relay that custodian's receipt can land too late to be recorded
+                // (breaking the threshold). Bounded — dedup by (subject, member) caps relays at one per
+                // node and stops once the receipt is recorded.
+                if parcel.member == self.me() {
+                    self.handle_custody_parcel(chain, &parcel, handoff_pool, custody_held, peers, mixer, beacon_hint);
+                } else if !self.recorded_handoff_keys(&chain.blocks).contains(&(parcel.member, parcel.subject))
+                    && custody_relayed.insert((parcel.subject, parcel.member))
+                {
+                    mixer.publish(peers, beacon_hint, Message::CustodyDispatch(parcel));
+                }
             }
             Message::Reshare(parcel) => {
                 // A confidential re-handoff sub-share addressed to a fresh-committee member: accumulate it
@@ -3628,11 +3644,12 @@ impl Node {
         let mut handoff_proof_pool: Vec<HandoffProofRecord> = Vec::new();
         let mut handoff_proof_cache: Option<HandoffProofRecord> = None;
         let mut handoff_proof_pub_h: Option<u64> = None;
-        let mut custody_dispatch_height: Option<u64> = None;
+        let mut custody_dispatch_at: Option<Instant> = None;
         // Custody this node took at round-0 handoff (orig subject → (r_old, our share)), so it can later
         // proactively re-share to a fresh committee; and the sub-shares it accumulates as a fresh-committee
         // member of a re-handoff (re-handoff nonce → [(old dealer index, r_old, sub-share)]).
         let mut custody_held: HashMap<u64, ([u8; 32], [u8; 32])> = HashMap::new();
+        let mut custody_relayed: HashSet<(u64, [u8; 32])> = HashSet::new();
         let mut reshare_held: HashMap<u64, Vec<(u64, [u8; 32], [u8; 32])>> = HashMap::new();
         let mut rehandoff_dispatch_height: Option<u64> = None;
         // §5.3/§5.4 PSI discovery: peers we have offered to (dedup), and the interest-peers we discovered.
@@ -3782,7 +3799,7 @@ impl Node {
                     self.drive_rogue_commits(&chain, &peers, &mixer, beacon_hint, &mut rogue_committed, &mut verdict_commit_pool);
                     self.drive_watchdog(&chain, &peers, &mixer, beacon_hint, &mut watchdog_raised, &mut watchdog_pool);
                     self.drive_rewind(&chain, &peers, &mixer, beacon_hint, &mut rewind_raised, &mut rewind_pool);
-                    self.drive_custody_dispatch(&chain, &peers, &mixer, beacon_hint, &mut custody_dispatch_height);
+                    self.drive_custody_dispatch(&chain, &peers, &mixer, beacon_hint, &mut custody_dispatch_at);
                     // Re-handoff driver: a surviving custodian proactively re-shares to a fresh committee
                     // once an original custodian departs (no-op unless triggered + we are a canonical dealer).
                     self.drive_rehandoff(&chain, &custody_held, &mut reshare_held, &mut handoff_pool, &peers, &mixer, beacon_hint, &mut rehandoff_dispatch_height);
@@ -3831,7 +3848,7 @@ impl Node {
                             early_proposals.insert(b.header.height, b.clone());
                         }
                     }
-                    self.on_msg(msg, round.as_mut(), &mut chain, &mut pending, &mut pending_membership, &mut pending_suspensions, &mut verdict_partials, &mut audit_pool, &mut verdict_commit_pool, &mut watchdog_pool, &mut rewind_pool, &mut handoff_pool, &mut handoff_proof_pool, &mut custody_held, &mut reshare_held, &mut psi_initiated, &mut interest_peers, &mut current_share, &mut va_held, &peers, &mixer, &mut slashed);
+                    self.on_msg(msg, round.as_mut(), &mut chain, &mut pending, &mut pending_membership, &mut pending_suspensions, &mut verdict_partials, &mut audit_pool, &mut verdict_commit_pool, &mut watchdog_pool, &mut rewind_pool, &mut handoff_pool, &mut handoff_proof_pool, &mut custody_held, &mut reshare_held, &mut psi_initiated, &mut interest_peers, &mut current_share, &mut va_held, &mut custody_relayed, &peers, &mixer, &mut slashed);
                 }
             }
         }
