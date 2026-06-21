@@ -3469,8 +3469,18 @@ impl Node {
                 }
             }
             Message::Finalized(b) => {
-                if self.valid_block(chain, &b) {
-                    let _ = chain.try_append(b);
+                let head_h = chain.head().header.height;
+                if b.header.height <= head_h + 1 {
+                    if self.valid_block(chain, &b) {
+                        let _ = chain.try_append(b);
+                    }
+                } else {
+                    // We are behind: a block only appends at exactly head+1, so a single missed
+                    // `Finalized` block would otherwise strand us forever (nothing else triggered a
+                    // chain-sync — `GetChain` was handled but never sent). Request the missing range; a
+                    // peer answers with `ChainRange` (applied below, in order). Self-limiting: once the
+                    // gap is filled there are no more out-of-order finalized blocks to react to.
+                    mixer.publish(peers, chain.head().header.beacon_t, Message::GetChain { from_height: head_h + 1 });
                 }
             }
             Message::Slash(proof) => {
@@ -3638,6 +3648,7 @@ impl Node {
         let mut round: Option<Round> = None;
         let mut slashed: HashSet<[u8; 32]> = HashSet::new();
         let mut done_at: Option<Instant> = None;
+        let mut last_sync = Instant::now();
         // Proposals that arrived for a height we had not yet entered (we finalize-enter slightly later
         // than the leader proposes). Buffer the latest per height and inject it the instant we enter
         // that round, so we vote at view 0 instead of missing the proposal and forcing a view-change.
@@ -3752,6 +3763,15 @@ impl Node {
                     // Autonomous objective-verdict driver: scan finalized txs and emit/combine partials
                     // (no-op unless this node is a verdict authority with a threshold key).
                     let beacon_hint = round.as_ref().map(|r| r.beacon_t).unwrap_or_else(|| chain.head().header.beacon_t);
+                    // Proactive chain-sync poll: periodically ask peers for anything past our head, so a
+                    // node that fell behind recovers even with no gap-triggering `Finalized` block to react
+                    // to (e.g. it reconnected while the network is quiescent, or started late). Throttled;
+                    // a caught-up peer answers with nothing (`blocks_from` is empty), so steady-state cost
+                    // is one small broadcast per interval. Pairs with the sync-on-gap path in `on_msg`.
+                    if last_sync.elapsed() >= Duration::from_millis(400) {
+                        last_sync = Instant::now();
+                        mixer.publish(&peers, beacon_hint, Message::GetChain { from_height: chain.head().header.height + 1 });
+                    }
                     // §4.1 VA_pub re-share on validator rotation (no-op until the set rotates / unless we
                     // hold a share or are a joiner). Updates current_share to the fresh post-rotation share.
                     self.drive_va_reshare(&chain, &mut current_share, &mut va_held, &peers, &mixer, beacon_hint, &mut va_reshare_last_h);
